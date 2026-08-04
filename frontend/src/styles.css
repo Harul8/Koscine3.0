@@ -116,6 +116,56 @@ button:hover {
   display: block;
 }
 
+.candles-wrap {
+  cursor: crosshair;
+  user-select: none;
+}
+.candles-toolbar {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  display: flex;
+  gap: 4px;
+  z-index: 2;
+}
+.candles-toolbar button {
+  min-width: 26px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 13px;
+  line-height: 1;
+  border: 1px solid #cdd8d3;
+  border-radius: 6px;
+  background: #ffffffcc;
+  color: #33443d;
+  cursor: pointer;
+}
+.candles-toolbar button:hover:not(:disabled) { background: #eef4f1; }
+.candles-toolbar button:disabled { opacity: 0.45; cursor: default; }
+.candle-tip {
+  position: absolute;
+  pointer-events: none;
+  z-index: 3;
+  background: #1c2b26;
+  color: #eaf1ee;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.22);
+  white-space: nowrap;
+  display: flex;
+  flex-direction: column;
+}
+.candle-tip strong { font-size: 12px; margin-bottom: 2px; color: #ffffff; }
+.candle-tip span { display: flex; justify-content: space-between; gap: 14px; }
+.candle-tip b { font-variant-numeric: tabular-nums; }
+
+@media (prefers-color-scheme: dark) {
+  .candles-toolbar button { background: #1f2a2699; border-color: #33443d; color: #d6e2dd; }
+  .candles-toolbar button:hover:not(:disabled) { background: #2a3a34; }
+}
+
 .dm-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

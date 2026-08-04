@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Cog, Filter, Flame, History, LineChart, Lock, Play, RefreshCw } from "lucide-react";
 import "./styles.css";
@@ -21,7 +21,9 @@ type MRow = { rank: number; symbol: string; atm_iv: number; live: boolean; picke
 type IdxRow = { label: string; move: number | null; live: boolean; pred?: number | null };
 type GroupMetric = { per_yr: number; move_ge6_pct: number; move_ge8_pct: number; closed_opp_pct: number; coverage: string; top5_share_pct: number; top5_names: string[] };
 type Manifest = { version: string; groups: Record<string, number>; book_metrics_2024_26: Record<string, GroupMetric> };
-type PricePoint = { date: string; close: number; high: number; low: number; picked: boolean };
+type PricePoint = { date: string; open: number; close: number; high: number; low: number; picked: boolean };
+type Timeframe = "D" | "W" | "M";
+const TF_LABEL: Record<Timeframe, string> = { D: "Daily", W: "Weekly", M: "Monthly" };
 type Status = { book?: { modified: number | null; rows: number | null }; premiums?: { modified: number | null; rows: number | null }; version?: string; selector?: Record<string, unknown>; jobs: Record<string, { status: string; module?: string; tail?: string }> };
 
 function pct(v: unknown, d = 1): string { const n = Number(v ?? 0); return Number.isFinite(n) ? `${n.toFixed(d)}%` : "-"; }
@@ -522,7 +524,9 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   const [symbol, setSymbol] = useState("ADANIENT");
   const [data, setData] = useState<{ series: PricePoint[]; premiums: Pick[] }>({ series: [], premiums: [] });
   const [nd, setNd] = useState<NDRow[]>([]);
+  const [tf, setTf] = useState<Timeframe>("D");
   const one = horizon === "1d";
+  const candles = useMemo(() => resample(data.series, tf), [data.series, tf]);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
     if (!symbol) return;
@@ -538,11 +542,16 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
             {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
           </select>
         </label>
-        <span className="hint">{data.series.length} trading days · red dots = days this stock was a pick</span>
+        <label><CalendarDays size={16} />
+          <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)}>
+            {(["D", "W", "M"] as Timeframe[]).map((t) => <option key={t} value={t}>{TF_LABEL[t]}</option>)}
+          </select>
+        </label>
+        <span className="hint">{data.series.length} trading days · scroll to zoom · hover for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
-        <div className="panel-title"><h2>{symbol} — price history</h2><span>last {data.series.length} days</span></div>
-        <div style={{ padding: 14 }}><Spark series={data.series} /></div>
+        <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
+        <div style={{ padding: 14 }}><Candles series={candles} /></div>
       </section>
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title"><h2>{one ? "Next-day prediction vs realized" : "ATM option premium at each pick"}</h2><span>{(one ? nd : data.premiums).length} rows</span></div>
@@ -580,22 +589,158 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   );
 }
 
-function Spark({ series }: { series: PricePoint[] }) {
-  if (series.length < 2) return <span className="hint">No data</span>;
-  const W = 900, H = 240, pad = 28;
-  const cs = series.map((p) => p.close);
-  const lo = Math.min(...cs), hi = Math.max(...cs);
-  const x = (i: number) => pad + (i / (series.length - 1)) * (W - 2 * pad);
-  const y = (v: number) => H - pad - ((v - lo) / (hi - lo || 1)) * (H - 2 * pad);
-  const path = series.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(p.close).toFixed(1)}`).join(" ");
+// Aggregate daily OHLC candles into weekly / monthly buckets. Input is sorted ascending by date.
+function resample(series: PricePoint[], tf: Timeframe): PricePoint[] {
+  if (tf === "D" || series.length === 0) return series;
+  const keyOf = (d: string): string => {
+    if (tf === "M") return d.slice(0, 7);            // YYYY-MM
+    const dt = new Date(d + "T00:00:00Z");           // ISO week (year + week number)
+    const day = (dt.getUTCDay() + 6) % 7;            // Mon=0
+    dt.setUTCDate(dt.getUTCDate() - day + 3);        // Thursday of this week
+    const firstThu = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
+    const week = 1 + Math.round(((dt.getTime() - firstThu.getTime()) / 86400000 - 3 + ((firstThu.getUTCDay() + 6) % 7)) / 7);
+    return `${dt.getUTCFullYear()}-W${week}`;
+  };
+  const groups = new Map<string, PricePoint[]>();
+  for (const p of series) {
+    const k = keyOf(p.date);
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push(p);
+  }
+  const out: PricePoint[] = [];
+  for (const arr of groups.values()) {
+    out.push({
+      date: arr[arr.length - 1].date,
+      open: arr[0].open,
+      close: arr[arr.length - 1].close,
+      high: Math.max(...arr.map((p) => p.high)),
+      low: Math.min(...arr.map((p) => p.low)),
+      picked: arr.some((p) => p.picked),
+    });
+  }
+  return out;
+}
+
+// "Nice" rounded axis levels (steps of 1/2/5 x 10^k) between lo and hi — ~count lines.
+function niceTicks(lo: number, hi: number, count = 10): number[] {
+  const span = hi - lo || 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(span / count)));
+  const norm = span / count / mag;
+  // round the raw step UP to the nearest 1/2/5/10 so we land near `count` lines, not above
+  const step = (norm > 5 ? 10 : norm > 2 ? 5 : norm > 1 ? 2 : 1) * mag;
+  const out: number[] = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 0.001; v += step) out.push(v);
+  return out;
+}
+
+function Candles({ series }: { series: PricePoint[] }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [win, setWin] = useState<{ s: number; e: number }>({ s: 0, e: series.length });
+  const [hover, setHover] = useState<number | null>(null);
+  // reset zoom window + tooltip whenever the underlying series changes (symbol / timeframe)
+  useEffect(() => { setWin({ s: 0, e: series.length }); setHover(null); }, [series]);
+
+  const W = 900, H = 300, padX = 40, padTop = 14, padBot = 34;
+  const total = series.length;
+  const s = Math.max(0, Math.min(win.s, Math.max(0, total - 2)));
+  const e = Math.max(s + 2, Math.min(win.e, total));
+  const vis = series.slice(s, e);
+  const n = vis.length;
+  const slot = n > 0 ? (W - 2 * padX) / n : 0;
+  const cw = Math.max(1, Math.min(14, slot * 0.7));
+  const x = (i: number) => padX + slot * (i + 0.5);
+
+  // native wheel listener (passive:false so we can preventDefault the page scroll)
+  useEffect(() => {
+    const node = wrapRef.current;
+    if (!node) return;
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const rect = node.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const cursorIdx = s + frac * n;
+      const factor = ev.deltaY < 0 ? 0.82 : 1.22;         // scroll up = zoom in
+      let width = Math.round(n * factor);
+      width = Math.max(6, Math.min(total, width));
+      let ns = Math.round(cursorIdx - frac * width);
+      ns = Math.max(0, Math.min(total - width, ns));
+      setWin({ s: ns, e: ns + width });
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => node.removeEventListener("wheel", onWheel);
+  }, [s, n, total]);
+
+  if (total < 2) return <span className="hint">No data</span>;
+
+  const hi = Math.max(...vis.map((p) => p.high));
+  const lo = Math.min(...vis.map((p) => p.low));
+  const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
+  const up = "#167c80", down = "#9a2431";
+  const zoomed = n < total;
+  const grid = niceTicks(lo, hi, 10);
+
+  const idxFromClientX = (clientX: number): number => {
+    const rect = wrapRef.current!.getBoundingClientRect();
+    const svgX = ((clientX - rect.left) / rect.width) * W;
+    return Math.max(0, Math.min(n - 1, Math.round((svgX - padX) / slot - 0.5)));
+  };
+
+  // x-axis: ~8 evenly spaced date labels across the visible window
+  const step = Math.max(1, Math.ceil(n / 8));
+  const ticks: number[] = [];
+  for (let i = 0; i < n; i += step) ticks.push(i);
+  if (ticks[ticks.length - 1] !== n - 1) ticks.push(n - 1);
+
+  const hp = hover != null && hover < n ? vis[hover] : null;
+  const tipLeftPct = hover != null ? (x(hover) / W) * 100 : 0;
+  const tipRight = tipLeftPct > 62;
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="spark">
-      <path d={path} fill="none" stroke="#167c80" strokeWidth={1.5} />
-      {series.map((p, i) => (p.picked ? <circle key={i} cx={x(i)} cy={y(p.close)} r={3.2} fill="#9a2431" /> : null))}
-      <text x={pad} y={16} fontSize={11} fill="#60706a">{num(hi, 0)}</text>
-      <text x={pad} y={H - 6} fontSize={11} fill="#60706a">{num(lo, 0)}</text>
-      <text x={W - pad} y={H - 6} fontSize={11} fill="#60706a" textAnchor="end">{series[series.length - 1].date}</text>
-    </svg>
+    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
+         onMouseMove={(ev) => setHover(idxFromClientX(ev.clientX))}
+         onMouseLeave={() => setHover(null)}
+         onDoubleClick={() => setWin({ s: 0, e: total })}>
+      <div className="candles-toolbar">
+        <button type="button" title="Zoom in" onClick={() => { const w = Math.max(6, Math.round(n * 0.7)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>+</button>
+        <button type="button" title="Zoom out" onClick={() => { const w = Math.min(total, Math.round(n * 1.4)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>−</button>
+        <button type="button" title="Reset zoom" disabled={!zoomed} onClick={() => setWin({ s: 0, e: total })}>Reset</button>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="spark">
+        {/* y-axis grid: light-grey lines at rounded price levels */}
+        {grid.map((g, gi) => (
+          <g key={`grid${gi}`}>
+            <line x1={padX} x2={W - padX} y1={y(g)} y2={y(g)} stroke="#e7ecea" strokeWidth={1} />
+            <text x={padX - 6} y={y(g) + 3} fontSize={10} fill="#8a978f" textAnchor="end">{num(g, 0)}</text>
+          </g>
+        ))}
+        {hp != null ? <line x1={x(hover!)} x2={x(hover!)} y1={padTop} y2={H - padBot} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
+        {vis.map((p, i) => {
+          const rising = p.close >= p.open;
+          const color = rising ? up : down;
+          const yo = y(p.open), yc = y(p.close);
+          const top = Math.min(yo, yc), bh = Math.max(1, Math.abs(yc - yo));
+          return (
+            <g key={s + i}>
+              <line x1={x(i)} x2={x(i)} y1={y(p.high)} y2={y(p.low)} stroke={color} strokeWidth={1} />
+              <rect x={x(i) - cw / 2} y={top} width={cw} height={bh} fill={color} />
+            </g>
+          );
+        })}
+        {/* x-axis date ticks */}
+        {ticks.map((i) => (
+          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill="#60706a"
+                textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{vis[i].date.slice(2)}</text>
+        ))}
+      </svg>
+      {hp ? (
+        <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
+          <strong>{hp.date}</strong>
+          <span>O <b>{num(hp.open, 1)}</b></span>
+          <span>H <b>{num(hp.high, 1)}</b></span>
+          <span>L <b>{num(hp.low, 1)}</b></span>
+          <span>C <b style={{ color: hp.close >= hp.open ? up : down }}>{num(hp.close, 1)}</b></span>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

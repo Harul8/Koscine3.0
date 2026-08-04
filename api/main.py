@@ -353,9 +353,9 @@ def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=20
     book = _v2_book()
     bsym = book[book["symbol"].eq(sym)] if not book.empty else pd.DataFrame()
     picks = set(pd.to_datetime(bsym["date"])) if not bsym.empty else set()
-    series = [{"date": d.strftime("%Y-%m-%d"), "close": float(c), "high": float(h), "low": float(lo),
+    series = [{"date": d.strftime("%Y-%m-%d"), "open": float(o), "close": float(c), "high": float(h), "low": float(lo),
                "picked": d in picks}
-              for d, c, h, lo in zip(s["date"], s["close"], s["high"], s["low"])]
+              for d, o, c, h, lo in zip(s["date"], s["open"], s["close"], s["high"], s["low"])]
     prem_cols = ["date", "strike", "ce_entry", "ce_high", "ce_low", "ce_close", "ce_mult_best",
                  "pe_entry", "pe_high", "pe_low", "pe_close", "pe_mult_best", "move_mag_pct",
                  "up_move", "down_move", "live", "dir_label", "confidence"]
