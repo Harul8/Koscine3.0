@@ -116,6 +116,13 @@ button:hover {
   display: block;
 }
 
+.controls-band label.chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.controls-band label.chk input { width: auto; }
+
 .candles-wrap {
   cursor: crosshair;
   user-select: none;

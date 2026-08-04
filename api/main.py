@@ -345,7 +345,7 @@ def prod2_stock_history(symbol: str) -> list[dict[str, object]]:
 
 
 @app.get("/prod2/price_history")
-def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=2000)) -> dict[str, object]:
+def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=4000)) -> dict[str, object]:
     """Daily price (close/high/low) for a symbol with pick markers + the ATM option premium OHLC per pick."""
     sym = symbol.upper()
     m = _market_ohlc()

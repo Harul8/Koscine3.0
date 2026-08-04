@@ -525,12 +525,14 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   const [data, setData] = useState<{ series: PricePoint[]; premiums: Pick[] }>({ series: [], premiums: [] });
   const [nd, setNd] = useState<NDRow[]>([]);
   const [tf, setTf] = useState<Timeframe>("D");
+  const [showLevels, setShowLevels] = useState(true);
+  const [minDD, setMinDD] = useState(10);
   const one = horizon === "1d";
   const candles = useMemo(() => resample(data.series, tf), [data.series, tf]);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
     if (!symbol) return;
-    getJson<{ series: PricePoint[]; premiums: Pick[] }>(`/prod2/price_history?symbol=${symbol}&days=400`).then(setData).catch(() => setData({ series: [], premiums: [] }));
+    getJson<{ series: PricePoint[]; premiums: Pick[] }>(`/prod2/price_history?symbol=${symbol}&days=2520`).then(setData).catch(() => setData({ series: [], premiums: [] }));
     if (one) getJson<NDRow[]>(`/prod2/nextday/stock_history?symbol=${symbol}`).then(setNd).catch(() => setNd([]));
   }, [symbol, one]);
   return (
@@ -547,11 +549,18 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
             {(["D", "W", "M"] as Timeframe[]).map((t) => <option key={t} value={t}>{TF_LABEL[t]}</option>)}
           </select>
         </label>
-        <span className="hint">{data.series.length} trading days · scroll to zoom · hover for OHLC · double-click to reset</span>
+        <label className="chk">
+          <input type="checkbox" checked={showLevels} onChange={(e) => setShowLevels(e.target.checked)} /> S/R levels
+        </label>
+        <label>DD %
+          <input type="number" min={1} max={40} step={1} value={minDD} style={{ width: 54 }}
+                 onChange={(e) => setMinDD(Math.max(1, Math.min(40, Number(e.target.value) || 5)))} />
+        </label>
+        <span className="hint">latest {DEFAULT_CANDLES} · scroll to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
         <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
-        <div style={{ padding: 14 }}><Candles series={candles} /></div>
+        <div style={{ padding: 14 }}><Candles series={candles} showLevels={showLevels} minDDpct={minDD} /></div>
       </section>
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title"><h2>{one ? "Next-day prediction vs realized" : "ATM option premium at each pick"}</h2><span>{(one ? nd : data.premiums).length} rows</span></div>
@@ -620,6 +629,98 @@ function resample(series: PricePoint[], tf: Timeframe): PricePoint[] {
   return out;
 }
 
+type Level = { price: number; kind: "R" | "S" | "ATH"; touches: number; firstIdx: number };
+
+// Wick-based support/resistance, evaluated as of the LAST bar in `series` (so panning
+// re-derives them from the data visible up to that day). N-bar pivot highs/lows are
+// clustered by price; a cluster is a zone only if the level was revisited >= 2 times
+// with a real pullback (>= minDD) BETWEEN visits (a flat stall = one touch). Returns at
+// most 3: nearest support below the last close, nearest resistance above it, and — if a
+// zone sits at the all-time high — that ATH zone (kind "ATH"). firstIdx = first touch.
+function srLevels(series: PricePoint[], minDD: number): Level[] {
+  const N = 3, tol = 0.008, minTouches = 2, athTol = 0.02;
+  const n = series.length;
+  if (n < 2 * N + 1) return [];
+  const hiP: number[] = [], loP: number[] = [];
+  for (let i = N; i < n - N; i++) {
+    let isHi = true, isLo = true;
+    for (let j = i - N; j <= i + N; j++) {
+      if (j === i) continue;
+      if (series[j].high >= series[i].high) isHi = false;
+      if (series[j].low <= series[i].low) isLo = false;
+    }
+    if (isHi) hiP.push(i);
+    if (isLo) loP.push(i);
+  }
+  const build = (idx: number[], kind: "R" | "S"): Level[] => {
+    const pts = idx.map((i) => ({ i, p: kind === "R" ? series[i].high : series[i].low }))
+                   .sort((a, b) => a.p - b.p);
+    const out: Level[] = [];
+    let cl: { i: number; p: number }[] = [];
+    const flush = () => {
+      if (cl.length) {
+        const level = cl.reduce((s, x) => s + x.p, 0) / cl.length;
+        const byTime = cl.slice().sort((a, b) => a.i - b.i);
+        let touches = 0, ref = -1;
+        for (const pt of byTime) {
+          if (ref < 0) { touches = 1; ref = pt.i; continue; }
+          let pulled: boolean;
+          if (kind === "R") {
+            let mn = Infinity;
+            for (let k = ref; k <= pt.i; k++) mn = Math.min(mn, series[k].low);
+            pulled = mn <= level * (1 - minDD);
+          } else {
+            let mx = -Infinity;
+            for (let k = ref; k <= pt.i; k++) mx = Math.max(mx, series[k].high);
+            pulled = mx >= level * (1 + minDD);
+          }
+          if (pulled) touches++;
+          ref = pt.i;
+        }
+        if (touches >= minTouches) out.push({ price: level, kind, touches, firstIdx: byTime[0].i });
+      }
+      cl = [];
+    };
+    for (const pt of pts) {
+      if (cl.length && Math.abs(pt.p - cl[cl.length - 1].p) / pt.p > tol) flush();
+      cl.push(pt);
+    }
+    flush();
+    return out;
+  };
+  // all zones, merge overlapping highs/lows
+  const all = [...build(hiP, "R"), ...build(loP, "S")].sort((a, b) => a.price - b.price);
+  const merged: Level[] = [];
+  for (const L of all) {
+    const last = merged[merged.length - 1];
+    if (last && Math.abs(L.price - last.price) / L.price <= tol) {
+      const tot = last.touches + L.touches;
+      last.price = (last.price * last.touches + L.price * L.touches) / tot;
+      last.touches = Math.max(last.touches, L.touches);
+      last.firstIdx = Math.min(last.firstIdx, L.firstIdx);
+    } else merged.push({ ...L });
+  }
+  // select: nearest support below + nearest resistance above the last visible close,
+  // plus the all-time-high zone (blue) if one exists — max 3 lines
+  const refClose = series[n - 1].close;
+  let ath = -Infinity;
+  for (const p of series) ath = Math.max(ath, p.high);
+  const support = merged.filter((L) => L.price < refClose).sort((a, b) => b.price - a.price)[0];
+  const resistance = merged.filter((L) => L.price > refClose).sort((a, b) => a.price - b.price)[0];
+  const athZone = merged.filter((L) => Math.abs(L.price - ath) / ath <= athTol).sort((a, b) => b.price - a.price)[0];
+  const sel: Level[] = [];
+  const add = (L: Level | undefined, isAth = false) => {
+    if (!L) return;
+    const dup = sel.find((x) => Math.abs(x.price - L.price) / L.price < 1e-9);
+    if (dup) { if (isAth) dup.kind = "ATH"; return; }
+    sel.push(isAth ? { ...L, kind: "ATH" } : L);
+  };
+  add(support);
+  add(resistance);
+  if (athZone) add(athZone, true);
+  return sel;
+}
+
 // "Nice" rounded axis levels (steps of 1/2/5 x 10^k) between lo and hi — ~count lines.
 function niceTicks(lo: number, hi: number, count = 10): number[] {
   const span = hi - lo || 1;
@@ -632,12 +733,15 @@ function niceTicks(lo: number, hi: number, count = 10): number[] {
   return out;
 }
 
-function Candles({ series }: { series: PricePoint[] }) {
+const DEFAULT_CANDLES = 100;
+
+function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showLevels: boolean; minDDpct: number }) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const [win, setWin] = useState<{ s: number; e: number }>({ s: 0, e: series.length });
+  const defWin = (len: number) => ({ s: Math.max(0, len - DEFAULT_CANDLES), e: len });
+  const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
   const [hover, setHover] = useState<number | null>(null);
-  // reset zoom window + tooltip whenever the underlying series changes (symbol / timeframe)
-  useEffect(() => { setWin({ s: 0, e: series.length }); setHover(null); }, [series]);
+  // default to the most recent ~100 candles; reset when the series changes (symbol / timeframe)
+  useEffect(() => { setWin(defWin(series.length)); setHover(null); }, [series]);
 
   const W = 900, H = 300, padX = 40, padTop = 14, padBot = 34;
   const total = series.length;
@@ -648,6 +752,12 @@ function Candles({ series }: { series: PricePoint[] }) {
   const slot = n > 0 ? (W - 2 * padX) / n : 0;
   const cw = Math.max(1, Math.min(14, slot * 0.7));
   const x = (i: number) => padX + slot * (i + 0.5);
+
+  // S/R levels re-derived as of the last VISIBLE bar (series[0..e)); recompute on pan/zoom
+  const levels = useMemo(
+    () => (showLevels ? srLevels(series.slice(0, e), minDDpct / 100) : []),
+    [series, e, showLevels, minDDpct],
+  );
 
   // native wheel listener (passive:false so we can preventDefault the page scroll)
   useEffect(() => {
@@ -669,13 +779,30 @@ function Candles({ series }: { series: PricePoint[] }) {
     return () => node.removeEventListener("wheel", onWheel);
   }, [s, n, total]);
 
+  // keyboard: left / right arrows pan the window (ignored while typing in a field)
+  useEffect(() => {
+    const onKey = (ev: KeyboardEvent) => {
+      const t = ev.target as HTMLElement | null;
+      if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
+      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      ev.preventDefault();
+      const width = e - s;
+      const step = Math.max(1, Math.round(width * 0.1));
+      if (ev.key === "ArrowLeft") { const ns = Math.max(0, s - step); setWin({ s: ns, e: ns + width }); }
+      else { const ne = Math.min(total, e + step); setWin({ s: ne - width, e: ne }); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [s, e, total]);
+
   if (total < 2) return <span className="hint">No data</span>;
 
-  const hi = Math.max(...vis.map((p) => p.high));
-  const lo = Math.min(...vis.map((p) => p.low));
+  const lvlPrices = levels.map((L) => L.price);
+  const hi = Math.max(...vis.map((p) => p.high), ...lvlPrices);
+  const lo = Math.min(...vis.map((p) => p.low), ...lvlPrices);
   const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
   const up = "#167c80", down = "#9a2431";
-  const zoomed = n < total;
+  const atDefault = s === Math.max(0, total - DEFAULT_CANDLES) && e === total;
   const grid = niceTicks(lo, hi, 10);
 
   const idxFromClientX = (clientX: number): number => {
@@ -698,11 +825,11 @@ function Candles({ series }: { series: PricePoint[] }) {
     <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
          onMouseMove={(ev) => setHover(idxFromClientX(ev.clientX))}
          onMouseLeave={() => setHover(null)}
-         onDoubleClick={() => setWin({ s: 0, e: total })}>
+         onDoubleClick={() => setWin(defWin(total))}>
       <div className="candles-toolbar">
         <button type="button" title="Zoom in" onClick={() => { const w = Math.max(6, Math.round(n * 0.7)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>+</button>
         <button type="button" title="Zoom out" onClick={() => { const w = Math.min(total, Math.round(n * 1.4)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>−</button>
-        <button type="button" title="Reset zoom" disabled={!zoomed} onClick={() => setWin({ s: 0, e: total })}>Reset</button>
+        <button type="button" title="Reset to latest 100" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
         {/* y-axis grid: light-grey lines at rounded price levels */}
@@ -722,6 +849,17 @@ function Candles({ series }: { series: PricePoint[] }) {
             <g key={s + i}>
               <line x1={x(i)} x2={x(i)} y1={y(p.high)} y2={y(p.low)} stroke={color} strokeWidth={1} />
               <rect x={x(i) - cw / 2} y={top} width={cw} height={bh} fill={color} />
+            </g>
+          );
+        })}
+        {/* S/R zones: line runs from its first touch to the right edge; label = price + touches */}
+        {levels.map((L, li) => {
+          const color = L.kind === "ATH" ? "#2563b0" : "#33443d";
+          const xStart = L.firstIdx <= s ? padX : Math.min(W - padX, x(L.firstIdx - s));
+          return (
+            <g key={`lv${li}`}>
+              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
+              <text x={W - padX - 4} y={y(L.price) - 3} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches}</text>
             </g>
           );
         })}
