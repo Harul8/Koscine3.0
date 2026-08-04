@@ -2,7 +2,7 @@
 
   ingestion: pipeline.fetch -> pipeline.fetch_fiidii -> pipeline.silver append-day  (raw -> silver, computes atm_iv)
   features:  refresh_dataset_tail                                                    (silver -> daily_features.parquet)
-  books:     mover_v2 -> direction_stage2 -> next_day -> mover_v3 -> direction_v1 -> expected_move_v1  (books, v3, B lean, tomorrow expected-move)
+  books:     mover_v2 -> premium_ohlc -> direction_stage2 -> next_day -> mover_v3 -> direction_v1 -> expected_move_v1  (books, pick premiums, v3, B lean, tomorrow expected-move)
 
 Usage:
     python analysis/run_daily_pipeline.py 2026-06-08 2026-06-12   # date range (inclusive, business days, in one go)
@@ -54,6 +54,7 @@ def main(start: str, end: str) -> None:
     # 3) K3 predictions (5-day book + direction overlay + 1-day book)
     env3 = {**os.environ, "PYTHONPATH": str(Path(K3) / "src")}
     run("K3 5-day mover book", [PY, "-m", "koscine3.largemove.mover_v2"], K3, env3)
+    run("K3 pick premium OHLC", [PY, "-u", "analysis/premium_ohlc.py"], K3, env3)  # book_premiums.csv (near-ATM CE/PE OHLC per v2 pick)
     run("K3 direction overlay", [PY, "-m", "koscine3.largemove.direction_stage2"], K3, env3)
     run("K3 1-day book", [PY, "-m", "koscine3.largemove.next_day"], K3, env3)
     run("K3 v3 mover-precision book", [PY, "-m", "koscine3.largemove.mover_v3"], K3, env3)
