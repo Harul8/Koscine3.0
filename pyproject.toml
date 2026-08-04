@@ -1,0 +1,33 @@
+[project]
+name = "koscine3"
+version = "0.1.0"
+description = "Clean-room AI swing-trading decision engine."
+requires-python = ">=3.11"
+dependencies = [
+  "catboost",
+  "fastapi",
+  "joblib",
+  "lightgbm",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "scikit-learn",
+  "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+]
+
+[project.scripts]
+koscine3 = "koscine3.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+

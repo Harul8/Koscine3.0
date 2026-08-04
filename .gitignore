@@ -1,0 +1,65 @@
+# ---- Data & generated artifacts (large / reproducible) ----
+data/
+models/
+locks/
+runs/
+reports/
+predictions/
+catboost_info/
+Universe/
+.tmp_refresh_repro/
+
+# Data / model / archive file types (anywhere, incl. experiments/)
+*.parquet
+*.feather
+*.zip
+*.xls
+*.xlsx
+*.cbm
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.bin
+
+# Experiment result payloads (keep .py/.md/.json source, drop heavy outputs)
+experiments/**/results/
+experiments/**/*.csv
+experiments/**/*.png
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Frontend ----
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ---- Tooling / local agent config ----
+.claude/
+.agents/
+.tmp*/
+
+# ---- Secrets / local env ----
+.env
+.env.*
+*.key
+*.pem
+*credential*
+*secret*
+
+# ---- Logs ----
+*.log
+
+# ---- OS ----
+.DS_Store
+Thumbs.db

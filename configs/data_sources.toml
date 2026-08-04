@@ -1,0 +1,17 @@
+[source]
+name = "koscine_2_daily_features_ready_table"
+path = 'C:\Users\rahul\Koscine 3.0\data\processed\daily_features.parquet'
+rows = 1314313
+columns = 193
+symbols = 447
+date_min = "2010-01-04"
+date_max = "2026-06-05"
+
+[usage_policy]
+use_as_market_data_source = true
+reuse_old_models = false
+reuse_old_predictions = false
+reuse_old_overlays = false
+reuse_old_go_labels = false
+reuse_old_promotion_rules = false
+
