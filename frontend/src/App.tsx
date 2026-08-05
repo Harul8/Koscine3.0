@@ -536,6 +536,8 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   }, [tf, autoDD]);
   const one = horizon === "1d";
   const candles = useMemo(() => resample(data.series, tf), [data.series, tf]);
+  // S/R is always computed on weekly bars, independent of the displayed timeframe (see Candles).
+  const weeklyFull = useMemo(() => resample(data.series, "W"), [data.series]);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
     if (!symbol) return;
@@ -564,11 +566,13 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
           <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
                  onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
         </label>
-        <span className="hint">latest {DEFAULT_CANDLES} · scroll to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
+        <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · scroll to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
         <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
-        <div style={{ padding: 14 }}><Candles series={candles} showLevels={showLevels} minDDpct={minDD} /></div>
+        <div style={{ padding: 14 }}>
+          <Candles series={candles} weeklyFull={weeklyFull} showLevels={showLevels} minDDpct={minDD} defaultCandles={DEFAULT_CANDLES_BY_TF[tf]} />
+        </div>
       </section>
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title"><h2>{one ? "Next-day prediction vs realized" : "ATM option premium at each pick"}</h2><span>{(one ? nd : data.premiums).length} rows</span></div>
@@ -672,19 +676,36 @@ function computeAutoDD(daily: PricePoint[]): number | null {
   return null;
 }
 
-type Level = { price: number; kind: "R" | "S" | "ATH"; touches: number; firstIdx: number };
-type Zone = { price: number; touches: number; firstIdx: number };
+// Largest index i with arr[i].date <= dateStr (arr sorted ascending by date); -1 if none.
+function idxOnOrBefore(arr: PricePoint[], dateStr: string): number {
+  let lo = 0, hi = arr.length - 1, ans = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (arr[mid].date <= dateStr) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+  return ans;
+}
+// Smallest index i with arr[i].date >= dateStr; arr.length if none.
+function idxOnOrAfter(arr: PricePoint[], dateStr: string): number {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (arr[mid].date < dateStr) lo = mid + 1; else hi = mid; }
+  return lo;
+}
 
-// Support/resistance from local swing pivots within the VISIBLE window `vis` (re-derived on
-// every pan/zoom; no look-ahead — everything below only looks at bars <= the last visible one).
+type Level = { price: number; kind: "R" | "S" | "ATH"; touches: number; firstDate: string };
+type Zone = { price: number; touches: number; firstDate: string };
+
+// Support/resistance is timeframe-independent: `vis` is always the WEEKLY-resampled history
+// (see Candles), never daily/monthly-specific pivots — the same lines apply whether you're
+// looking at daily, weekly or monthly candles. It's the full backward history up to (never past)
+// the last visible bar's date — no look-ahead — NOT clipped to the left edge of whatever x-range
+// happens to be panned/zoomed into; a separate display filter then decides whether to draw a
+// given line, based on whether its price falls in the currently visible y-axis range.
 // Every N-bar local pivot high/low is a raw candidate (no per-peak filter); candidates within 1%
 // cluster into a price zone. Within a zone, pivots are walked in time order and only count as a
 // NEW touch (vs. still being part of the same ongoing test) if, since the last accepted touch,
 // price either pulled >= dd away from the zone OR stayed on the far side of it (below for
 // resistance, above for support) for >= G consecutive bars — a genuine gap, not a flat re-test a
 // few bars later. Only zones with >= 2 touches qualify. Returns the 2 nearest resistance zones
-// above the last-visible close and the 2 nearest support zones below (<= 4 lines), plus the
-// all-time-high zone (blue) when `ath` sits among the visible swing highs.
+// above the latest close and the 2 nearest support zones below (<= 4 lines), plus the all-time-
+// high zone (blue) when `ath` coincides with one of the qualifying swing highs.
 function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
   // N=2: needs to beat only its 2 nearest neighbors each side. N=3 was too wide — two genuinely
   // separate nearby peaks (e.g. 3 weeks apart on a weekly chart) could sit within each other's
@@ -731,23 +752,23 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
       const ddOk = isResistance ? minLow <= level * (1 - dd) : maxHigh >= level * (1 + dd);
       if (ddOk || bestStreak >= G) { touches++; lastI = curI; }
     }
-    return touches >= 2 ? { price: level, touches, firstIdx: byTime[0].i } : null;
+    return touches >= 2 ? { price: level, touches, firstDate: vis[byTime[0].i].date } : null;
   };
   const resZones = clusterRaw(highs).map((m) => resolveZone(m, true)).filter((z): z is Zone => z !== null);
   const supZones = clusterRaw(lows).map((m) => resolveZone(m, false)).filter((z): z is Zone => z !== null);
-  const refClose = vis[n - 1].close;
+  const refClose = vis[n - 1].close;   // vis is always the full history, so this is the latest close
   // 2 nearest >=2-touch resistance zones above the close, 2 nearest support zones below
   const above = resZones.filter((z) => z.touches >= 2 && z.price > refClose).sort((a, b) => a.price - b.price).slice(0, 2);
   const below = supZones.filter((z) => z.touches >= 2 && z.price < refClose).sort((a, b) => b.price - a.price).slice(0, 2);
   const sel: Level[] = [];
-  for (const z of above) sel.push({ price: z.price, kind: "R", touches: z.touches, firstIdx: z.firstIdx });
-  for (const z of below) sel.push({ price: z.price, kind: "S", touches: z.touches, firstIdx: z.firstIdx });
-  // all-time-high zone (blue) when a >=2-touch zone sits at the global ATH, within the visible window
+  for (const z of above) sel.push({ price: z.price, kind: "R", touches: z.touches, firstDate: z.firstDate });
+  for (const z of below) sel.push({ price: z.price, kind: "S", touches: z.touches, firstDate: z.firstDate });
+  // all-time-high zone (blue) when a >=2-touch zone sits at the global ATH
   const athZone = resZones.filter((z) => z.touches >= 2 && Math.abs(z.price - ath) / ath <= athTol).sort((a, b) => b.price - a.price)[0];
   if (athZone) {
     const dup = sel.find((x) => Math.abs(x.price - athZone.price) / athZone.price < 1e-9);
     if (dup) dup.kind = "ATH";
-    else sel.push({ price: athZone.price, kind: "ATH", touches: athZone.touches, firstIdx: athZone.firstIdx });
+    else sel.push({ price: athZone.price, kind: "ATH", touches: athZone.touches, firstDate: athZone.firstDate });
   }
   return sel;
 }
@@ -764,14 +785,18 @@ function niceTicks(lo: number, hi: number, count = 10): number[] {
   return out;
 }
 
-const DEFAULT_CANDLES = 100;
+// Default visible candle count per timeframe. Monthly's ~120 months of 10y history is under
+// this, so "9999" effectively means "show all" via the same defWin(len - N) clamp-to-0 logic.
+const DEFAULT_CANDLES_BY_TF: Record<Timeframe, number> = { D: 300, W: 150, M: 9999 };
 
-function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showLevels: boolean; minDDpct: number }) {
+function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
+  series: PricePoint[]; weeklyFull: PricePoint[]; showLevels: boolean; minDDpct: number; defaultCandles: number;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const defWin = (len: number) => ({ s: Math.max(0, len - DEFAULT_CANDLES), e: len });
+  const defWin = (len: number) => ({ s: Math.max(0, len - defaultCandles), e: len });
   const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
   const [hover, setHover] = useState<number | null>(null);
-  // default to the most recent ~100 candles; reset when the series changes (symbol / timeframe)
+  // default to the most recent `defaultCandles`; reset when the series changes (symbol / timeframe)
   useEffect(() => { setWin(defWin(series.length)); setHover(null); }, [series]);
 
   const W = 900, H = 300, padX = 40, padTop = 14, padBot = 34;
@@ -784,13 +809,19 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
   const cw = Math.max(1, Math.min(14, slot * 0.7));
   const x = (i: number) => padX + slot * (i + 0.5);
 
-  // S/R levels from the VISIBLE window only (series[s..e)); recompute on pan/zoom
+  // S/R: full backward WEEKLY history up to (never past) the last-visible bar's date — no
+  // look-ahead, but not clipped to the x-window's left edge either. Recomputes only when the
+  // right edge's date changes (panning within the same right edge doesn't refire this).
+  const lastVisibleDate = vis.length ? vis[vis.length - 1].date : null;
   const levels = useMemo(() => {
-    if (!showLevels) return [];
+    if (!showLevels || !lastVisibleDate) return [];
+    const endIdx = idxOnOrBefore(weeklyFull, lastVisibleDate);
+    if (endIdx < 0) return [];
+    const scoped = weeklyFull.slice(0, endIdx + 1);
     let a = -Infinity;
-    for (const p of series) if (p.high > a) a = p.high;   // global all-time high
-    return srLevels(series.slice(s, e), minDDpct / 100, a);
-  }, [series, s, e, showLevels, minDDpct]);
+    for (const p of scoped) if (p.high > a) a = p.high;   // all-time high as of lastVisibleDate
+    return srLevels(scoped, minDDpct / 100, a);
+  }, [weeklyFull, lastVisibleDate, showLevels, minDDpct]);
 
   // native wheel listener (passive:false so we can preventDefault the page scroll)
   useEffect(() => {
@@ -837,7 +868,7 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
   const hi = rawHi + pad, lo = rawLo - pad;
   const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
   const up = "#167c80", down = "#9a2431";
-  const atDefault = s === Math.max(0, total - DEFAULT_CANDLES) && e === total;
+  const atDefault = s === Math.max(0, total - defaultCandles) && e === total;
   const grid = niceTicks(lo, hi, 10);
 
   const idxFromClientX = (clientX: number): number => {
@@ -864,7 +895,7 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
       <div className="candles-toolbar">
         <button type="button" title="Zoom in" onClick={() => { const w = Math.max(6, Math.round(n * 0.7)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>+</button>
         <button type="button" title="Zoom out" onClick={() => { const w = Math.min(total, Math.round(n * 1.4)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>−</button>
-        <button type="button" title="Reset to latest 100" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
+        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
         {/* y-axis grid: light-grey lines at rounded price levels */}
@@ -887,10 +918,13 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
             </g>
           );
         })}
-        {/* S/R zones (only those within the visible price range): first touch -> right edge */}
+        {/* S/R zones (only those within the visible price range): first touch -> right edge.
+            firstDate comes from the weekly-computed zone; resolve it to a position on whatever
+            timeframe is currently displayed (series), relative to the visible window start s. */}
         {levels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
           const color = L.kind === "ATH" ? "#2563b0" : "#33443d";
-          const xStart = Math.min(W - padX, Math.max(padX, x(L.firstIdx)));
+          const relIdx = idxOnOrAfter(series, L.firstDate) - s;
+          const xStart = Math.min(W - padX, Math.max(padX, x(relIdx)));
           return (
             <g key={`lv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
