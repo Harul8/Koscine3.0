@@ -527,6 +527,8 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   const [tf, setTf] = useState<Timeframe>("D");
   const [showLevels, setShowLevels] = useState(true);
   const [minDD, setMinDD] = useState(10);
+  // default drawdown by timeframe: 10% on daily, 20% on weekly/monthly (still overridable)
+  useEffect(() => { setMinDD(tf === "D" ? 10 : 20); }, [tf]);
   const one = horizon === "1d";
   const candles = useMemo(() => resample(data.series, tf), [data.series, tf]);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
@@ -630,94 +632,63 @@ function resample(series: PricePoint[], tf: Timeframe): PricePoint[] {
 }
 
 type Level = { price: number; kind: "R" | "S" | "ATH"; touches: number; firstIdx: number };
+type Zone = { price: number; touches: number; firstIdx: number };
 
-// Wick-based support/resistance, evaluated as of the LAST bar in `series` (so panning
-// re-derives them from the data visible up to that day). N-bar pivot highs/lows are
-// clustered by price; a cluster is a zone only if the level was revisited >= 2 times
-// with a real pullback (>= minDD) BETWEEN visits (a flat stall = one touch). Returns at
-// most 3: nearest support below the last close, nearest resistance above it, and — if a
-// zone sits at the all-time high — that ATH zone (kind "ATH"). firstIdx = first touch.
-function srLevels(series: PricePoint[], minDD: number): Level[] {
-  const N = 3, tol = 0.008, minTouches = 2, athTol = 0.02;
-  const n = series.length;
-  if (n < 2 * N + 1) return [];
-  const hiP: number[] = [], loP: number[] = [];
-  for (let i = N; i < n - N; i++) {
-    let isHi = true, isLo = true;
-    for (let j = i - N; j <= i + N; j++) {
-      if (j === i) continue;
-      if (series[j].high >= series[i].high) isHi = false;
-      if (series[j].low <= series[i].low) isLo = false;
+// Support/resistance from ZigZag swings within the VISIBLE window `vis` (re-derived on every
+// pan/zoom; no look-ahead). A swing high is the highest high of an up-leg — sub-`dd` pullbacks
+// absorbed — confirmed once price falls >= dd from it; swing low is the mirror. Swings within
+// 1% cluster into a zone (touches = # swings; firstIdx = leftmost touch, in `vis` coordinates);
+// only >= 2-touch zones qualify. Returns the 2 nearest resistance zones above the last-visible
+// close and the 2 nearest support zones below (<= 4 lines), plus the all-time-high zone (blue)
+// when `ath` sits among the visible swing highs.
+function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
+  const tol = 0.01, athTol = 0.02;
+  const n = vis.length;
+  if (n < 3) return [];
+  const highs: { i: number; p: number }[] = [], lows: { i: number; p: number }[] = [];
+  let dir = 0, hiI = 0, hiP = vis[0].high, loI = 0, loP = vis[0].low;
+  for (let i = 1; i < n; i++) {
+    const h = vis[i].high, l = vis[i].low;
+    if (dir === 1) {
+      if (h > hiP) { hiP = h; hiI = i; }
+      else if (l <= hiP * (1 - dd)) { highs.push({ i: hiI, p: hiP }); dir = -1; loP = l; loI = i; }
+    } else if (dir === -1) {
+      if (l < loP) { loP = l; loI = i; }
+      else if (h >= loP * (1 + dd)) { lows.push({ i: loI, p: loP }); dir = 1; hiP = h; hiI = i; }
+    } else {
+      if (h > hiP) { hiP = h; hiI = i; }
+      if (l < loP) { loP = l; loI = i; }
+      if (l <= hiP * (1 - dd)) { highs.push({ i: hiI, p: hiP }); dir = -1; loP = l; loI = i; }
+      else if (h >= loP * (1 + dd)) { lows.push({ i: loI, p: loP }); dir = 1; hiP = h; hiI = i; }
     }
-    if (isHi) hiP.push(i);
-    if (isLo) loP.push(i);
   }
-  const build = (idx: number[], kind: "R" | "S"): Level[] => {
-    const pts = idx.map((i) => ({ i, p: kind === "R" ? series[i].high : series[i].low }))
-                   .sort((a, b) => a.p - b.p);
-    const out: Level[] = [];
+  const cluster = (pts: { i: number; p: number }[]): Zone[] => {
+    pts = pts.slice().sort((a, b) => a.p - b.p);
+    const out: Zone[] = [];
     let cl: { i: number; p: number }[] = [];
     const flush = () => {
-      if (cl.length) {
-        const level = cl.reduce((s, x) => s + x.p, 0) / cl.length;
-        const byTime = cl.slice().sort((a, b) => a.i - b.i);
-        let touches = 0, ref = -1;
-        for (const pt of byTime) {
-          if (ref < 0) { touches = 1; ref = pt.i; continue; }
-          let pulled: boolean;
-          if (kind === "R") {
-            let mn = Infinity;
-            for (let k = ref; k <= pt.i; k++) mn = Math.min(mn, series[k].low);
-            pulled = mn <= level * (1 - minDD);
-          } else {
-            let mx = -Infinity;
-            for (let k = ref; k <= pt.i; k++) mx = Math.max(mx, series[k].high);
-            pulled = mx >= level * (1 + minDD);
-          }
-          if (pulled) touches++;
-          ref = pt.i;
-        }
-        if (touches >= minTouches) out.push({ price: level, kind, touches, firstIdx: byTime[0].i });
-      }
+      if (cl.length) out.push({ price: cl.reduce((s, x) => s + x.p, 0) / cl.length, touches: cl.length, firstIdx: Math.min(...cl.map((x) => x.i)) });
       cl = [];
     };
-    for (const pt of pts) {
-      if (cl.length && Math.abs(pt.p - cl[cl.length - 1].p) / pt.p > tol) flush();
-      cl.push(pt);
-    }
+    for (const pt of pts) { if (cl.length && Math.abs(pt.p - cl[cl.length - 1].p) / pt.p > tol) flush(); cl.push(pt); }
     flush();
     return out;
   };
-  // all zones, merge overlapping highs/lows
-  const all = [...build(hiP, "R"), ...build(loP, "S")].sort((a, b) => a.price - b.price);
-  const merged: Level[] = [];
-  for (const L of all) {
-    const last = merged[merged.length - 1];
-    if (last && Math.abs(L.price - last.price) / L.price <= tol) {
-      const tot = last.touches + L.touches;
-      last.price = (last.price * last.touches + L.price * L.touches) / tot;
-      last.touches = Math.max(last.touches, L.touches);
-      last.firstIdx = Math.min(last.firstIdx, L.firstIdx);
-    } else merged.push({ ...L });
-  }
-  // select: nearest support below + nearest resistance above the last visible close,
-  // plus the all-time-high zone (blue) if one exists — max 3 lines
-  const refClose = series[n - 1].close;
-  let ath = -Infinity;
-  for (const p of series) ath = Math.max(ath, p.high);
-  const support = merged.filter((L) => L.price < refClose).sort((a, b) => b.price - a.price)[0];
-  const resistance = merged.filter((L) => L.price > refClose).sort((a, b) => a.price - b.price)[0];
-  const athZone = merged.filter((L) => Math.abs(L.price - ath) / ath <= athTol).sort((a, b) => b.price - a.price)[0];
+  const resZones = cluster(highs), supZones = cluster(lows);
+  const refClose = vis[n - 1].close;
+  // 2 nearest >=2-touch resistance zones above the close, 2 nearest support zones below
+  const above = resZones.filter((z) => z.touches >= 2 && z.price > refClose).sort((a, b) => a.price - b.price).slice(0, 2);
+  const below = supZones.filter((z) => z.touches >= 2 && z.price < refClose).sort((a, b) => b.price - a.price).slice(0, 2);
   const sel: Level[] = [];
-  const add = (L: Level | undefined, isAth = false) => {
-    if (!L) return;
-    const dup = sel.find((x) => Math.abs(x.price - L.price) / L.price < 1e-9);
-    if (dup) { if (isAth) dup.kind = "ATH"; return; }
-    sel.push(isAth ? { ...L, kind: "ATH" } : L);
-  };
-  add(support);
-  add(resistance);
-  if (athZone) add(athZone, true);
+  for (const z of above) sel.push({ price: z.price, kind: "R", touches: z.touches, firstIdx: z.firstIdx });
+  for (const z of below) sel.push({ price: z.price, kind: "S", touches: z.touches, firstIdx: z.firstIdx });
+  // all-time-high zone (blue) when a >=2-touch zone sits at the global ATH, within the visible window
+  const athZone = resZones.filter((z) => z.touches >= 2 && Math.abs(z.price - ath) / ath <= athTol).sort((a, b) => b.price - a.price)[0];
+  if (athZone) {
+    const dup = sel.find((x) => Math.abs(x.price - athZone.price) / athZone.price < 1e-9);
+    if (dup) dup.kind = "ATH";
+    else sel.push({ price: athZone.price, kind: "ATH", touches: athZone.touches, firstIdx: athZone.firstIdx });
+  }
   return sel;
 }
 
@@ -753,11 +724,13 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
   const cw = Math.max(1, Math.min(14, slot * 0.7));
   const x = (i: number) => padX + slot * (i + 0.5);
 
-  // S/R levels re-derived as of the last VISIBLE bar (series[0..e)); recompute on pan/zoom
-  const levels = useMemo(
-    () => (showLevels ? srLevels(series.slice(0, e), minDDpct / 100) : []),
-    [series, e, showLevels, minDDpct],
-  );
+  // S/R levels from the VISIBLE window only (series[s..e)); recompute on pan/zoom
+  const levels = useMemo(() => {
+    if (!showLevels) return [];
+    let a = -Infinity;
+    for (const p of series) if (p.high > a) a = p.high;   // global all-time high
+    return srLevels(series.slice(s, e), minDDpct / 100, a);
+  }, [series, s, e, showLevels, minDDpct]);
 
   // native wheel listener (passive:false so we can preventDefault the page scroll)
   useEffect(() => {
@@ -797,9 +770,11 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
 
   if (total < 2) return <span className="hint">No data</span>;
 
-  const lvlPrices = levels.map((L) => L.price);
-  const hi = Math.max(...vis.map((p) => p.high), ...lvlPrices);
-  const lo = Math.min(...vis.map((p) => p.low), ...lvlPrices);
+  // y-range fits the visible candles (+4% headroom); levels outside it are hidden (not drawn)
+  const rawHi = Math.max(...vis.map((p) => p.high));
+  const rawLo = Math.min(...vis.map((p) => p.low));
+  const pad = (rawHi - rawLo) * 0.04 || 1;
+  const hi = rawHi + pad, lo = rawLo - pad;
   const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
   const up = "#167c80", down = "#9a2431";
   const atDefault = s === Math.max(0, total - DEFAULT_CANDLES) && e === total;
@@ -852,10 +827,10 @@ function Candles({ series, showLevels, minDDpct }: { series: PricePoint[]; showL
             </g>
           );
         })}
-        {/* S/R zones: line runs from its first touch to the right edge; label = price + touches */}
-        {levels.map((L, li) => {
+        {/* S/R zones (only those within the visible price range): first touch -> right edge */}
+        {levels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
           const color = L.kind === "ATH" ? "#2563b0" : "#33443d";
-          const xStart = L.firstIdx <= s ? padX : Math.min(W - padX, x(L.firstIdx - s));
+          const xStart = Math.min(W - padX, Math.max(padX, x(L.firstIdx)));
           return (
             <g key={`lv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
