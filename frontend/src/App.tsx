@@ -30,6 +30,25 @@ function pct(v: unknown, d = 1): string { const n = Number(v ?? 0); return Numbe
 function num(v: unknown, d = 1): string { const n = Number(v); return Number.isFinite(n) ? n.toFixed(d) : "—"; }
 async function getJson<T>(p: string): Promise<T> { const r = await fetch(`${API_BASE}${p}`); if (!r.ok) throw new Error(`${r.status} ${r.statusText}`); return r.json(); }
 async function postJson<T>(p: string): Promise<T> { const r = await fetch(`${API_BASE}${p}`, { method: "POST" }); if (!r.ok) throw new Error(`${r.status}`); return r.json(); }
+function median(vals: number[]): number { if (!vals.length) return 0; const s = [...vals].sort((a, b) => a - b); const mid = Math.floor(s.length / 2); return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2; }
+const MONTH_FMT = new Intl.DateTimeFormat("en-US", { month: "short", year: "2-digit", timeZone: "UTC" });
+function monthsOf<T>(rows: T[], dateOf: (r: T) => string): string[] {
+  return Array.from(new Set(rows.map((r) => dateOf(r).slice(0, 7)))).sort().reverse();
+}
+// One-click month filter for history tables — chips built from the dates actually present.
+function MonthFilter({ months, value, onChange }: { months: string[]; value: string; onChange: (m: string) => void }) {
+  if (!months.length) return null;
+  return (
+    <div className="month-filter">
+      <button type="button" className={`month-chip ${value === "" ? "active" : ""}`} onClick={() => onChange("")}>All</button>
+      {months.map((m) => (
+        <button key={m} type="button" className={`month-chip ${value === m ? "active" : ""}`} onClick={() => onChange(m)}>
+          {MONTH_FMT.format(new Date(`${m}-01T00:00:00Z`))}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 const TABS = [
   { id: "sell", label: "Sell Signals", icon: <Coins size={16} /> },
@@ -174,6 +193,7 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");
+  const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<SignalHist | null>(null);
   useEffect(() => {
     getJson<string[]>(`/prod3/dates?horizon=${horizon}`).then((d) => { setDates(d); setDate((old) => d.includes(old) ? old : d[0] || ""); }).catch((e) => setErr(String(e)));
@@ -187,8 +207,23 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
   useEffect(() => {
     getJson<SignalHist>(`/prod3/signal_history?horizon=${horizon}${filterSym ? `&symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
   }, [horizon, filterSym]);
-  const hs = hist?.summary;
+  useEffect(() => setFilterMonth(""), [filterSym, horizon]);
   const allSyms = filterSym === "";
+  const histMonths = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.date), [hist]);
+  const histRows = useMemo(() => {
+    const all = hist?.rows ?? [];
+    return filterMonth ? all.filter((r) => r.date.startsWith(filterMonth)) : all;
+  }, [hist, filterMonth]);
+  const hs = useMemo(() => {
+    if (!histRows.length) return null;
+    return {
+      n: histRows.length, hit_rate: histRows.filter((r) => r.hit).length / histRows.length,
+      mean_pred_pct: Math.round((histRows.reduce((s, r) => s + r.pred_move_pct, 0) / histRows.length) * 100) / 100,
+      mean_actual_pct: Math.round((histRows.reduce((s, r) => s + r.actual_move_pct, 0) / histRows.length) * 100) / 100,
+      median_actual_pct: Math.round(median(histRows.map((r) => r.actual_move_pct)) * 100) / 100,
+      worst_actual_pct: Math.round(Math.min(...histRows.map((r) => r.actual_move_pct)) * 100) / 100,
+    };
+  }, [histRows]);
   const rows = [...(data?.signals ?? [])].sort((a, b) => {
     const value = (r: DeskRow): string | number | null | undefined => ({ group: GROUP_LABEL[r.group] ?? r.group, rank: r.rank, symbol: r.symbol, conviction: r.conv_pctile, iv: r.atm_iv, liquidity: r.atm2_contracts, v2: r.v2_pick ? r.pick_rank ?? 99 : 999, forecast: r.pred_move_pct, actual: r.actual_peak_signed_pct, peak: r.next_day_peak_expected_pct, close: r.next_day_close_expected_pct, lean: r.lean })[sort.key];
     const av = value(a), bv = value(b); const missing = (v: unknown) => v == null || (typeof v === "number" && !Number.isFinite(v));
@@ -234,6 +269,7 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
       <p className="hint" style={{ padding: "10px 16px 0" }}>
         Direction-agnostic: this book forecasts move <strong>size</strong>, not side. "Hit" = realized 5-day peak |move| ≥ 6%.
       </p>
+      <MonthFilter months={histMonths} value={filterMonth} onChange={setFilterMonth} />
       {hs ? (
         <div className="sell-bt">{hs.n} signals · hit rate (≥6%) <b>{(hs.hit_rate * 100).toFixed(0)}%</b> ·
           mean predicted <b>{hs.mean_pred_pct}%</b> vs mean realized <b>{hs.mean_actual_pct}%</b> ·
@@ -246,7 +282,7 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
             <th>Predicted move</th><th>Realized move</th><th>Hit ≥6%</th>
           </tr></thead>
           <tbody>
-            {(hist?.rows ?? []).map((r, i) => (
+            {histRows.map((r, i) => (
               <tr key={`${r.symbol}-${r.date}-${i}`}>
                 <td>{r.date}</td>
                 {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td> : null}
@@ -259,7 +295,7 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
                 <td>{r.hit ? "✓" : "✕"}</td>
               </tr>
             ))}
-            {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 9 : 8} className="empty-cell">No signals</td></tr>}
+            {!histRows.length && <tr><td colSpan={allSyms ? 9 : 8} className="empty-cell">No signals</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1164,6 +1200,7 @@ function SellStrategies() {
   const [data, setData] = useState<SellResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");   // "" = all
+  const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<SellHist | null>(null);
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   useEffect(() => { getJson<SellResp>("/prod2/sell_strategies").then(setData).catch(() => setData(null)); }, []);
@@ -1171,13 +1208,29 @@ function SellStrategies() {
   useEffect(() => {
     getJson<SellHist>(`/prod2/sell_signal_history${filterSym ? `?symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
   }, [filterSym]);
+  useEffect(() => setFilterMonth(""), [filterSym]);
 
   const bt = data?.backtest;
   const cands = data?.candidates ?? [];
   // top 3 per group for the daily signals
   const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g).slice(0, 3));
-  const hs = hist?.summary;
   const allSyms = filterSym === "";
+  const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
+  const histRows = useMemo(() => {
+    const all = hist?.rows ?? [];
+    return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
+  }, [hist, filterMonth]);
+  const hs = useMemo(() => {
+    if (!histRows.length) return null;
+    return {
+      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
+      ev_ror_pct: Math.round((histRows.reduce((s, r) => s + r.ror_pct, 0) / histRows.length) * 10) / 10,
+      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
+      total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
+    };
+  }, [histRows]);
 
   return (
     <>
@@ -1235,6 +1288,7 @@ function SellStrategies() {
             </select>
           </label>
         </div>
+        <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
@@ -1247,7 +1301,7 @@ function SellStrategies() {
               <th>Short C / P</th><th>Credit</th><th>Max risk</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
-              {(hist?.rows ?? []).map((r, i) => (
+              {histRows.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
                   <td>{r.signal_date}</td>
                   {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
@@ -1263,7 +1317,7 @@ function SellStrategies() {
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 12 : 11} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 12 : 11} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1301,6 +1355,7 @@ function SkewStrategy() {
   const [data, setData] = useState<SkewResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");
+  const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<SkewHist | null>(null);
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   useEffect(() => { getJson<SkewResp>("/prod2/skew_strategy").then(setData).catch(() => setData(null)); }, []);
@@ -1308,12 +1363,28 @@ function SkewStrategy() {
   useEffect(() => {
     getJson<SkewHist>(`/prod2/skew_signal_history${filterSym ? `?symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
   }, [filterSym]);
+  useEffect(() => setFilterMonth(""), [filterSym]);
 
   const bt = data?.backtest;
   const cands = data?.candidates ?? [];
   const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g).slice(0, 3));
-  const hs = hist?.summary;
   const allSyms = filterSym === "";
+  const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
+  const histRows = useMemo(() => {
+    const all = hist?.rows ?? [];
+    return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
+  }, [hist, filterMonth]);
+  const hs = useMemo(() => {
+    if (!histRows.length) return null;
+    return {
+      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
+      ev_ror_pct: Math.round((histRows.reduce((s, r) => s + r.ror_pct, 0) / histRows.length) * 10) / 10,
+      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
+      total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
+    };
+  }, [histRows]);
 
   return (
     <>
@@ -1376,6 +1447,7 @@ function SkewStrategy() {
             </select>
           </label>
         </div>
+        <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
@@ -1388,7 +1460,7 @@ function SkewStrategy() {
               <th>Short / Long</th><th>Credit</th><th>Max risk</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
-              {(hist?.rows ?? []).map((r, i) => (
+              {histRows.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
                   <td>{r.signal_date}</td>
                   {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
@@ -1405,7 +1477,7 @@ function SkewStrategy() {
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 13 : 12} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 13 : 12} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
