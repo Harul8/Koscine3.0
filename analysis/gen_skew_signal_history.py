@@ -1,12 +1,12 @@
 """Generate the historical IV-skew signal log: only the dates a signal actually fired
-(IV-rich AND near-expiry entry window), selling whichever side (CE/PE) has the richer
-Black-Scholes implied vol at entry, held to day-5/expiry close (no interim stop-loss --
-every tested EOD stop level made results worse; see analysis/skew_stop_loss_note.md).
-Writes locks/prod_sell_strategies/skew_signal_history.csv for the API
-(/prod2/skew_signal_history) to serve.
+(IV-rich, no DTE window -- always the nearest available expiry), selling whichever side
+(CE/PE) has the richer Black-Scholes implied vol at entry, held to day-5/expiry close
+(no interim stop-loss -- every tested EOD stop level made results worse). Writes
+locks/prod_sell_strategies/skew_signal_history.csv for the API (/prod2/skew_signal_history)
+to serve.
 
 Pipeline:
-  1. python analysis/build_sell_panel.py 2024-08-01 2026-08-04 panel.parquet   # cache the A/B option panel
+  1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
   2. python analysis/gen_skew_signal_history.py panel.parquet                   # -> locks/prod_sell_strategies/skew_signal_history.csv
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
 SHORT_OTM, WING, FWD = 0.02, 0.03, 5
-DTE_LO, DTE_HI, IV_RICH = 5, 12, 1.1
+IV_RICH = 1.1   # no DTE window -- signal fires on any day IV is rich, using whatever expiry is nearest
 R = 0.065
 
 
@@ -81,11 +81,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if ivr is None or not (ivr >= IV_RICH):
         continue
     u = day["underlying"].iloc[0]
-    day2 = day.assign(dte=(day["expiry"] - pd.Timestamp(e_date)).dt.days)
-    day2 = day2[(day2["dte"] >= DTE_LO) & (day2["dte"] <= DTE_HI)]
-    if day2.empty:
-        continue
-    exp = day2["expiry"].min(); chain = day2[day2["expiry"] == exp]
+    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry, no DTE filter
     dte = int((exp - pd.Timestamp(e_date)).days)
     win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
 

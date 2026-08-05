@@ -1185,7 +1185,7 @@ type CondorRow = {
 };
 type SellResp = {
   as_of: string | null; params: Record<string, number>;
-  backtest: { window: string; ev_on_risk_all: number; ev_on_risk_iv_rich: number; win_rate: number; worst: string };
+  backtest: { window: string; ev_on_risk: number; win_rate: number; worst: string };
   candidates: CondorRow[];
 };
 type SellHistRow = {
@@ -1246,12 +1246,12 @@ function SellStrategies() {
             <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
             <b> Max loss is always capped</b> at (wing width − credit); you can never lose more than the max-risk shown.
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1)
-            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1) — no DTE window,
+            always the nearest available expiry. Rows meeting the IV bar are the <b>entry-window</b> picks (highlighted).</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); it decays in your favour while price stays between the breakevens.</div>
           {bt ? (
-            <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk_all * 100).toFixed(0)}%</b> mean return-on-risk (all),
-              <b> +{(bt.ev_on_risk_iv_rich * 100).toFixed(0)}%</b> when IV-rich, win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
+            <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
+              win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
               <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
           ) : null}
         </div>
@@ -1404,10 +1404,10 @@ function SkewStrategy() {
             <b> Max loss is always capped</b> at (wing width − credit).
             <span className="hint"> This is a relative-value read on option pricing, not a forecast of which way the stock moves — direction alone is ≈ coin-flip on this universe.</span>
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1)
-            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1) — no DTE window,
+            always the nearest available expiry. Rows meeting the IV bar are the <b>entry-window</b> picks (highlighted).</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first) — <b>no interim stop-loss</b>.
-            Every EOD stop level tested (15–50% of max risk) reduced win rate and mean return: at 5–12 DTE, day-close dips mostly mean-revert by expiry, so a stop just locks in a temporary drawdown.</div>
+            Day-close dips over the hold tend to mean-revert, so a stop just locks in a temporary drawdown (finding validated under the prior DTE-windowed backtest; not yet re-tested for this no-DTE-window version).</div>
           {bt ? (
             <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
               win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.

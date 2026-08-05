@@ -1,9 +1,10 @@
 """Generate the historical Sell-Strategy signal log: only the dates a condor signal actually
-fired (IV-rich AND near-expiry entry window), with entry / exit / PnL / max-drawdown per trade.
-Writes locks/prod_sell_strategies/signal_history.csv for the API (/prod2/sell_signal_history) to serve.
+fired (IV-rich, no DTE window -- always the nearest available expiry), with entry / exit / PnL /
+max-drawdown per trade. Writes locks/prod_sell_strategies/signal_history.csv for the API
+(/prod2/sell_signal_history) to serve.
 
 Pipeline:
-  1. python analysis/build_sell_panel.py 2024-08-01 2026-08-04 panel.parquet   # cache the A/B option panel
+  1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
   2. python analysis/gen_sell_signal_history.py panel.parquet                   # -> locks/prod_sell_strategies/signal_history.csv
 """
 from __future__ import annotations
@@ -18,7 +19,7 @@ from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
 SHORT_OTM, WING, FWD = 0.02, 0.03, 5
-DTE_LO, DTE_HI, IV_RICH = 5, 12, 1.1
+IV_RICH = 1.1   # no DTE window -- signal fires on any day IV is rich, using whatever expiry is nearest
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -51,11 +52,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if ivr is None or not (ivr >= IV_RICH):        # signal = IV rich at t
         continue
     u = day["underlying"].iloc[0]
-    day = day.assign(dte=(day["expiry"] - pd.Timestamp(e_date)).dt.days)
-    day = day[(day["dte"] >= DTE_LO) & (day["dte"] <= DTE_HI)]     # near-expiry entry window
-    if day.empty:
-        continue
-    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]
+    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry, no DTE filter
     dte = int((exp - pd.Timestamp(e_date)).days)
     win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
     def pick(ot, tgt):

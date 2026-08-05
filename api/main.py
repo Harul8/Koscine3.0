@@ -401,11 +401,11 @@ def _sell_sources():
 @app.get("/prod2/sell_strategies")
 def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                           wing: float = Query(0.03, ge=0.01, le=0.08),
-                          dte_max: int = Query(14, ge=2, le=45),
                           iv_rich: float = Query(1.1, ge=0.5, le=2.0)) -> dict[str, object]:
     """Live DEFINED-RISK iron-condor candidates on the A/B universe: sell ~short_otm% OTM CE+PE,
-    buy the +wing% wings (loss always capped). Ranked by IV-richness x return-on-risk. Entry
-    window flagged when DTE<=dte_max and IV is rich. Backtest context (2y, pre-cost) is embedded."""
+    buy the +wing% wings (loss always capped), always on the nearest available expiry -- no DTE
+    window. Ranked by IV-richness x return-on-risk. Entry window flagged when IV is rich.
+    Backtest context (2y, pre-cost) is embedded."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
@@ -448,14 +448,14 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
-            "in_window": bool(dte <= dte_max and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+            "in_window": bool(ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
         })
     out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing": wing, "dte_max": dte_max, "iv_rich": iv_rich},
-        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE 5-12, pre-cost)",
-                     "ev_on_risk_all": 0.46, "ev_on_risk_iv_rich": 0.68, "win_rate": 0.93, "worst": "-0.84x (capped)"},
+        "params": {"short_otm": short_otm, "wing": wing, "iv_rich": iv_rich},
+        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, IV-rich, any DTE, pre-cost)",
+                     "ev_on_risk": 0.46, "win_rate": 0.785, "worst": "-1.07x (capped)"},
         "candidates": out,
     }
 
@@ -463,13 +463,13 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 @app.get("/prod2/skew_strategy")
 def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                         wing: float = Query(0.03, ge=0.01, le=0.08),
-                        dte_max: int = Query(14, ge=2, le=45),
                         iv_rich: float = Query(1.1, ge=0.5, le=2.0)) -> dict[str, object]:
     """Live DEFINED-RISK single-side credit spread on the A/B universe: back out BS implied vol
     for the ~short_otm% OTM call and put separately, sell whichever side is relatively richer
-    (skew = ce_iv - pe_iv) with the +wing% wing bought (loss always capped) -- a relative-value
-    read on option pricing, not a forecast of which way the stock moves. Ranked by IV-richness x
-    return-on-risk. Backtest context (2y, pre-cost) is embedded."""
+    (skew = ce_iv - pe_iv) with the +wing% wing bought (loss always capped), always on the
+    nearest available expiry -- no DTE window. A relative-value read on option pricing, not a
+    forecast of which way the stock moves. Ranked by IV-richness x return-on-risk. Backtest
+    context (2y, pre-cost) is embedded."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
@@ -522,16 +522,17 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "sell_premium": round(sell_premium, 2), "buy_premium": round(buy_premium, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
-            "in_window": bool(dte <= dte_max and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+            "in_window": bool(ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
         })
     out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing": wing, "dte_max": dte_max, "iv_rich": iv_rich},
-        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE 5-12, pre-cost)",
-                     "ev_on_risk": 0.305, "win_rate": 0.844, "worst": "-0.44x (capped)",
-                     "note": "no interim stop-loss -- every tested EOD stop level (15-50% of max risk) "
-                             "reduced win rate and mean return vs holding to ~50% max profit / expiry"},
+        "params": {"short_otm": short_otm, "wing": wing, "iv_rich": iv_rich},
+        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, IV-rich, any DTE, pre-cost)",
+                     "ev_on_risk": 0.269, "win_rate": 0.814, "worst": "-0.93x (capped)",
+                     "note": "no interim stop-loss -- day-close dips over a 5-day hold tend to mean-revert; "
+                             "a stop just locks in a temporary drawdown (validated under the prior DTE-windowed "
+                             "backtest, not yet re-tested for this no-DTE-window version)"},
         "candidates": out,
     }
 
