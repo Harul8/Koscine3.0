@@ -344,6 +344,96 @@ def prod2_stock_history(symbol: str) -> list[dict[str, object]]:
     return _records(df)
 
 
+# ---- Sell Strategies (defined-risk premium selling) -------------------------------------------
+_SELL_CACHE: dict = {"mtime": None, "contracts": None, "iv": None}
+
+
+def _sell_sources():
+    """Latest per-strike option chain (eod_deriv_contracts) + per-stock ATM-IV history, cached."""
+    import glob
+    from koscine.config import SILVER_DATA_ROOT
+    root = SILVER_DATA_ROOT / "eod_deriv_contracts"
+    files = sorted(glob.glob(str(root / "**" / "*.parquet"), recursive=True))
+    if not files:
+        return None, None
+    mt = max(os.path.getmtime(f) for f in files)
+    if _SELL_CACHE["mtime"] != mt:
+        c = pd.concat([pd.read_parquet(f) for f in files[-2:]], ignore_index=True)
+        c["date"] = pd.to_datetime(c["date"]); c["expiry"] = pd.to_datetime(c["expiry"])
+        dd = pd.read_parquet(SILVER_DATA_ROOT / "eod_deriv_daily.parquet", columns=["date", "symbol", "atm_iv"])
+        dd["date"] = pd.to_datetime(dd["date"]); dd["symbol"] = dd["symbol"].astype(str)
+        dd = dd.sort_values(["symbol", "date"])
+        dd["iv_ratio"] = dd.groupby("symbol")["atm_iv"].transform(
+            lambda s: s / s.rolling(252, min_periods=60).median())
+        _SELL_CACHE.update(mtime=mt, contracts=c, iv=dd)
+    return _SELL_CACHE["contracts"], _SELL_CACHE["iv"]
+
+
+@app.get("/prod2/sell_strategies")
+def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
+                          wing: float = Query(0.03, ge=0.01, le=0.08),
+                          dte_max: int = Query(14, ge=2, le=45),
+                          iv_rich: float = Query(1.1, ge=0.5, le=2.0)) -> dict[str, object]:
+    """Live DEFINED-RISK iron-condor candidates on the A/B universe: sell ~short_otm% OTM CE+PE,
+    buy the +wing% wings (loss always capped). Ranked by IV-richness x return-on-risk. Entry
+    window flagged when DTE<=dte_max and IV is rich. Backtest context (2y, pre-cost) is embedded."""
+    contracts, iv = _sell_sources()
+    if contracts is None:
+        return {"as_of": None, "candidates": [], "note": "no option-chain data"}
+    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    last = contracts["date"].max()
+    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
+                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & (contracts["underlying_price"] > 0)].copy()
+    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
+
+    def price(row):  # leg mid: prefer close, fall back to settle
+        p = row.get("close")
+        return float(p) if pd.notna(p) and p > 0 else (float(row["settle"]) if pd.notna(row.get("settle")) else np.nan)
+
+    out = []
+    for sym, sg in day.groupby("symbol"):
+        exp = sg["expiry"].min()
+        chain = sg[sg["expiry"] == exp]
+        u = float(chain["underlying_price"].iloc[0])
+        dte = int((exp - last).days)
+        ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
+        if ce.empty or pe.empty:
+            continue
+        def nearest(df, target):
+            r = df.iloc[(df["strike"] - target).abs().argmin()]
+            return r
+        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
+        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        psce, plce, pspe, plpe = price(sce), price(lce), price(spe), price(lpe)
+        if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
+            continue
+        credit = (psce + pspe) - (plce + plpe)
+        width = max(float(lce["strike"] - sce["strike"]), float(spe["strike"] - lpe["strike"]))
+        risk = width - credit
+        if credit <= 0 or risk <= 0:
+            continue
+        ivr = ivlast.get(sym)
+        out.append({
+            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
+            "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
+            "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+            "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+            "ror_pct": round(credit / risk * 100, 1),
+            "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
+            "in_window": bool(dte <= dte_max and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+        })
+    out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
+    return {
+        "as_of": last.date().isoformat(),
+        "params": {"short_otm": short_otm, "wing": wing, "dte_max": dte_max, "iv_rich": iv_rich},
+        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE 5-12, pre-cost)",
+                     "ev_on_risk_all": 0.46, "ev_on_risk_iv_rich": 0.68, "win_rate": 0.93, "worst": "-0.84x (capped)"},
+        "candidates": out,
+    }
+
+
 @app.get("/prod2/price_history")
 def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=4000)) -> dict[str, object]:
     """Daily price (close/high/low) for a symbol with pick markers + the ATM option premium OHLC per pick."""

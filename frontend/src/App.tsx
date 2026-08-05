@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Cog, Filter, Flame, History, LineChart, Lock, Play, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, Filter, Flame, History, LineChart, Lock, Play, RefreshCw } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
@@ -35,6 +35,7 @@ const TABS = [
   { id: "desk", label: "Signal Desk", icon: <Flame size={16} /> },
   { id: "movers", label: "Universe", icon: <Filter size={16} /> },
   { id: "price", label: "Stock Detail", icon: <LineChart size={16} /> },
+  { id: "sell", label: "Sell Strategies", icon: <Coins size={16} /> },
   { id: "ops", label: "Refresh / Retrain", icon: <Cog size={16} /> }
 ];
 
@@ -78,6 +79,7 @@ export default function App() {
       {tab === "desk" && <SignalDesk {...props} />}
       {tab === "movers" && <DailyMovers {...props} />}
       {tab === "price" && <PriceHistory {...props} />}
+      {tab === "sell" && <SellStrategies />}
       {tab === "ops" && <RunRetrain />}
     </main>
   );
@@ -1018,6 +1020,76 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
         </div>
       ) : null}
     </div>
+  );
+}
+
+// ----------------------------------------------------------------- Sell Strategies
+type CondorRow = {
+  symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
+  short_ce: number; long_ce: number; short_pe: number; long_pe: number;
+  credit: number; max_risk: number; max_profit: number; ror_pct: number; be_low: number; be_high: number; in_window: boolean;
+};
+type SellResp = {
+  as_of: string | null; params: Record<string, number>;
+  backtest: { window: string; ev_on_risk_all: number; ev_on_risk_iv_rich: number; win_rate: number; worst: string };
+  candidates: CondorRow[];
+};
+
+function SellStrategies() {
+  const [data, setData] = useState<SellResp | null>(null);
+  useEffect(() => { getJson<SellResp>("/prod2/sell_strategies").then(setData).catch(() => setData(null)); }, []);
+  const bt = data?.backtest;
+  const rows = data?.candidates ?? [];
+  const live = rows.filter((r) => r.in_window).length;
+  return (
+    <>
+      <section className="panel cockpit">
+        <div className="panel-title"><h2>Sell Strategies — defined-risk iron condor</h2>
+          <span>as of {data?.as_of ?? "—"} · {rows.length} names · {live} in entry window</span></div>
+        <div className="sell-explain">
+          <div className="sell-rule">
+            <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
+            <b> Max loss is always capped</b> at (wing width − credit); you can never lose more than the max-risk shown.
+          </div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, `iv_ratio` ≥ 1.1)
+            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rich premium + near expiry = fastest theta. Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); the structure decays in your favour if price stays between the breakevens.</div>
+          {bt ? (
+            <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk_all * 100).toFixed(0)}%</b> mean return-on-risk (all),
+              <b> +{(bt.ev_on_risk_iv_rich * 100).toFixed(0)}%</b> when IV-rich, win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
+              <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
+          ) : null}
+        </div>
+      </section>
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th>
+              <th>Short C / Long C</th><th>Short P / Long P</th><th>Credit</th><th>Max risk</th><th>Ret/risk</th><th>Breakevens</th>
+            </tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
+                  <td><strong>{r.symbol}</strong></td>
+                  <td>{r.group.slice(0, 1)}</td>
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{num(r.underlying, 0)}</td>
+                  <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
+                  <td>{num(r.short_ce, 0)} / {num(r.long_ce, 0)}</td>
+                  <td>{num(r.short_pe, 0)} / {num(r.long_pe, 0)}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td>{num(r.max_risk, 1)}</td>
+                  <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
+                  <td className="hint">{num(r.be_low, 0)} – {num(r.be_high, 0)}</td>
+                </tr>
+              ))}
+              {!rows.length && <tr><td colSpan={11} className="empty-cell">No option-chain data</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
   );
 }
 
