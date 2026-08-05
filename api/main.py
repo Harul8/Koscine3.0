@@ -434,6 +434,32 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     }
 
 
+@app.get("/prod2/sell_signal_history")
+def prod2_sell_signal_history(symbol: str | None = None) -> dict[str, object]:
+    """Historical Sell-Strategy signals (only the dates a condor signal fired: IV-rich + entry
+    window), each with entry credit / exit value / PnL / max intra-trade drawdown. Optional
+    ?symbol= filter. Also returns the aggregate track record for the filtered set."""
+    f = LM_LOCK_V2.parent / "prod_sell_strategies" / "signal_history.csv"
+    if not f.exists():
+        return {"rows": [], "summary": None}
+    df = pd.read_csv(f)
+    if symbol:
+        df = df[df["symbol"].eq(symbol.upper())]
+    df = df.sort_values("entry_date", ascending=False)
+    summary = None
+    if not df.empty:
+        summary = {
+            "n": int(len(df)),
+            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
+            "median_ror_pct": round(float(df["ror_pct"].median()), 1),
+            "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
+            "worst_dd_pct": round(float(df["max_dd_pct"].min()), 1),
+            "total_pnl": round(float(df["pnl"].sum()), 1),
+        }
+    return {"rows": _records(df), "summary": summary}
+
+
 @app.get("/prod2/price_history")
 def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=4000)) -> dict[str, object]:
     """Daily price (close/high/low) for a symbol with pick markers + the ATM option premium OHLC per pick."""

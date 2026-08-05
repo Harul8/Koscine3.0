@@ -1034,34 +1034,53 @@ type SellResp = {
   backtest: { window: string; ev_on_risk_all: number; ev_on_risk_iv_rich: number; win_rate: number; worst: string };
   candidates: CondorRow[];
 };
+type SellHistRow = {
+  symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number;
+  short_ce: number; short_pe: number; credit: number; max_risk: number; exit_value: number;
+  pnl: number; ror_pct: number; max_dd_pct: number; outcome: string;
+};
+type SellHist = {
+  rows: SellHistRow[];
+  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+};
 
 function SellStrategies() {
   const [data, setData] = useState<SellResp | null>(null);
+  const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
+  const [filterSym, setFilterSym] = useState("");   // "" = all
+  const [hist, setHist] = useState<SellHist | null>(null);
   useEffect(() => { getJson<SellResp>("/prod2/sell_strategies").then(setData).catch(() => setData(null)); }, []);
+  useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => {
+    getJson<SellHist>(`/prod2/sell_signal_history${filterSym ? `?symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
+  }, [filterSym]);
+
   const bt = data?.backtest;
-  const rows = data?.candidates ?? [];
-  const live = rows.filter((r) => r.in_window).length;
+  const cands = data?.candidates ?? [];
+  // top 3 per group for the daily signals
+  const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g).slice(0, 3));
+  const hs = hist?.summary;
+  const allSyms = filterSym === "";
+
   return (
     <>
       <section className="panel cockpit">
         <div className="panel-title"><h2>Sell Strategies — defined-risk iron condor</h2>
-          <span>as of {data?.as_of ?? "—"} · {rows.length} names · {live} in entry window</span></div>
+          <span>as of {data?.as_of ?? "—"} · top 3 per group</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
             <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
             <b> Max loss is always capped</b> at (wing width − credit); you can never lose more than the max-risk shown.
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, `iv_ratio` ≥ 1.1)
-            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rich premium + near expiry = fastest theta. Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
-          <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); the structure decays in your favour if price stays between the breakevens.</div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1)
+            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); it decays in your favour while price stays between the breakevens.</div>
           {bt ? (
             <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk_all * 100).toFixed(0)}%</b> mean return-on-risk (all),
               <b> +{(bt.ev_on_risk_iv_rich * 100).toFixed(0)}%</b> when IV-rich, win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
               <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
           ) : null}
         </div>
-      </section>
-      <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="table-wrap">
           <table>
             <thead><tr>
@@ -1069,7 +1088,7 @@ function SellStrategies() {
               <th>Short C / Long C</th><th>Short P / Long P</th><th>Credit</th><th>Max risk</th><th>Ret/risk</th><th>Breakevens</th>
             </tr></thead>
             <tbody>
-              {rows.map((r) => (
+              {daily.map((r) => (
                 <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
                   <td><strong>{r.symbol}</strong></td>
                   <td>{r.group.slice(0, 1)}</td>
@@ -1084,7 +1103,50 @@ function SellStrategies() {
                   <td className="hint">{num(r.be_low, 0)} – {num(r.be_high, 0)}</td>
                 </tr>
               ))}
-              {!rows.length && <tr><td colSpan={11} className="empty-cell">No option-chain data</td></tr>}
+              {!daily.length && <tr><td colSpan={11} className="empty-cell">No option-chain data</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title">
+          <h2>Signal history — returns per fired signal</h2>
+          <label className="chk"><Coins size={15} />
+            <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+              <option value="">All stocks</option>
+              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+            </select>
+          </label>
+        </div>
+        {hs ? (
+          <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
+            mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
+            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk</div>
+        ) : null}
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
+              <th>Short C / P</th><th>Credit (entry)</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+            </tr></thead>
+            <tbody>
+              {(hist?.rows ?? []).map((r, i) => (
+                <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
+                  <td>{r.signal_date}</td>
+                  {allSyms ? <td><strong>{r.symbol}</strong> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{r.iv_ratio.toFixed(2)}×</td>
+                  <td>{num(r.short_ce, 0)} / {num(r.short_pe, 0)}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td>{num(r.exit_value, 1)}</td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</td>
+                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
+                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                </tr>
+              ))}
+              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 11 : 10} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
