@@ -570,26 +570,6 @@ tr.sell-live td:first-child {
   text-decoration: underline;
 }
 
-.month-filter {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 0 16px 12px;
-}
-.month-chip {
-  all: unset;
-  cursor: pointer;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid #d8dfdb;
-  background: #ffffff;
-  color: #52625c;
-  font-size: 12px;
-  font-weight: 620;
-}
-.month-chip:hover { border-color: #167c80; color: #0d666a; }
-.month-chip.active { border-color: #167c80; background: #eef6f3; color: #0d666a; }
-
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -628,9 +608,6 @@ tr.sell-live td:first-child {
   .symbol-link:hover { color: #4fd1c5; }
   .modal-panel { background: #182420; border-color: #2c3a34; }
   .modal-header { background: #182420; border-color: #2c3a34; }
-  .month-chip { background: #1f2a26; border-color: #33443d; color: #b7c4bf; }
-  .month-chip:hover { border-color: #167c80; color: #4fd1c5; }
-  .month-chip.active { background: #17281f; border-color: #167c80; color: #4fd1c5; }
 }
 
 @media (max-width: 980px) {

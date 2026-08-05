@@ -35,18 +35,17 @@ const MONTH_FMT = new Intl.DateTimeFormat("en-US", { month: "short", year: "2-di
 function monthsOf<T>(rows: T[], dateOf: (r: T) => string): string[] {
   return Array.from(new Set(rows.map((r) => dateOf(r).slice(0, 7)))).sort().reverse();
 }
-// One-click month filter for history tables — chips built from the dates actually present.
+// Month filter for history tables — a dropdown (beside the stock filter), built from the
+// dates actually present rather than listing every possible month.
 function MonthFilter({ months, value, onChange }: { months: string[]; value: string; onChange: (m: string) => void }) {
   if (!months.length) return null;
   return (
-    <div className="month-filter">
-      <button type="button" className={`month-chip ${value === "" ? "active" : ""}`} onClick={() => onChange("")}>All</button>
-      {months.map((m) => (
-        <button key={m} type="button" className={`month-chip ${value === m ? "active" : ""}`} onClick={() => onChange(m)}>
-          {MONTH_FMT.format(new Date(`${m}-01T00:00:00Z`))}
-        </button>
-      ))}
-    </div>
+    <label className="chk"><CalendarDays size={15} />
+      <select value={value} onChange={(e) => onChange(e.target.value)} style={{ minWidth: 130 }}>
+        <option value="">All months</option>
+        {months.map((m) => <option key={m} value={m}>{MONTH_FMT.format(new Date(`${m}-01T00:00:00Z`))}</option>)}
+      </select>
+    </label>
   );
 }
 
@@ -169,7 +168,7 @@ type DeskResp = { date: string | null; horizon: Horizon; live?: boolean; signals
 type DeskSortKey = "group" | "rank" | "symbol" | "conviction" | "iv" | "liquidity" | "v2" | "forecast" | "actual" | "peak" | "close" | "lean";
 type SignalHistRow = {
   date: string; group: string; symbol: string; rank: number; conv_pctile: number | null; atm_iv: number;
-  pred_move_pct: number; actual_move_pct: number; hit: boolean;
+  pred_move_pct: number; actual_move_pct: number; actual_move_signed_pct: number; hit: boolean;
 };
 type SignalHist = {
   rows: SignalHistRow[];
@@ -259,17 +258,19 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
     <section className="panel cockpit" style={{ marginTop: 14 }}>
       <div className="panel-title">
         <h2>Signal history — forecast vs realized</h2>
-        <label className="chk"><Coins size={15} />
-          <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
-            <option value="">All stocks</option>
-            {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
-          </select>
-        </label>
+        <div className="panel-title-controls">
+          <label className="chk"><Coins size={15} />
+            <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+              <option value="">All stocks</option>
+              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+            </select>
+          </label>
+          <MonthFilter months={histMonths} value={filterMonth} onChange={setFilterMonth} />
+        </div>
       </div>
       <p className="hint" style={{ padding: "10px 16px 0" }}>
         Direction-agnostic: this book forecasts move <strong>size</strong>, not side. "Hit" = realized 5-day peak |move| ≥ 6%.
       </p>
-      <MonthFilter months={histMonths} value={filterMonth} onChange={setFilterMonth} />
       {hs ? (
         <div className="sell-bt">{hs.n} signals · hit rate (≥6%) <b>{(hs.hit_rate * 100).toFixed(0)}%</b> ·
           mean predicted <b>{hs.mean_pred_pct}%</b> vs mean realized <b>{hs.mean_actual_pct}%</b> ·
@@ -291,7 +292,9 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
                 <td>{r.conv_pctile != null ? `${(r.conv_pctile * 100).toFixed(0)}th` : "—"}</td>
                 <td>{pct(r.atm_iv * 100, 0)}</td>
                 <td><strong>{pct(r.pred_move_pct, 2)}</strong></td>
-                <td className={r.hit ? "move-up" : "hint"}>{pct(r.actual_move_pct, 2)}</td>
+                <td className={r.actual_move_signed_pct >= 0 ? "move-up" : "move-down"}>
+                  {r.actual_move_signed_pct >= 0 ? "+" : "−"}{Math.abs(r.actual_move_signed_pct).toFixed(2)}%
+                </td>
                 <td>{r.hit ? "✓" : "✕"}</td>
               </tr>
             ))}
@@ -1281,14 +1284,16 @@ function SellStrategies() {
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title">
           <h2>Signal history — returns per fired signal</h2>
-          <label className="chk"><Coins size={15} />
-            <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
-              <option value="">All stocks</option>
-              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
-            </select>
-          </label>
+          <div className="panel-title-controls">
+            <label className="chk"><Coins size={15} />
+              <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+                <option value="">All stocks</option>
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+              </select>
+            </label>
+            <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
+          </div>
         </div>
-        <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
@@ -1440,14 +1445,16 @@ function SkewStrategy() {
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title">
           <h2>Signal history — returns per fired signal</h2>
-          <label className="chk"><Coins size={15} />
-            <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
-              <option value="">All stocks</option>
-              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
-            </select>
-          </label>
+          <div className="panel-title-controls">
+            <label className="chk"><Coins size={15} />
+              <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+                <option value="">All stocks</option>
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+              </select>
+            </label>
+            <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
+          </div>
         </div>
-        <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·

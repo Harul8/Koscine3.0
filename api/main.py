@@ -1078,9 +1078,18 @@ def prod3_signal_history(symbol: str | None = None, horizon: str = Query(default
     df["actual_move_pct"] = (df["move_mag"] * 100).round(2)
     df["pred_move_pct"] = df["pred_move_pct"].round(2)
     df["hit"] = df["actual_move_pct"] >= hit_threshold
+    sign_col = "sign_1" if horizon == "1d" else "sign_5"
+    signs = _fwd_move_signs()
+    if not signs.empty and sign_col in signs.columns:
+        df = df.merge(signs[["date", "symbol", sign_col]].rename(columns={sign_col: "move_sign"}),
+                      on=["date", "symbol"], how="left")
+        df["actual_move_signed_pct"] = (df["actual_move_pct"] * df["move_sign"].fillna(1)).round(2)
+    else:
+        df["actual_move_signed_pct"] = df["actual_move_pct"]
     df["date"] = df["date"].dt.strftime("%Y-%m-%d")
     df = df.sort_values("date", ascending=False)
-    out = df[["date", "group", "symbol", "rank", "conv_pctile", "atm_iv", "pred_move_pct", "actual_move_pct", "hit"]]
+    out = df[["date", "group", "symbol", "rank", "conv_pctile", "atm_iv", "pred_move_pct",
+              "actual_move_pct", "actual_move_signed_pct", "hit"]]
     summary = {
         "n": int(len(out)),
         "hit_rate": round(float(out["hit"].mean()), 3),
