@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, Filter, Flame, History, LineChart, Lock, Play, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, X } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
@@ -32,12 +32,16 @@ async function getJson<T>(p: string): Promise<T> { const r = await fetch(`${API_
 async function postJson<T>(p: string): Promise<T> { const r = await fetch(`${API_BASE}${p}`, { method: "POST" }); if (!r.ok) throw new Error(`${r.status}`); return r.json(); }
 
 const TABS = [
-  { id: "desk", label: "Signal Desk", icon: <Flame size={16} /> },
+  { id: "sell", label: "Sell Signals", icon: <Coins size={16} /> },
+  { id: "desk", label: "Buy Signals", icon: <Flame size={16} /> },
   { id: "movers", label: "Universe", icon: <Filter size={16} /> },
-  { id: "price", label: "Stock Detail", icon: <LineChart size={16} /> },
-  { id: "sell", label: "Sell Strategies", icon: <Coins size={16} /> },
+  { id: "price", label: "Chart", icon: <LineChart size={16} /> },
   { id: "ops", label: "Refresh / Retrain", icon: <Cog size={16} /> }
 ];
+
+function urlParam(name: string): string | null {
+  return new URLSearchParams(window.location.search).get(name);
+}
 
 function HorizonFilter({ horizon, setHorizon }: PageProps) {
   return (
@@ -57,9 +61,10 @@ function UMove({ v, live }: { v: number | null | undefined; live: boolean }) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState("desk");
+  const [tab, setTab] = useState(() => urlParam("tab") || "sell");
   const [horizon, setHorizon] = useState<Horizon>("5d");
   const [version, setVersion] = useState("prod");
+  const initialSymbol = useMemo(() => urlParam("symbol") ?? undefined, []);
   useEffect(() => { getJson<Manifest>("/prod2/manifest").then((m) => setVersion(m.version)).catch(() => {}); }, []);
   const props = { horizon, setHorizon };
   return (
@@ -76,12 +81,58 @@ export default function App() {
           <button key={t.id} className={`tab ${tab === t.id ? "active" : ""}`} onClick={() => setTab(t.id)}>{t.icon} {t.label}</button>
         ))}
       </nav>
+      {tab === "sell" && <><SellStrategies /><SkewStrategy /></>}
       {tab === "desk" && <SignalDesk {...props} />}
       {tab === "movers" && <DailyMovers {...props} />}
-      {tab === "price" && <PriceHistory {...props} />}
-      {tab === "sell" && <><SellStrategies /><SkewStrategy /></>}
+      {tab === "price" && <PriceHistory {...props} initialSymbol={initialSymbol} />}
       {tab === "ops" && <RunRetrain />}
     </main>
+  );
+}
+
+function openChartInNewWindow(symbol: string): void {
+  const url = `${window.location.origin}${window.location.pathname}?tab=price&symbol=${encodeURIComponent(symbol)}`;
+  window.open(url, "_blank", "noopener");
+}
+
+// Clickable stock symbol -> opens the chart-preview modal; used across Sell/Buy Signal tables.
+function SymbolLink({ symbol, onOpen }: { symbol: string; onOpen: (s: string) => void }) {
+  return <button type="button" className="symbol-link" onClick={() => onOpen(symbol)}>{symbol}</button>;
+}
+
+// Modal chart preview: reuses the same Candles renderer as the Chart tab, for a quick look
+// without leaving the current tab. "Open in new window" deep-links to the full Chart tab.
+function ChartModal({ symbol, onClose }: { symbol: string; onClose: () => void }) {
+  const [series, setSeries] = useState<PricePoint[]>([]);
+  useEffect(() => {
+    getJson<{ series: PricePoint[] }>(`/prod2/price_history?symbol=${symbol}&days=2520`)
+      .then((d) => setSeries(d.series)).catch(() => setSeries([]));
+  }, [symbol]);
+  const weeklyFull = useMemo(() => resample(series, "W"), [series]);
+  const autoDD = useMemo(() => computeAutoDD(series), [series]);
+  const minDD = autoDD != null ? Math.round(autoDD * 100 * 10) / 10 : 20;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h2>{symbol} — daily candles</h2>
+          <div className="modal-actions">
+            <button type="button" title="Open in new window" onClick={() => openChartInNewWindow(symbol)}><ExternalLink size={16} /></button>
+            <button type="button" title="Close" onClick={onClose}><X size={16} /></button>
+          </div>
+        </div>
+        <div style={{ padding: 14 }}>
+          {series.length
+            ? <Candles series={series} weeklyFull={weeklyFull} showLevels minDDpct={minDD} defaultCandles={DEFAULT_CANDLES_BY_TF.D} />
+            : <p className="hint" style={{ padding: 16 }}>Loading…</p>}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -97,6 +148,14 @@ type DeskRow = {
 type DeskResp = { date: string | null; horizon: Horizon; live?: boolean; signals: DeskRow[];
   target_notes: Record<string, string>; decision: Record<string, string> };
 type DeskSortKey = "group" | "rank" | "symbol" | "conviction" | "iv" | "liquidity" | "v2" | "forecast" | "actual" | "peak" | "close" | "lean";
+type SignalHistRow = {
+  date: string; group: string; symbol: string; rank: number; conv_pctile: number | null; atm_iv: number;
+  pred_move_pct: number; actual_move_pct: number; hit: boolean;
+};
+type SignalHist = {
+  rows: SignalHistRow[];
+  summary: { n: number; hit_rate: number; mean_pred_pct: number; mean_actual_pct: number; median_actual_pct: number; worst_actual_pct: number } | null;
+};
 function DeskSortHeader({ label, sortKey, sort, onSort }: { label: string; sortKey: DeskSortKey; sort: { key: DeskSortKey; direction: SortDirection }; onSort: (key: DeskSortKey) => void }) {
   const active = sort.key === sortKey; const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
   return <th aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}><button type="button" className="sort-header" onClick={() => onSort(sortKey)} aria-label={`Sort by ${label}`}>{label}<Icon size={14} aria-hidden="true" /></button></th>;
@@ -112,6 +171,10 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
   const [data, setData] = useState<DeskResp | null>(null);
   const [err, setErr] = useState("");
   const [sort, setSort] = useState<{ key: DeskSortKey; direction: SortDirection }>({ key: "rank", direction: "asc" });
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null);
+  const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
+  const [filterSym, setFilterSym] = useState("");
+  const [hist, setHist] = useState<SignalHist | null>(null);
   useEffect(() => {
     getJson<string[]>(`/prod3/dates?horizon=${horizon}`).then((d) => { setDates(d); setDate((old) => d.includes(old) ? old : d[0] || ""); }).catch((e) => setErr(String(e)));
   }, [horizon]);
@@ -120,6 +183,12 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
     setData(null);
     getJson<DeskResp>(`/signal-desk?date=${date}&horizon=${horizon}`).then(setData).catch((e) => setErr(String(e)));
   }, [date, horizon]);
+  useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => {
+    getJson<SignalHist>(`/prod3/signal_history?horizon=${horizon}${filterSym ? `&symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
+  }, [horizon, filterSym]);
+  const hs = hist?.summary;
+  const allSyms = filterSym === "";
   const rows = [...(data?.signals ?? [])].sort((a, b) => {
     const value = (r: DeskRow): string | number | null | undefined => ({ group: GROUP_LABEL[r.group] ?? r.group, rank: r.rank, symbol: r.symbol, conviction: r.conv_pctile, iv: r.atm_iv, liquidity: r.atm2_contracts, v2: r.v2_pick ? r.pick_rank ?? 99 : 999, forecast: r.pred_move_pct, actual: r.actual_peak_signed_pct, peak: r.next_day_peak_expected_pct, close: r.next_day_close_expected_pct, lean: r.lean })[sort.key];
     const av = value(a), bv = value(b); const missing = (v: unknown) => v == null || (typeof v === "number" && !Number.isFinite(v));
@@ -146,12 +215,56 @@ function SignalDesk({ horizon, setHorizon }: PageProps) {
       {err && <p className="hint" style={{ padding: 16 }}>{err}</p>}
       <div className="table-wrap"><table><thead><tr><DeskSortHeader label="Group" sortKey="group" sort={sort} onSort={toggleSort} /><DeskSortHeader label="V3 rank" sortKey="rank" sort={sort} onSort={toggleSort} /><DeskSortHeader label="Symbol" sortKey="symbol" sort={sort} onSort={toggleSort} /><DeskSortHeader label="Conviction" sortKey="conviction" sort={sort} onSort={toggleSort} /><DeskSortHeader label="ATM IV" sortKey="iv" sort={sort} onSort={toggleSort} /><DeskSortHeader label="Liquidity" sortKey="liquidity" sort={sort} onSort={toggleSort} /><DeskSortHeader label="V2 baseline" sortKey="v2" sort={sort} onSort={toggleSort} />{horizon === "5d" ? <><DeskSortHeader label="5d forecast" sortKey="forecast" sort={sort} onSort={toggleSort} /><DeskSortHeader label="5d actual" sortKey="actual" sort={sort} onSort={toggleSort} /><DeskSortHeader label="B lean" sortKey="lean" sort={sort} onSort={toggleSort} /></> : <><DeskSortHeader label="V3 1d forecast" sortKey="forecast" sort={sort} onSort={toggleSort} /><DeskSortHeader label="V3 1d actual" sortKey="actual" sort={sort} onSort={toggleSort} /><DeskSortHeader label="1d peak forecast / actual" sortKey="peak" sort={sort} onSort={toggleSort} /><DeskSortHeader label="1d close forecast / actual" sortKey="close" sort={sort} onSort={toggleSort} /></>}</tr></thead>
         <tbody>{rows.map((r) => <tr key={`${r.group}-${r.symbol}`} className={r.v2_pick ? "picked-row" : undefined}>
-          <td><span className="group-tag">{GROUP_LABEL[r.group] ?? r.group}</span></td><td>#{r.rank}</td><td className="symbol">{r.symbol}</td><td>{r.conv_pctile != null ? `${(r.conv_pctile * 100).toFixed(0)}th` : "—"}</td><td>{pct(r.atm_iv * 100, 0)}</td><td>{r.atm2_contracts ? `${Math.round(r.atm2_contracts).toLocaleString()} contracts` : "—"}</td>
+          <td><span className="group-tag">{GROUP_LABEL[r.group] ?? r.group}</span></td><td>#{r.rank}</td><td className="symbol"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td><td>{r.conv_pctile != null ? `${(r.conv_pctile * 100).toFixed(0)}th` : "—"}</td><td>{pct(r.atm_iv * 100, 0)}</td><td>{r.atm2_contracts ? `${Math.round(r.atm2_contracts).toLocaleString()} contracts` : "—"}</td>
           <td>{r.v2_pick ? <span className="thr-badge">pick #{r.pick_rank}</span> : <span className="hint">not v2 pick</span>}</td>
           {horizon === "5d" ? <><td><strong>{r.pred_move_pct != null ? pct(r.pred_move_pct, 2) : "—"}</strong></td><td><SignedActual value={r.actual_peak_signed_pct} live={r.live} /></td><td>{r.lean ? <span className="thr-badge">{r.lean} · {pct((r.dir_conf ?? 0) * 100, 0)}</span> : <span className="hint">agnostic</span>}</td></> : <><td><strong>{r.pred_move_pct != null ? pct(r.pred_move_pct, 2) : "—"}</strong></td><td><SignedActual value={r.actual_peak_signed_pct} live={r.live} /></td><td>{r.next_day_peak_expected_pct != null ? <>{pct(r.next_day_peak_expected_pct, 2)} / <SignedActual value={r.next_day_peak_signed_actual_pct} live={r.live} /></> : "—"}</td><td>{r.next_day_close_expected_pct != null ? <>{pct(r.next_day_close_expected_pct, 2)} / <SignedActual value={r.next_day_close_signed_actual_pct} live={r.live} /></> : "—"}</td></>}
         </tr>)}{!rows.length && <tr><td className="empty-cell" colSpan={horizon === "5d" ? 10 : 11}>Loading or no signals</td></tr>}</tbody></table></div>
     </section>
     <section className="panel cockpit" style={{ marginTop: 14 }}><div className="panel-title"><h2>Production decision policy</h2><span>guardrail</span></div><p className="hint" style={{ padding: "4px 16px 16px" }}>{data?.decision?.promotion_gate ?? "Scorecard unavailable — build the production scorecard after refresh."}</p></section>
+    <section className="panel cockpit" style={{ marginTop: 14 }}>
+      <div className="panel-title">
+        <h2>Signal history — forecast vs realized</h2>
+        <label className="chk"><Coins size={15} />
+          <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+            <option value="">All stocks</option>
+            {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+          </select>
+        </label>
+      </div>
+      <p className="hint" style={{ padding: "10px 16px 0" }}>
+        Direction-agnostic: this book forecasts move <strong>size</strong>, not side. "Hit" = realized 5-day peak |move| ≥ 6%.
+      </p>
+      {hs ? (
+        <div className="sell-bt">{hs.n} signals · hit rate (≥6%) <b>{(hs.hit_rate * 100).toFixed(0)}%</b> ·
+          mean predicted <b>{hs.mean_pred_pct}%</b> vs mean realized <b>{hs.mean_actual_pct}%</b> ·
+          median realized <b>{hs.median_actual_pct}%</b> · worst realized <b>{hs.worst_actual_pct}%</b></div>
+      ) : null}
+      <div className="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Grp</th><th>V3 rank</th><th>Conviction</th><th>ATM IV</th>
+            <th>Predicted move</th><th>Realized move</th><th>Hit ≥6%</th>
+          </tr></thead>
+          <tbody>
+            {(hist?.rows ?? []).map((r, i) => (
+              <tr key={`${r.symbol}-${r.date}-${i}`}>
+                <td>{r.date}</td>
+                {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td> : null}
+                <td className="hint">{GROUP_LABEL[r.group] ?? r.group}</td>
+                <td>#{r.rank}</td>
+                <td>{r.conv_pctile != null ? `${(r.conv_pctile * 100).toFixed(0)}th` : "—"}</td>
+                <td>{pct(r.atm_iv * 100, 0)}</td>
+                <td><strong>{pct(r.pred_move_pct, 2)}</strong></td>
+                <td className={r.hit ? "move-up" : "hint"}>{pct(r.actual_move_pct, 2)}</td>
+                <td>{r.hit ? "✓" : "✕"}</td>
+              </tr>
+            ))}
+            {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 9 : 8} className="empty-cell">No signals</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
   </>;
 }
 
@@ -521,9 +634,9 @@ function StockHistory({ horizon, setHorizon }: PageProps) {
 }
 
 // --------------------------------------------------------------- Price History
-function PriceHistory({ horizon, setHorizon }: PageProps) {
+function PriceHistory({ horizon, setHorizon, initialSymbol }: PageProps & { initialSymbol?: string }) {
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
-  const [symbol, setSymbol] = useState("ADANIENT");
+  const [symbol, setSymbol] = useState(initialSymbol || "ADANIENT");
   const [data, setData] = useState<{ series: PricePoint[]; premiums: Pick[] }>({ series: [], premiums: [] });
   const [nd, setNd] = useState<NDRow[]>([]);
   const [tf, setTf] = useState<Timeframe>("D");
@@ -1052,6 +1165,7 @@ function SellStrategies() {
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");   // "" = all
   const [hist, setHist] = useState<SellHist | null>(null);
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   useEffect(() => { getJson<SellResp>("/prod2/sell_strategies").then(setData).catch(() => setData(null)); }, []);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
@@ -1093,7 +1207,7 @@ function SellStrategies() {
             <tbody>
               {daily.map((r) => (
                 <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
-                  <td><strong>{r.symbol}</strong></td>
+                  <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
                   <td>{r.group.slice(0, 1)}</td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
@@ -1136,7 +1250,7 @@ function SellStrategies() {
               {(hist?.rows ?? []).map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
                   <td>{r.signal_date}</td>
-                  {allSyms ? <td><strong>{r.symbol}</strong> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{r.iv_ratio.toFixed(2)}×</td>
                   <td>{num(r.short_ce, 0)} / {num(r.short_pe, 0)}</td>
@@ -1154,6 +1268,7 @@ function SellStrategies() {
           </table>
         </div>
       </section>
+      {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
     </>
   );
 }
@@ -1187,6 +1302,7 @@ function SkewStrategy() {
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");
   const [hist, setHist] = useState<SkewHist | null>(null);
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   useEffect(() => { getJson<SkewResp>("/prod2/skew_strategy").then(setData).catch(() => setData(null)); }, []);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
@@ -1230,7 +1346,7 @@ function SkewStrategy() {
             <tbody>
               {daily.map((r) => (
                 <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
-                  <td><strong>{r.symbol}</strong></td>
+                  <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
                   <td>{r.group.slice(0, 1)}</td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
@@ -1275,7 +1391,7 @@ function SkewStrategy() {
               {(hist?.rows ?? []).map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
                   <td>{r.signal_date}</td>
-                  {allSyms ? <td><strong>{r.symbol}</strong> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{r.iv_ratio.toFixed(2)}×</td>
                   <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
@@ -1294,6 +1410,7 @@ function SkewStrategy() {
           </table>
         </div>
       </section>
+      {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
     </>
   );
 }

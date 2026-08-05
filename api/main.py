@@ -1061,6 +1061,37 @@ def prod3_stock_history(symbol: str, horizon: str = Query(default="5d")) -> list
     return [] if df.empty else _records(df[df.symbol.eq(symbol.upper())].sort_values("date", ascending=False))
 
 
+@app.get("/prod3/signal_history")
+def prod3_signal_history(symbol: str | None = None, horizon: str = Query(default="5d"),
+                         hit_threshold: float = Query(default=6.0)) -> dict[str, object]:
+    """Historical Buy-Signal (v3 mover) picks: predicted vs realized peak move, direction-agnostic
+    (this book forecasts move SIZE, not direction -- 'hit' = realized |move| >= hit_threshold%).
+    Optional ?symbol= filter. Only completed (non-live) rows are included."""
+    df = _v3_calibrated_peak_forecasts(_v3_book(horizon))
+    if df.empty:
+        return {"rows": [], "summary": None}
+    if symbol:
+        df = df[df["symbol"].eq(symbol.upper())]
+    df = df[~df["live"].astype(bool)].copy()
+    if df.empty:
+        return {"rows": [], "summary": None}
+    df["actual_move_pct"] = (df["move_mag"] * 100).round(2)
+    df["pred_move_pct"] = df["pred_move_pct"].round(2)
+    df["hit"] = df["actual_move_pct"] >= hit_threshold
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df = df.sort_values("date", ascending=False)
+    out = df[["date", "group", "symbol", "rank", "conv_pctile", "atm_iv", "pred_move_pct", "actual_move_pct", "hit"]]
+    summary = {
+        "n": int(len(out)),
+        "hit_rate": round(float(out["hit"].mean()), 3),
+        "mean_pred_pct": round(float(out["pred_move_pct"].mean()), 2),
+        "mean_actual_pct": round(float(out["actual_move_pct"].mean()), 2),
+        "median_actual_pct": round(float(out["actual_move_pct"].median()), 2),
+        "worst_actual_pct": round(float(out["actual_move_pct"].min()), 2),
+    }
+    return {"rows": _records(out), "summary": summary, "hit_threshold": hit_threshold}
+
+
 @app.get("/prod3/status")
 def prod3_status() -> dict[str, object]:
     import os

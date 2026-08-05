@@ -559,6 +559,57 @@ tr.sell-live td:first-child {
   tr.sell-live { background: #17281f; }
 }
 
+.symbol-link {
+  all: unset;
+  cursor: pointer;
+  font-weight: 700;
+  color: #172126;
+}
+.symbol-link:hover {
+  color: #0d666a;
+  text-decoration: underline;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 20, 0.5);
+  padding: 24px;
+}
+.modal-panel {
+  width: min(1000px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  background: #ffffff;
+  border: 1px solid #d8dfdb;
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid #e5ebe8;
+  position: sticky;
+  top: 0;
+  background: #ffffff;
+  z-index: 1;
+}
+.modal-header h2 { margin: 0; font-size: 16px; }
+.modal-actions { display: flex; gap: 8px; }
+
+@media (prefers-color-scheme: dark) {
+  .symbol-link { color: #eaf1ee; }
+  .symbol-link:hover { color: #4fd1c5; }
+  .modal-panel { background: #182420; border-color: #2c3a34; }
+  .modal-header { background: #182420; border-color: #2c3a34; }
+}
+
 @media (max-width: 980px) {
   .app-shell {
     padding: 14px;
