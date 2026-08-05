@@ -5,7 +5,6 @@ import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
 const GROUP_LABEL: Record<string, string> = { A_mcap30: "A · mega-cap", B_turn35: "B · movers" };
-const MIN_PROPOSAL_ROR_PCT = 150; // top-3 daily proposals never include a return-on-risk below this
 type Horizon = "5d" | "1d";
 type PageProps = { horizon: Horizon; setHorizon: (h: Horizon) => void };
 
@@ -1186,7 +1185,7 @@ type CondorRow = {
 type SellResp = {
   as_of: string | null; params: Record<string, number>;
   backtest: { window: string; ev_on_risk: number; win_rate: number; worst: string };
-  candidates: CondorRow[];
+  candidates: CondorRow[]; weekly_picks: CondorRow[];
 };
 type SellHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number;
@@ -1215,9 +1214,7 @@ function SellStrategies() {
   useEffect(() => setFilterMonth(""), [filterSym]);
 
   const bt = data?.backtest;
-  const cands = data?.candidates ?? [];
-  // top 3 per group for the daily signals
-  const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g && c.ror_pct >= MIN_PROPOSAL_ROR_PCT).slice(0, 3));
+  const daily = data?.weekly_picks ?? [];
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
   const histRows = useMemo(() => {
@@ -1240,14 +1237,17 @@ function SellStrategies() {
     <>
       <section className="panel cockpit">
         <div className="panel-title"><h2>Sell Strategies — defined-risk iron condor</h2>
-          <span>as of {data?.as_of ?? "—"} · top 3 per group · ret/risk ≥{MIN_PROPOSAL_ROR_PCT}%</span></div>
+          <span>as of {data?.as_of ?? "—"} · up to 2 new per group per week</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
             <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
             <b> Max loss is always capped</b> at (wing width − credit); you can never lose more than the max-risk shown.
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1) — no DTE window,
-            always the nearest available expiry. Rows meeting the IV bar are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.3)
+            and there are <b>at least 9 days to expiry</b> — never closer, to stay clear of NSE's physical-delivery margin ramp
+            (ITM margin escalates 10/25/45/70/100%+ of contract value starting 4 trading days before expiry). Rows meeting both are the <b>entry-window</b> picks (highlighted);
+            a position still open when DTE drops to 4 is force-closed regardless of profit target. New symbols are capped at 2 per group per week — a symbol already
+            picked this week keeps showing, but no more than 2 new names join per group until next week.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); it decays in your favour while price stays between the breakevens.</div>
           {bt ? (
             <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
@@ -1276,7 +1276,7 @@ function SellStrategies() {
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={10} className="empty-cell">No candidate clears the {MIN_PROPOSAL_ROR_PCT}% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={10} className="empty-cell">No signal in the entry window today (or this week's quota is full)</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1344,7 +1344,7 @@ type SkewRow = {
 type SkewResp = {
   as_of: string | null; params: Record<string, number>;
   backtest: { window: string; ev_on_risk: number; win_rate: number; worst: string; note: string };
-  candidates: SkewRow[];
+  candidates: SkewRow[]; weekly_picks: SkewRow[];
 };
 type SkewHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number;
@@ -1372,8 +1372,7 @@ function SkewStrategy() {
   useEffect(() => setFilterMonth(""), [filterSym]);
 
   const bt = data?.backtest;
-  const cands = data?.candidates ?? [];
-  const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g && c.ror_pct >= MIN_PROPOSAL_ROR_PCT).slice(0, 3));
+  const daily = data?.weekly_picks ?? [];
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
   const histRows = useMemo(() => {
@@ -1396,7 +1395,7 @@ function SkewStrategy() {
     <>
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title"><h2>Directional credit spread — IV skew</h2>
-          <span>as of {data?.as_of ?? "—"} · top 3 per group · ret/risk ≥{MIN_PROPOSAL_ROR_PCT}%</span></div>
+          <span>as of {data?.as_of ?? "—"} · up to 2 new per group per week</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
             <strong>Structure</strong> Sell only the side (call or put) whose ~2% OTM strike is priced with the <b>richer</b> Black-Scholes implied vol
@@ -1404,10 +1403,12 @@ function SkewStrategy() {
             <b> Max loss is always capped</b> at (wing width − credit).
             <span className="hint"> This is a relative-value read on option pricing, not a forecast of which way the stock moves — direction alone is ≈ coin-flip on this universe.</span>
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1) — no DTE window,
-            always the nearest available expiry. Rows meeting the IV bar are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.6)
+            and there are <b>at least 15 days to expiry</b> — unlike the condor, this structure backtests <i>better</i> further from expiry, not closer.
+            Rows meeting both are the <b>entry-window</b> picks (highlighted); a position still open when DTE drops to 4 is force-closed
+            (NSE's physical-delivery margin ramp starts there). New symbols are capped at 2 per group per week.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first) — <b>no interim stop-loss</b>.
-            Day-close dips over the hold tend to mean-revert, so a stop just locks in a temporary drawdown (finding validated under the prior DTE-windowed backtest; not yet re-tested for this no-DTE-window version).</div>
+            Day-close dips over the hold tend to mean-revert, so a stop just locks in a temporary drawdown (finding carried over from an earlier backtest; not yet re-tested for this rule).</div>
           {bt ? (
             <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
               win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
@@ -1437,7 +1438,7 @@ function SkewStrategy() {
                   <td className="hint">{num(r.breakeven, 0)}</td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={12} className="empty-cell">No candidate clears the {MIN_PROPOSAL_ROR_PCT}% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={12} className="empty-cell">No signal in the entry window today (or this week's quota is full)</td></tr>}
             </tbody>
           </table>
         </div>

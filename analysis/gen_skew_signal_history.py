@@ -1,9 +1,15 @@
 """Generate the historical IV-skew signal log: only the dates a signal actually fired
-(IV-rich, no DTE window -- always the nearest available expiry), selling whichever side
-(CE/PE) has the richer Black-Scholes implied vol at entry, held to day-5/expiry close
-(no interim stop-loss -- every tested EOD stop level made results worse). Writes
-locks/prod_sell_strategies/skew_signal_history.csv for the API (/prod2/skew_signal_history)
-to serve.
+(IV-rich, DTE >= DTE_MIN), selling whichever side (CE/PE) has the richer Black-Scholes
+implied vol at entry, held to day-5/expiry close (no interim stop-loss -- every tested
+EOD stop level made results worse). Writes locks/prod_sell_strategies/skew_signal_history.csv
+for the API (/prod2/skew_signal_history) to serve.
+
+Two safety rules (NSE physical-settlement / delivery-margin avoidance -- ITM margin ramps
+10%/25%/45%/70%/100%+ of contract value starting E-4, i.e. 4 trading days before expiry):
+  1. Entry requires DTE >= DTE_MIN.
+  2. Forced exit if the position is still open when DTE drops to <= SAFE_DTE.
+Liquidity guard applies on EVERY day of the hold (not just entry): a day where either leg's
+traded volume is too thin is skipped rather than marked at a possibly stale EOD print.
 
 Pipeline:
   1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
@@ -22,8 +28,8 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "src"))
 from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
-SHORT_OTM, WING, FWD = 0.02, 0.03, 5
-IV_RICH = 1.1   # no DTE window -- signal fires on any day IV is rich, using whatever expiry is nearest
+SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.03, 5, 4
+DTE_MIN, IV_RICH, MIN_VOL = 15, 1.6, 50
 R = 0.065
 
 
@@ -56,7 +62,7 @@ mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str)
 mk["iv_ratio"] = mk.groupby("symbol")["atm_iv"].transform(lambda s: s / s.rolling(252, min_periods=60).median())
 IV = mk.set_index(["symbol", "date"])["iv_ratio"].to_dict()
 tdays = np.array(sorted(mk["date"].unique())); tpos = {d: k for k, d in enumerate(tdays)}
-cbar = {k: dict(zip(pd.to_datetime(g["date"]).values, zip(g["open"].values, g["close"].values)))
+cbar = {k: dict(zip(pd.to_datetime(g["date"]).values, zip(g["open"].values, g["close"].values, g["vol"].values)))
         for k, g in panel.groupby(["symbol", "opt_type", "expiry", "strike"], sort=False)}
 
 
@@ -67,8 +73,8 @@ def legseq(sym, ot, exp, strike, win):
     e = b.get(win[0])
     if not e or e[0] <= 0:
         return None
-    closes = [b[d][1] if d in b else None for d in win]
-    return e[0], closes
+    bars = [b.get(d) for d in win]     # (open, close, vol) or None per day
+    return e[0], bars
 
 
 out = []
@@ -81,8 +87,10 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if ivr is None or not (ivr >= IV_RICH):
         continue
     u = day["underlying"].iloc[0]
-    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry, no DTE filter
+    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry
     dte = int((exp - pd.Timestamp(e_date)).days)
+    if dte < DTE_MIN:                              # delivery-margin safety floor
+        continue
     win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
 
     def pick(ot, tgt):
@@ -95,7 +103,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     spe, lpe = pick("PE", u * (1 - SHORT_OTM)), pick("PE", u * (1 - SHORT_OTM - WING))
     if any(x is None for x in (sce, lce, spe, lpe)):
         continue
-    if sce["open"] < 3 or spe["open"] < 3 or sce["vol"] < 50 or spe["vol"] < 50:
+    if sce["open"] < 3 or spe["open"] < 3 or sce["vol"] < MIN_VOL or spe["vol"] < MIN_VOL:
         continue
 
     T = dte / 365.0
@@ -117,15 +125,19 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if credit <= 0 or risk <= 0:
         continue
 
+    # daily mark-to-close, skipping thin-volume days; forced exit before the E-4 delivery-margin ramp.
     vals, dd = [], 0.0
     for i in range(FWD):
-        sc, lc = seq_s[1][i], seq_l[1][i]
-        if sc is None or lc is None:
-            continue
-        value = sc - lc
-        upnl = credit - value
-        vals.append(value)
-        dd = min(dd, upnl)
+        sb, lb = seq_s[1][i], seq_l[1][i]
+        if not (sb is None or lb is None or sb[2] < MIN_VOL or lb[2] < MIN_VOL):
+            value = sb[1] - lb[1]
+            value = max(0.0, min(width, value))   # a credit spread's value can never legitimately
+                                                    # exceed its width -- clamp out stale-print artifacts
+            upnl = credit - value
+            vals.append(value)
+            dd = min(dd, upnl)
+        if (exp - win[i]).days <= SAFE_DTE:
+            break
     if not vals:
         continue
     exit_value = vals[-1]; pnl = credit - exit_value
