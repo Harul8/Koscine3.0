@@ -444,6 +444,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
             "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+            "sell_premium": round(psce + pspe, 2), "buy_premium": round(plce + plpe, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
@@ -503,9 +504,10 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         skew = ce_iv - pe_iv
         side = "CE" if skew > 0 else "PE"
         if side == "CE":
-            short_leg, long_leg, credit = sce, lce, psce - plce
+            short_leg, long_leg, sell_premium, buy_premium = sce, lce, psce, plce
         else:
-            short_leg, long_leg, credit = spe, lpe, pspe - plpe
+            short_leg, long_leg, sell_premium, buy_premium = spe, lpe, pspe, plpe
+        credit = sell_premium - buy_premium
         width = abs(float(long_leg["strike"]) - float(short_leg["strike"]))
         risk = width - credit
         if credit <= 0 or risk <= 0:
@@ -517,6 +519,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_leg["strike"]), "long_strike": float(long_leg["strike"]),
+            "sell_premium": round(sell_premium, 2), "buy_premium": round(buy_premium, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
             "in_window": bool(dte <= dte_max and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
