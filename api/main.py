@@ -36,7 +36,7 @@ def _market_ohlc() -> pd.DataFrame:
     except OSError:
         mt = None
     if _OHLC_CACHE["df"] is None or _OHLC_CACHE["mtime"] != mt:
-        df = load_market_data(columns=["date", "symbol", "open", "high", "low", "close"])
+        df = load_market_data(columns=["date", "symbol", "open", "high", "low", "close", "volume", "delivery_qty"])
         df["symbol"] = df["symbol"].astype(str)
         df["date"] = pd.to_datetime(df["date"])
         _OHLC_CACHE.update(mtime=mt, df=df, signs=None)
@@ -353,9 +353,11 @@ def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=40
     book = _v2_book()
     bsym = book[book["symbol"].eq(sym)] if not book.empty else pd.DataFrame()
     picks = set(pd.to_datetime(bsym["date"])) if not bsym.empty else set()
+    vol = s["volume"].fillna(0) if "volume" in s.columns else pd.Series(0, index=s.index)
+    dq = s["delivery_qty"].fillna(0) if "delivery_qty" in s.columns else pd.Series(0, index=s.index)
     series = [{"date": d.strftime("%Y-%m-%d"), "open": float(o), "close": float(c), "high": float(h), "low": float(lo),
-               "picked": d in picks}
-              for d, o, c, h, lo in zip(s["date"], s["open"], s["close"], s["high"], s["low"])]
+               "volume": float(v), "delivQty": float(dqv), "picked": d in picks}
+              for d, o, c, h, lo, v, dqv in zip(s["date"], s["open"], s["close"], s["high"], s["low"], vol, dq)]
     prem_cols = ["date", "strike", "ce_entry", "ce_high", "ce_low", "ce_close", "ce_mult_best",
                  "pe_entry", "pe_high", "pe_low", "pe_close", "pe_mult_best", "move_mag_pct",
                  "up_move", "down_move", "live", "dir_label", "confidence"]

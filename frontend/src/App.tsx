@@ -21,7 +21,7 @@ type MRow = { rank: number; symbol: string; atm_iv: number; live: boolean; picke
 type IdxRow = { label: string; move: number | null; live: boolean; pred?: number | null };
 type GroupMetric = { per_yr: number; move_ge6_pct: number; move_ge8_pct: number; closed_opp_pct: number; coverage: string; top5_share_pct: number; top5_names: string[] };
 type Manifest = { version: string; groups: Record<string, number>; book_metrics_2024_26: Record<string, GroupMetric> };
-type PricePoint = { date: string; open: number; close: number; high: number; low: number; picked: boolean };
+type PricePoint = { date: string; open: number; close: number; high: number; low: number; volume: number; delivQty: number; picked: boolean };
 type Timeframe = "D" | "W" | "M";
 const TF_LABEL: Record<Timeframe, string> = { D: "Daily", W: "Weekly", M: "Monthly" };
 type Status = { book?: { modified: number | null; rows: number | null }; premiums?: { modified: number | null; rows: number | null }; version?: string; selector?: Record<string, unknown>; jobs: Record<string, { status: string; module?: string; tail?: string }> };
@@ -566,7 +566,7 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
           <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
                  onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
         </label>
-        <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · scroll to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
+        <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · ↑↓ to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
         <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
@@ -635,6 +635,8 @@ function resample(series: PricePoint[], tf: Timeframe): PricePoint[] {
       close: arr[arr.length - 1].close,
       high: Math.max(...arr.map((p) => p.high)),
       low: Math.min(...arr.map((p) => p.low)),
+      volume: arr.reduce((s, p) => s + p.volume, 0),
+      delivQty: arr.reduce((s, p) => s + p.delivQty, 0),
       picked: arr.some((p) => p.picked),
     });
   }
@@ -757,17 +759,32 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
   const resZones = clusterRaw(highs).map((m) => resolveZone(m, true)).filter((z): z is Zone => z !== null);
   const supZones = clusterRaw(lows).map((m) => resolveZone(m, false)).filter((z): z is Zone => z !== null);
   const refClose = vis[n - 1].close;   // vis is always the full history, so this is the latest close
+  // Collapse same-side zones within 5% of each other into one, keeping whichever is nearer to
+  // the current price: the LOWER price for resistance, the UPPER price for support — so the
+  // final displayed lines are never two near-duplicates <5% apart.
+  const dedupBySide = (zones: Zone[], keepHighest: boolean): Zone[] => {
+    const sorted = zones.slice().sort((a, b) => a.price - b.price);
+    const out: Zone[] = [];
+    let cl: Zone[] = [];
+    const flush = () => {
+      if (cl.length) out.push(keepHighest ? cl.reduce((m, z) => (z.price > m.price ? z : m)) : cl.reduce((m, z) => (z.price < m.price ? z : m)));
+      cl = [];
+    };
+    for (const z of sorted) { if (cl.length && Math.abs(z.price - cl[cl.length - 1].price) / z.price > 0.05) flush(); cl.push(z); }
+    flush();
+    return out;
+  };
   // 2 nearest >=2-touch resistance zones above the close, 2 nearest support zones below
-  const above = resZones.filter((z) => z.touches >= 2 && z.price > refClose).sort((a, b) => a.price - b.price).slice(0, 2);
-  const below = supZones.filter((z) => z.touches >= 2 && z.price < refClose).sort((a, b) => b.price - a.price).slice(0, 2);
+  const above = dedupBySide(resZones.filter((z) => z.touches >= 2 && z.price > refClose), false).sort((a, b) => a.price - b.price).slice(0, 2);
+  const below = dedupBySide(supZones.filter((z) => z.touches >= 2 && z.price < refClose), true).sort((a, b) => b.price - a.price).slice(0, 2);
   const sel: Level[] = [];
   for (const z of above) sel.push({ price: z.price, kind: "R", touches: z.touches, firstDate: z.firstDate });
   for (const z of below) sel.push({ price: z.price, kind: "S", touches: z.touches, firstDate: z.firstDate });
   // all-time-high zone (blue) when a >=2-touch zone sits at the global ATH
   const athZone = resZones.filter((z) => z.touches >= 2 && Math.abs(z.price - ath) / ath <= athTol).sort((a, b) => b.price - a.price)[0];
   if (athZone) {
-    const dup = sel.find((x) => Math.abs(x.price - athZone.price) / athZone.price < 1e-9);
-    if (dup) dup.kind = "ATH";
+    const near = sel.find((x) => Math.abs(x.price - athZone.price) / athZone.price < 0.05);
+    if (near) near.kind = "ATH";
     else sel.push({ price: athZone.price, kind: "ATH", touches: athZone.touches, firstDate: athZone.firstDate });
   }
   return sel;
@@ -843,21 +860,29 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
     return () => node.removeEventListener("wheel", onWheel);
   }, [s, n, total]);
 
-  // keyboard: left / right arrows pan the window (ignored while typing in a field)
+  // keyboard: left/right arrows pan, up/down arrows zoom (ignored while typing in a field)
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       const t = ev.target as HTMLElement | null;
       if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
-      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(ev.key)) return;
       ev.preventDefault();
-      const width = e - s;
-      const step = Math.max(1, Math.round(width * 0.1));
-      if (ev.key === "ArrowLeft") { const ns = Math.max(0, s - step); setWin({ s: ns, e: ns + width }); }
-      else { const ne = Math.min(total, e + step); setWin({ s: ne - width, e: ne }); }
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        const width = e - s;
+        const step = Math.max(1, Math.round(width * 0.1));
+        if (ev.key === "ArrowLeft") { const ns = Math.max(0, s - step); setWin({ s: ns, e: ns + width }); }
+        else { const ne = Math.min(total, e + step); setWin({ s: ne - width, e: ne }); }
+      } else {
+        const factor = ev.key === "ArrowUp" ? 0.7 : 1.4;   // up = zoom in, down = zoom out
+        const w = Math.max(6, Math.min(total, Math.round(n * factor)));
+        const mid = s + n / 2;
+        const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2)));
+        setWin({ s: ns, e: ns + w });
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [s, e, total]);
+  }, [s, e, n, total]);
 
   if (total < 2) return <span className="hint">No data</span>;
 
@@ -887,14 +912,21 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
   const tipLeftPct = hover != null ? (x(hover) / W) * 100 : 0;
   const tipRight = tipLeftPct > 62;
 
+  // volume + delivery pane: same x-mapping as the price chart above, its own small y-scale.
+  // Each bar is drawn twice at the same x: full volume (light) then delivery on top (teal),
+  // so delivery reads as a stacked segment inside the same bar, not a second bar.
+  const VH = 90, vPadTop = 10, vPadBot = 18;
+  const volsCr = vis.map((p) => p.volume / 1e7);
+  const maxVolCr = Math.max(0.01, ...volsCr);
+  const vy = (vCr: number) => vPadTop + (1 - vCr / maxVolCr) * (VH - vPadTop - vPadBot);
+  const vBarBottom = VH - vPadBot;
+
   return (
     <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
          onMouseMove={(ev) => setHover(idxFromClientX(ev.clientX))}
          onMouseLeave={() => setHover(null)}
          onDoubleClick={() => setWin(defWin(total))}>
       <div className="candles-toolbar">
-        <button type="button" title="Zoom in" onClick={() => { const w = Math.max(6, Math.round(n * 0.7)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>+</button>
-        <button type="button" title="Zoom out" onClick={() => { const w = Math.min(total, Math.round(n * 1.4)); const mid = s + n / 2; const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2))); setWin({ s: ns, e: ns + w }); }}>−</button>
         <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
@@ -938,6 +970,22 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
                 textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{vis[i].date.slice(2)}</text>
         ))}
       </svg>
+      <svg viewBox={`0 0 ${W} ${VH}`} className="spark" style={{ marginTop: 4 }}>
+        <text x={padX} y={9} fontSize={9} fill="#8a978f">Volume (Cr) · teal = delivery</text>
+        {hp != null ? <line x1={x(hover!)} x2={x(hover!)} y1={vPadTop} y2={vBarBottom} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
+        {vis.map((p, i) => {
+          const volCr = p.volume / 1e7;
+          const delivCr = Math.min(p.delivQty / 1e7, volCr);
+          return (
+            <g key={s + i}>
+              <rect x={x(i) - cw / 2} y={vy(volCr)} width={cw} height={Math.max(0, vBarBottom - vy(volCr))} fill="#cdd8d3" />
+              <rect x={x(i) - cw / 2} y={vy(delivCr)} width={cw} height={Math.max(0, vBarBottom - vy(delivCr))} fill="#167c80" />
+            </g>
+          );
+        })}
+        <text x={padX - 6} y={vy(maxVolCr) + 3} fontSize={9} fill="#8a978f" textAnchor="end">{num(maxVolCr, 1)}</text>
+        <text x={padX - 6} y={vBarBottom} fontSize={9} fill="#8a978f" textAnchor="end">0</text>
+      </svg>
       {hp ? (
         <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
           <strong>{hp.date}</strong>
@@ -945,6 +993,8 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
           <span>H <b>{num(hp.high, 1)}</b></span>
           <span>L <b>{num(hp.low, 1)}</b></span>
           <span>C <b style={{ color: hp.close >= hp.open ? up : down }}>{num(hp.close, 1)}</b></span>
+          <span>Vol <b>{num(hp.volume / 1e7, 2)} Cr</b></span>
+          <span>Deliv <b>{num(hp.delivQty / 1e7, 2)} Cr</b>{hp.volume > 0 ? ` (${num(hp.delivQty / hp.volume * 100, 0)}%)` : ""}</span>
         </div>
       ) : null}
     </div>
