@@ -1169,6 +1169,7 @@ type SkewResp = {
 type SkewHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number; short_strike: number; long_strike: number;
+  sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; exit_value: number; pnl: number; ror_pct: number; max_dd_pct: number; outcome: string;
 };
 type SkewHist = {
@@ -1263,7 +1264,7 @@ function SkewStrategy() {
           <table>
             <thead><tr>
               <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th><th>Sell</th>
-              <th>Short / Long</th><th>Credit (entry)</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <th>Short / Long</th><th>Credit</th><th>Max risk</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
               {(hist?.rows ?? []).map((r, i) => (
@@ -1274,7 +1275,8 @@ function SkewStrategy() {
                   <td>{r.iv_ratio.toFixed(2)}×</td>
                   <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
                   <td>{num(r.short_strike, 0)} / {num(r.long_strike, 0)}</td>
-                  <td>{num(r.credit, 1)}</td>
+                  <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.abs(r.long_strike - r.short_strike), 1)} / credit {num(r.credit, 1)})</span></td>
                   <td>{num(r.exit_value, 1)}</td>
                   <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
@@ -1282,7 +1284,7 @@ function SkewStrategy() {
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 12 : 11} className="empty-cell">No signals</td></tr>}
+              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 13 : 12} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>

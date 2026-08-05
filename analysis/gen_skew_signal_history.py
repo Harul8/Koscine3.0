@@ -138,6 +138,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2),
         "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
         "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
+        "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
         "credit": round(credit, 2), "max_risk": round(risk, 2), "exit_value": round(exit_value, 2),
         "pnl": round(pnl, 2), "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
         "outcome": "win" if pnl > 0 else "loss",
