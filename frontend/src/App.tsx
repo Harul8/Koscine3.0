@@ -566,7 +566,7 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
           <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
                  onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
         </label>
-        <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · ↑↓ to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
+        <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · ↑↓ to zoom · ← → to pan · click a bar for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
         <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
@@ -812,9 +812,9 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
   const wrapRef = useRef<HTMLDivElement>(null);
   const defWin = (len: number) => ({ s: Math.max(0, len - defaultCandles), e: len });
   const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
-  const [hover, setHover] = useState<number | null>(null);
+  const [sel, setSel] = useState<number | null>(null);   // clicked bar (vis-relative index); tooltip pops on click, not hover
   // default to the most recent `defaultCandles`; reset when the series changes (symbol / timeframe)
-  useEffect(() => { setWin(defWin(series.length)); setHover(null); }, [series]);
+  useEffect(() => { setWin(defWin(series.length)); setSel(null); }, [series]);
 
   const W = 900, H = 300, padX = 40, padTop = 14, padBot = 34;
   const total = series.length;
@@ -908,8 +908,12 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
   for (let i = 0; i < n; i += step) ticks.push(i);
   if (ticks[ticks.length - 1] !== n - 1) ticks.push(n - 1);
 
-  const hp = hover != null && hover < n ? vis[hover] : null;
-  const tipLeftPct = hover != null ? (x(hover) / W) * 100 : 0;
+  const hp = sel != null && sel < n ? vis[sel] : null;
+  // prior bar's close, looked up against the full (unwindowed) series so it's available even for
+  // the leftmost visible candle, not just clamped to what happens to be on screen
+  const prevClose = hp != null ? series[s + sel! - 1]?.close : null;
+  const chgPct = hp != null && prevClose ? ((hp.close - prevClose) / prevClose) * 100 : null;
+  const tipLeftPct = sel != null ? (x(sel) / W) * 100 : 0;
   const tipRight = tipLeftPct > 62;
 
   // volume + delivery pane: same x-mapping as the price chart above, its own small y-scale.
@@ -923,9 +927,8 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
 
   return (
     <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
-         onMouseMove={(ev) => setHover(idxFromClientX(ev.clientX))}
-         onMouseLeave={() => setHover(null)}
-         onDoubleClick={() => setWin(defWin(total))}>
+         onClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}
+         onDoubleClick={() => { setWin(defWin(total)); setSel(null); }}>
       <div className="candles-toolbar">
         <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
@@ -937,7 +940,7 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
             <text x={padX - 6} y={y(g) + 3} fontSize={10} fill="#8a978f" textAnchor="end">{num(g, 0)}</text>
           </g>
         ))}
-        {hp != null ? <line x1={x(hover!)} x2={x(hover!)} y1={padTop} y2={H - padBot} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
+        {hp != null ? <line x1={x(sel!)} x2={x(sel!)} y1={padTop} y2={H - padBot} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
         {vis.map((p, i) => {
           const rising = p.close >= p.open;
           const color = rising ? up : down;
@@ -972,7 +975,7 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
       </svg>
       <svg viewBox={`0 0 ${W} ${VH}`} className="spark" style={{ marginTop: 4 }}>
         <text x={padX} y={9} fontSize={9} fill="#8a978f">Volume (Cr) · teal = delivery</text>
-        {hp != null ? <line x1={x(hover!)} x2={x(hover!)} y1={vPadTop} y2={vBarBottom} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
+        {hp != null ? <line x1={x(sel!)} x2={x(sel!)} y1={vPadTop} y2={vBarBottom} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
         {vis.map((p, i) => {
           const volCr = p.volume / 1e7;
           const delivCr = Math.min(p.delivQty / 1e7, volCr);
@@ -989,6 +992,9 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
       {hp ? (
         <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
           <strong>{hp.date}</strong>
+          {chgPct != null ? (
+            <span>Chg <b style={{ color: chgPct >= 0 ? up : down }}>{chgPct >= 0 ? "+" : ""}{num(chgPct, 2)}%</b></span>
+          ) : null}
           <span>O <b>{num(hp.open, 1)}</b></span>
           <span>H <b>{num(hp.high, 1)}</b></span>
           <span>L <b>{num(hp.low, 1)}</b></span>
