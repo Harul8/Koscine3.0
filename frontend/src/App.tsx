@@ -527,8 +527,13 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
   const [tf, setTf] = useState<Timeframe>("D");
   const [showLevels, setShowLevels] = useState(true);
   const [minDD, setMinDD] = useState(10);
-  // default drawdown by timeframe: 10% on daily, 20% on weekly/monthly (still overridable)
-  useEffect(() => { setMinDD(tf === "D" ? 10 : 20); }, [tf]);
+  // per-stock default: average of this symbol's own >10% declines over the trailing 2 years
+  // (computed once per symbol, not on pan/zoom); falls back to the fixed 10%/20% if none found.
+  const autoDD = useMemo(() => computeAutoDD(data.series), [data.series]);
+  useEffect(() => {
+    const weeklyMonthly = autoDD != null ? autoDD * 100 : 20;
+    setMinDD(Math.round((tf === "D" ? weeklyMonthly / 2 : weeklyMonthly) * 10) / 10);
+  }, [tf, autoDD]);
   const one = horizon === "1d";
   const candles = useMemo(() => resample(data.series, tf), [data.series, tf]);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
@@ -554,9 +559,10 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
         <label className="chk">
           <input type="checkbox" checked={showLevels} onChange={(e) => setShowLevels(e.target.checked)} /> S/R levels
         </label>
-        <label>DD %
-          <input type="number" min={1} max={40} step={1} value={minDD} style={{ width: 54 }}
-                 onChange={(e) => setMinDD(Math.max(1, Math.min(40, Number(e.target.value) || 5)))} />
+        <label title={autoDD != null ? `auto-computed from this stock's own >10% declines over the trailing 2 years (${(autoDD * 100).toFixed(1)}%)` : "no >10% decline in the trailing 2 years — using the fixed default"}>
+          DD % {autoDD != null ? <span className="hint" style={{ marginLeft: 0 }}>(auto {(autoDD * 100).toFixed(0)}%)</span> : null}
+          <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
+                 onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
         </label>
         <span className="hint">latest {DEFAULT_CANDLES} · scroll to zoom · ← → to pan · hover for OHLC · double-click to reset</span>
       </section>
@@ -631,50 +637,104 @@ function resample(series: PricePoint[], tf: Timeframe): PricePoint[] {
   return out;
 }
 
+// Per-stock default drawdown threshold: the average of this stock's own sizeable peak-to-trough
+// declines over the trailing 2 years of DAILY data (independent of the displayed timeframe;
+// computed once per symbol, not on every pan/zoom). For each N-bar pivot high, a "decline" is
+// the drop to the LOWEST low reached before price recovers back above that peak (the full
+// down-leg, not just to the first minor wiggle). Tries declines > 10% first; if a calm stock has
+// none, retries with > 5%; if it STILL has none (essentially flat), returns null and the caller
+// falls back to the fixed 10%/20% default.
+function computeAutoDD(daily: PricePoint[]): number | null {
+  const N = 2;
+  if (daily.length < 2 * N + 1) return null;
+  const lastDate = new Date(daily[daily.length - 1].date + "T00:00:00Z");
+  const cutoff = new Date(lastDate); cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 2);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+  const win = daily.filter((p) => p.date >= cutoffStr);
+  const n = win.length;
+  if (n < 2 * N + 1) return null;
+  const isPivotHigh = (i: number) => { for (let j = i - N; j <= i + N; j++) if (j !== i && win[j].high >= win[i].high) return false; return true; };
+  const allDeclines: number[] = [];
+  for (let i = N; i < n - N; i++) {
+    if (!isPivotHigh(i)) continue;
+    const peak = win[i].high;
+    let minLow: number | null = null;
+    for (let j = i + 1; j < n; j++) {
+      if (win[j].high > peak) break;          // price recovered above the peak: this leg is over
+      if (minLow === null || win[j].low < minLow) minLow = win[j].low;
+    }
+    if (minLow !== null) allDeclines.push((peak - minLow) / peak);
+  }
+  for (const floor of [0.10, 0.05]) {
+    const kept = allDeclines.filter((d) => d > floor);
+    if (kept.length) return kept.reduce((s, x) => s + x, 0) / kept.length;
+  }
+  return null;
+}
+
 type Level = { price: number; kind: "R" | "S" | "ATH"; touches: number; firstIdx: number };
 type Zone = { price: number; touches: number; firstIdx: number };
 
-// Support/resistance from ZigZag swings within the VISIBLE window `vis` (re-derived on every
-// pan/zoom; no look-ahead). A swing high is the highest high of an up-leg — sub-`dd` pullbacks
-// absorbed — confirmed once price falls >= dd from it; swing low is the mirror. Swings within
-// 1% cluster into a zone (touches = # swings; firstIdx = leftmost touch, in `vis` coordinates);
-// only >= 2-touch zones qualify. Returns the 2 nearest resistance zones above the last-visible
-// close and the 2 nearest support zones below (<= 4 lines), plus the all-time-high zone (blue)
-// when `ath` sits among the visible swing highs.
+// Support/resistance from local swing pivots within the VISIBLE window `vis` (re-derived on
+// every pan/zoom; no look-ahead — everything below only looks at bars <= the last visible one).
+// Every N-bar local pivot high/low is a raw candidate (no per-peak filter); candidates within 1%
+// cluster into a price zone. Within a zone, pivots are walked in time order and only count as a
+// NEW touch (vs. still being part of the same ongoing test) if, since the last accepted touch,
+// price either pulled >= dd away from the zone OR stayed on the far side of it (below for
+// resistance, above for support) for >= G consecutive bars — a genuine gap, not a flat re-test a
+// few bars later. Only zones with >= 2 touches qualify. Returns the 2 nearest resistance zones
+// above the last-visible close and the 2 nearest support zones below (<= 4 lines), plus the
+// all-time-high zone (blue) when `ath` sits among the visible swing highs.
 function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
-  const tol = 0.01, athTol = 0.02;
+  // N=2: needs to beat only its 2 nearest neighbors each side. N=3 was too wide — two genuinely
+  // separate nearby peaks (e.g. 3 weeks apart on a weekly chart) could sit within each other's
+  // pivot window and invalidate one another even though a real pullback separated them.
+  const N = 2, tol = 0.01, athTol = 0.02, G = 8;
   const n = vis.length;
-  if (n < 3) return [];
+  if (n < 2 * N + 1) return [];
+  const isPivotHigh = (i: number) => { for (let j = i - N; j <= i + N; j++) if (j !== i && vis[j].high >= vis[i].high) return false; return true; };
+  const isPivotLow = (i: number) => { for (let j = i - N; j <= i + N; j++) if (j !== i && vis[j].low <= vis[i].low) return false; return true; };
   const highs: { i: number; p: number }[] = [], lows: { i: number; p: number }[] = [];
-  let dir = 0, hiI = 0, hiP = vis[0].high, loI = 0, loP = vis[0].low;
-  for (let i = 1; i < n; i++) {
-    const h = vis[i].high, l = vis[i].low;
-    if (dir === 1) {
-      if (h > hiP) { hiP = h; hiI = i; }
-      else if (l <= hiP * (1 - dd)) { highs.push({ i: hiI, p: hiP }); dir = -1; loP = l; loI = i; }
-    } else if (dir === -1) {
-      if (l < loP) { loP = l; loI = i; }
-      else if (h >= loP * (1 + dd)) { lows.push({ i: loI, p: loP }); dir = 1; hiP = h; hiI = i; }
-    } else {
-      if (h > hiP) { hiP = h; hiI = i; }
-      if (l < loP) { loP = l; loI = i; }
-      if (l <= hiP * (1 - dd)) { highs.push({ i: hiI, p: hiP }); dir = -1; loP = l; loI = i; }
-      else if (h >= loP * (1 + dd)) { lows.push({ i: loI, p: loP }); dir = 1; hiP = h; hiI = i; }
-    }
+  for (let i = N; i < n - N; i++) {
+    if (isPivotHigh(i)) highs.push({ i, p: vis[i].high });
+    if (isPivotLow(i)) lows.push({ i, p: vis[i].low });
   }
-  const cluster = (pts: { i: number; p: number }[]): Zone[] => {
+  // group raw pivots within 1% of each other into candidate price zones (member lists, not yet touch-counted)
+  const clusterRaw = (pts: { i: number; p: number }[]): { i: number; p: number }[][] => {
     pts = pts.slice().sort((a, b) => a.p - b.p);
-    const out: Zone[] = [];
+    const out: { i: number; p: number }[][] = [];
     let cl: { i: number; p: number }[] = [];
-    const flush = () => {
-      if (cl.length) out.push({ price: cl.reduce((s, x) => s + x.p, 0) / cl.length, touches: cl.length, firstIdx: Math.min(...cl.map((x) => x.i)) });
-      cl = [];
-    };
+    const flush = () => { if (cl.length) out.push(cl); cl = []; };
     for (const pt of pts) { if (cl.length && Math.abs(pt.p - cl[cl.length - 1].p) / pt.p > tol) flush(); cl.push(pt); }
     flush();
     return out;
   };
-  const resZones = cluster(highs), supZones = cluster(lows);
+  // walk a candidate zone's members in time order; count only genuinely-gapped touches (dd% pullback
+  // OR >= G bars on the far side of the zone since the last accepted touch)
+  const resolveZone = (members: { i: number; p: number }[], isResistance: boolean): Zone | null => {
+    const byTime = members.slice().sort((a, b) => a.i - b.i);
+    const level = byTime.reduce((s, x) => s + x.p, 0) / byTime.length;
+    let touches = 1, lastI = byTime[0].i;
+    for (let k = 1; k < byTime.length; k++) {
+      const curI = byTime[k].i;
+      let minLow = Infinity, maxHigh = -Infinity, streak = 0, bestStreak = 0;
+      for (let j = lastI + 1; j < curI; j++) {
+        if (isResistance) {
+          minLow = Math.min(minLow, vis[j].low);
+          streak = vis[j].high < level ? streak + 1 : 0;
+        } else {
+          maxHigh = Math.max(maxHigh, vis[j].high);
+          streak = vis[j].low > level ? streak + 1 : 0;
+        }
+        bestStreak = Math.max(bestStreak, streak);
+      }
+      const ddOk = isResistance ? minLow <= level * (1 - dd) : maxHigh >= level * (1 + dd);
+      if (ddOk || bestStreak >= G) { touches++; lastI = curI; }
+    }
+    return touches >= 2 ? { price: level, touches, firstIdx: byTime[0].i } : null;
+  };
+  const resZones = clusterRaw(highs).map((m) => resolveZone(m, true)).filter((z): z is Zone => z !== null);
+  const supZones = clusterRaw(lows).map((m) => resolveZone(m, false)).filter((z): z is Zone => z !== null);
   const refClose = vis[n - 1].close;
   // 2 nearest >=2-touch resistance zones above the close, 2 nearest support zones below
   const above = resZones.filter((z) => z.touches >= 2 && z.price > refClose).sort((a, b) => a.price - b.price).slice(0, 2);
