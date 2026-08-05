@@ -1,9 +1,16 @@
 """Generate the historical Sell-Strategy signal log: only the dates a condor signal actually
-fired (IV-rich, DTE >= DTE_MIN), with entry / exit / PnL / max-drawdown per trade. Writes
-locks/prod_sell_strategies/signal_history.csv for the API (/prod2/sell_signal_history) to serve.
+fired (entry-time credit/max_risk > MIN_ENTRY_ROR, DTE >= DTE_MIN), with entry / exit / PnL /
+max-drawdown per trade. Writes locks/prod_sell_strategies/signal_history.csv for the API
+(/prod2/sell_signal_history) to serve.
 
-Two safety rules (NSE physical-settlement / delivery-margin avoidance -- ITM margin ramps
-10%/25%/45%/70%/100%+ of contract value starting E-4, i.e. 4 trading days before expiry):
+The gating criterion is MIN_ENTRY_ROR: the entry-time credit/max_risk ratio (the theoretical
+max-profit/max-risk of the SETUP, knowable before the trade, unlike the realized ror_pct column
+which is the ex-post outcome and can't be gated on in advance). IV-richness is recorded for
+context but is no longer a hard filter.
+
+One safety rule is still non-negotiable (NSE physical-settlement / delivery-margin avoidance --
+ITM margin ramps 10%/25%/45%/70%/100%+ of contract value starting E-4, i.e. 4 trading days
+before expiry):
   1. Entry requires DTE >= DTE_MIN (never enter close enough to expiry to risk being caught
      in the E-4 ramp before the position can be closed).
   2. Forced exit if the position is still open when DTE drops to <= SAFE_DTE, regardless of
@@ -13,7 +20,7 @@ traded volume is too thin is treated as unusable (skipped) rather than marked at
 stale/illiquid EOD print -- this is what a KAYNES trade (Jul 2026) exposed: an interim mark of
 104.45 against a wing width of exactly 100, which is mathematically impossible at real
 settlement (a capped condor can never owe more than its width) and was traced to a thin-volume
-print, not a real loss.
+print, not a real loss. A [0, width] clamp on the daily mark backstops this.
 
 Pipeline:
   1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
@@ -31,7 +38,7 @@ from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
 SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.03, 5, 4
-DTE_MIN, IV_RICH, MIN_VOL = 9, 1.3, 50
+DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 150.0, 50
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -60,9 +67,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if p is None or p == 0 or p + FWD - 1 >= len(tdays):
         continue
     t = pd.Timestamp(tdays[p - 1])
-    ivr = IV.get((sym, t))
-    if ivr is None or not (ivr >= IV_RICH):        # signal = IV rich at t
-        continue
+    ivr = IV.get((sym, t))                          # recorded for context, no longer a hard gate
     u = day["underlying"].iloc[0]
     exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry
     dte = int((exp - pd.Timestamp(e_date)).days)
@@ -89,6 +94,9 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     risk = width - credit
     if credit <= 0 or risk <= 0:
         continue
+    entry_ror = credit / risk * 100
+    if entry_ror <= MIN_ENTRY_ROR:                  # THE gating criterion: entry-time credit/max_risk
+        continue
     # daily mark-to-close: cost to close the condor each day; unrealized pnl = credit - value.
     # Any day where a leg's volume is too thin is skipped (not marked at a stale/illiquid print);
     # forced exit once DTE drops to <=SAFE_DTE (ahead of the E-4 delivery-margin ramp).
@@ -110,10 +118,12 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     exit_value = vals[-1][1]; pnl = credit - exit_value
     out.append({
         "symbol": sym, "group": g2[sym], "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
-        "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2),
+        "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
+        "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
         "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]), "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
         "sell_premium": round(seqs["sc"][0] + seqs["sp"][0], 2), "buy_premium": round(seqs["lc"][0] + seqs["lp"][0], 2),
-        "credit": round(credit, 2), "max_risk": round(risk, 2), "exit_value": round(exit_value, 2),
+        "credit": round(credit, 2), "max_risk": round(risk, 2), "entry_ror_pct": round(entry_ror, 1),
+        "exit_value": round(exit_value, 2),
         "pnl": round(pnl, 2), "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
         "outcome": "win" if pnl > 0 else "loss",
     })

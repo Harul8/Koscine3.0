@@ -398,60 +398,21 @@ def _sell_sources():
     return _SELL_CACHE["contracts"], _SELL_CACHE["iv"]
 
 
-WEEKLY_CAP_PER_GROUP = 2   # "a few trades a week", not a fixed daily quota
-
-
-def _weekly_log_path(structure: str) -> Path:
-    p = LM_LOCK_V2.parent / "prod_sell_strategies"
-    p.mkdir(parents=True, exist_ok=True)
-    return p / f"weekly_signal_log_{structure}.csv"
-
-
-def _apply_weekly_quota(candidates: list[dict], structure: str, as_of: pd.Timestamp,
-                        cap_per_group: int = WEEKLY_CAP_PER_GROUP) -> list[dict]:
-    """Cap NEW symbols surfaced per group to cap_per_group per ISO week (not per day). A symbol
-    already logged this week keeps showing (as long as it's still in_window); once a group hits
-    its weekly cap, no further new symbols surface for it until next week. Ranked by IV-richness
-    x return-on-risk among today's in_window candidates."""
-    iso_year, iso_week, _ = as_of.isocalendar()
-    path = _weekly_log_path(structure)
-    log = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=["iso_year", "iso_week", "group", "symbol"])
-    this_week = log[(log["iso_year"] == iso_year) & (log["iso_week"] == iso_week)]
-    already: dict[str, set] = {g: set(this_week[this_week["group"] == g]["symbol"]) for g in this_week["group"].unique()}
-    counts = {g: len(s) for g, s in already.items()}
-
-    in_window = [c for c in candidates if c["in_window"]]
-    in_window.sort(key=lambda c: ((c["iv_ratio"] or 0), c["ror_pct"]), reverse=True)
-    picks, new_rows = [], []
-    for c in in_window:
-        g = c["group"]
-        if c["symbol"] in already.get(g, set()):
-            picks.append(c)
-            continue
-        if counts.get(g, 0) < cap_per_group:
-            picks.append(c)
-            new_rows.append({"iso_year": iso_year, "iso_week": iso_week, "group": g, "symbol": c["symbol"]})
-            counts[g] = counts.get(g, 0) + 1
-    if new_rows:
-        pd.concat([log, pd.DataFrame(new_rows)], ignore_index=True).to_csv(path, index=False)
-    return picks
-
-
-CONDOR_DTE_MIN, CONDOR_IV_RICH = 9, 1.3   # optimized entry rule: safety floor + IV-rich threshold
+CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 150.0   # safety floor (delivery-margin) + THE quality gate
 
 
 @app.get("/prod2/sell_strategies")
 def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                           wing: float = Query(0.03, ge=0.01, le=0.08),
                           dte_min: int = Query(CONDOR_DTE_MIN, ge=0, le=30),
-                          iv_rich: float = Query(CONDOR_IV_RICH, ge=0.5, le=2.0)) -> dict[str, object]:
+                          min_ror: float = Query(CONDOR_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
     """Live DEFINED-RISK iron-condor candidates on the A/B universe: sell ~short_otm% OTM CE+PE,
     buy the +wing% wings (loss always capped), on the nearest available expiry. Entry requires
     DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry: 10/25/45/70/100%+ of contract
-    value -- dte_min=9 keeps a full 5-day hold clear of that window) and IV-rich >= iv_rich.
-    Ranked by IV-richness x return-on-risk; the top picks (weekly_picks) are additionally capped
-    to a small number of NEW symbols per group per ISO week (existing week's picks keep showing).
-    Backtest context (2y, pre-cost, safety-floor-compliant) is embedded."""
+    value -- dte_min=9 keeps a full 5-day hold clear of that window) AND entry-time
+    credit/max_risk (ror_pct) > min_ror -- THE gating criterion, knowable before the trade
+    (unlike a realized/backtested outcome). Ranked by ror_pct; top_picks is the top-3-per-group
+    shortlist among in_window candidates. Backtest context (2y, pre-cost) is embedded."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
@@ -494,35 +455,38 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
-            "in_window": bool(dte >= dte_min and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
-    out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
-    weekly_picks = _apply_weekly_quota(out, "condor", last)
+    out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
+    in_window = [c for c in out if c["in_window"]]
+    top_picks = [c for g in ("A_mcap30", "B_turn35")
+                for c in sorted([c for c in in_window if c["group"] == g], key=lambda c: c["ror_pct"], reverse=True)[:3]]
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "iv_rich": iv_rich},
-        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9, IV-rich>=1.3, pre-cost)",
-                     "ev_on_risk": 0.766, "win_rate": 0.740, "worst": "-1.00x (capped)"},
+        "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
+        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9, entry ror>150%, pre-cost)",
+                     "ev_on_risk": 0.840, "win_rate": 0.889, "worst": "-0.67x (capped)"},
         "candidates": out,
-        "weekly_picks": weekly_picks,
+        "top_picks": top_picks,
     }
 
 
-SKEW_DTE_MIN, SKEW_IV_RICH = 15, 1.6   # optimized entry rule (skew performs best further from expiry)
+SKEW_DTE_MIN, SKEW_MIN_ROR = 15, 150.0   # safety floor (delivery-margin) + THE quality gate
 
 
 @app.get("/prod2/skew_strategy")
 def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                         wing: float = Query(0.03, ge=0.01, le=0.08),
                         dte_min: int = Query(SKEW_DTE_MIN, ge=0, le=30),
-                        iv_rich: float = Query(SKEW_IV_RICH, ge=0.5, le=2.0)) -> dict[str, object]:
+                        min_ror: float = Query(SKEW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
     """Live DEFINED-RISK single-side credit spread on the A/B universe: back out BS implied vol
     for the ~short_otm% OTM call and put separately, sell whichever side is relatively richer
     (skew = ce_iv - pe_iv) with the +wing% wing bought (loss always capped), on the nearest
-    available expiry. Entry requires DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry)
-    and IV-rich >= iv_rich -- unlike the condor, skew backtests best further from expiry, not
-    closer to it. Ranked by IV-richness x return-on-risk; weekly_picks caps NEW symbols per
-    group per ISO week. Backtest context (2y, pre-cost, safety-floor-compliant) is embedded."""
+    available expiry. Entry requires DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry --
+    unlike the condor, skew backtests best further from expiry, not closer) AND entry-time
+    credit/max_risk (ror_pct) > min_ror -- THE gating criterion. Ranked by ror_pct; top_picks
+    is the top-3-per-group shortlist among in_window candidates. Backtest context (2y, pre-cost)
+    is embedded."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
@@ -575,19 +539,21 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "sell_premium": round(sell_premium, 2), "buy_premium": round(buy_premium, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
-            "in_window": bool(dte >= dte_min and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
-    out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
-    weekly_picks = _apply_weekly_quota(out, "skew", last)
+    out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
+    in_window = [c for c in out if c["in_window"]]
+    top_picks = [c for g in ("A_mcap30", "B_turn35")
+                for c in sorted([c for c in in_window if c["group"] == g], key=lambda c: c["ror_pct"], reverse=True)[:3]]
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "iv_rich": iv_rich},
-        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15, IV-rich>=1.6, pre-cost)",
-                     "ev_on_risk": 0.323, "win_rate": 0.829, "worst": "-0.35x (capped)",
-                     "note": "no interim stop-loss finding carried over from the prior DTE-windowed backtest, "
-                             "not yet re-tested for this rule"},
+        "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
+        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15, entry ror>150%, pre-cost)",
+                     "ev_on_risk": 2.377, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
+                     "note": "small sample (n=250 over 2y) -- 100% win rate is what was observed, not a guarantee. "
+                             "No interim stop-loss finding carried over from an earlier backtest, not re-tested here."},
         "candidates": out,
-        "weekly_picks": weekly_picks,
+        "top_picks": top_picks,
     }
 
 

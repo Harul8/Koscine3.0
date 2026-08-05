@@ -1,15 +1,22 @@
 """Generate the historical IV-skew signal log: only the dates a signal actually fired
-(IV-rich, DTE >= DTE_MIN), selling whichever side (CE/PE) has the richer Black-Scholes
-implied vol at entry, held to day-5/expiry close (no interim stop-loss -- every tested
-EOD stop level made results worse). Writes locks/prod_sell_strategies/skew_signal_history.csv
-for the API (/prod2/skew_signal_history) to serve.
+(entry-time credit/max_risk > MIN_ENTRY_ROR, DTE >= DTE_MIN), selling whichever side (CE/PE)
+has the richer Black-Scholes implied vol at entry, held to day-5/expiry close (no interim
+stop-loss -- every tested EOD stop level made results worse). Writes
+locks/prod_sell_strategies/skew_signal_history.csv for the API (/prod2/skew_signal_history)
+to serve.
 
-Two safety rules (NSE physical-settlement / delivery-margin avoidance -- ITM margin ramps
-10%/25%/45%/70%/100%+ of contract value starting E-4, i.e. 4 trading days before expiry):
+The gating criterion is MIN_ENTRY_ROR: the entry-time credit/max_risk ratio (knowable before
+the trade), not the realized ror_pct column (an ex-post outcome). IV-richness is recorded for
+context but is no longer a hard filter.
+
+One safety rule is still non-negotiable (NSE physical-settlement / delivery-margin avoidance --
+ITM margin ramps 10%/25%/45%/70%/100%+ of contract value starting E-4, i.e. 4 trading days
+before expiry):
   1. Entry requires DTE >= DTE_MIN.
   2. Forced exit if the position is still open when DTE drops to <= SAFE_DTE.
 Liquidity guard applies on EVERY day of the hold (not just entry): a day where either leg's
-traded volume is too thin is skipped rather than marked at a possibly stale EOD print.
+traded volume is too thin is skipped rather than marked at a possibly stale EOD print. A
+[0, width] clamp on the daily mark backstops this.
 
 Pipeline:
   1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
@@ -29,7 +36,7 @@ from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
 SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.03, 5, 4
-DTE_MIN, IV_RICH, MIN_VOL = 15, 1.6, 50
+DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 15, 150.0, 50
 R = 0.065
 
 
@@ -83,9 +90,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if p is None or p == 0 or p + FWD - 1 >= len(tdays):
         continue
     t = pd.Timestamp(tdays[p - 1])
-    ivr = IV.get((sym, t))
-    if ivr is None or not (ivr >= IV_RICH):
-        continue
+    ivr = IV.get((sym, t))                          # recorded for context, no longer a hard gate
     u = day["underlying"].iloc[0]
     exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry
     dte = int((exp - pd.Timestamp(e_date)).days)
@@ -124,6 +129,9 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     risk = width - credit
     if credit <= 0 or risk <= 0:
         continue
+    entry_ror = credit / risk * 100
+    if entry_ror <= MIN_ENTRY_ROR:                  # THE gating criterion: entry-time credit/max_risk
+        continue
 
     # daily mark-to-close, skipping thin-volume days; forced exit before the E-4 delivery-margin ramp.
     vals, dd = [], 0.0
@@ -143,11 +151,13 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     exit_value = vals[-1]; pnl = credit - exit_value
     out.append({
         "symbol": sym, "group": g2[sym], "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
-        "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2),
+        "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
+        "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
         "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
         "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
         "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
-        "credit": round(credit, 2), "max_risk": round(risk, 2), "exit_value": round(exit_value, 2),
+        "credit": round(credit, 2), "max_risk": round(risk, 2), "entry_ror_pct": round(entry_ror, 1),
+        "exit_value": round(exit_value, 2),
         "pnl": round(pnl, 2), "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
         "outcome": "win" if pnl > 0 else "loss",
     })
