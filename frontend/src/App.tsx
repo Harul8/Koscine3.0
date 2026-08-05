@@ -1085,7 +1085,7 @@ function SellStrategies() {
           <table>
             <thead><tr>
               <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th>
-              <th>Short C / Long C</th><th>Short P / Long P</th><th>Credit</th><th>Max risk</th><th>Ret/risk</th><th>Breakevens</th>
+              <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Credit</th><th>Max risk</th><th>Ret/risk</th>
             </tr></thead>
             <tbody>
               {daily.map((r) => (
@@ -1095,15 +1095,14 @@ function SellStrategies() {
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
-                  <td>{num(r.short_ce, 0)} / {num(r.long_ce, 0)}</td>
-                  <td>{num(r.short_pe, 0)} / {num(r.long_pe, 0)}</td>
+                  <td>{num(r.short_ce, 0)} / {num(r.long_ce, 0)} / <span className="hint">{num(r.be_high, 0)}</span></td>
+                  <td>{num(r.short_pe, 0)} / {num(r.long_pe, 0)} / <span className="hint">{num(r.be_low, 0)}</span></td>
                   <td>{num(r.credit, 1)}</td>
                   <td>{num(r.max_risk, 1)}</td>
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
-                  <td className="hint">{num(r.be_low, 0)} – {num(r.be_high, 0)}</td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={11} className="empty-cell">No option-chain data</td></tr>}
+              {!daily.length && <tr><td colSpan={10} className="empty-cell">No option-chain data</td></tr>}
             </tbody>
           </table>
         </div>
