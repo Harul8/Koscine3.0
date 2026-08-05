@@ -548,28 +548,33 @@ function PriceHistory({ horizon, setHorizon }: PageProps) {
     <>
       <section className="controls-band">
         <HorizonFilter horizon={horizon} setHorizon={setHorizon} />
-        <label><LineChart size={16} />
-          <select value={symbol} onChange={(e) => setSymbol(e.target.value)}>
-            {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
-          </select>
-        </label>
-        <label><CalendarDays size={16} />
-          <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)}>
-            {(["D", "W", "M"] as Timeframe[]).map((t) => <option key={t} value={t}>{TF_LABEL[t]}</option>)}
-          </select>
-        </label>
-        <label className="chk">
-          <input type="checkbox" checked={showLevels} onChange={(e) => setShowLevels(e.target.checked)} /> S/R levels
-        </label>
-        <label title={autoDD != null ? `auto-computed from this stock's own >10% declines over the trailing 2 years (${(autoDD * 100).toFixed(1)}%)` : "no >10% decline in the trailing 2 years — using the fixed default"}>
-          DD % {autoDD != null ? <span className="hint" style={{ marginLeft: 0 }}>(auto {(autoDD * 100).toFixed(0)}%)</span> : null}
-          <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
-                 onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
-        </label>
         <span className="hint">latest {DEFAULT_CANDLES_BY_TF[tf] === 9999 ? "all" : DEFAULT_CANDLES_BY_TF[tf]} · ↑↓ to zoom · ← → to pan · click a bar for OHLC · double-click to reset</span>
       </section>
       <section className="panel cockpit">
-        <div className="panel-title"><h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2><span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span></div>
+        <div className="panel-title">
+          <h2>{symbol} — {TF_LABEL[tf].toLowerCase()} candles</h2>
+          <div className="panel-title-controls">
+            <label><LineChart size={16} />
+              <select value={symbol} onChange={(e) => setSymbol(e.target.value)} style={{ minWidth: 150 }}>
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+              </select>
+            </label>
+            <label><CalendarDays size={16} />
+              <select value={tf} onChange={(e) => setTf(e.target.value as Timeframe)} style={{ minWidth: 90 }}>
+                {(["D", "W", "M"] as Timeframe[]).map((t) => <option key={t} value={t}>{TF_LABEL[t]}</option>)}
+              </select>
+            </label>
+            <label className="chk">
+              <input type="checkbox" checked={showLevels} onChange={(e) => setShowLevels(e.target.checked)} /> S/R levels
+            </label>
+            <label title={autoDD != null ? `auto-computed from this stock's own >10% declines over the trailing 2 years (${(autoDD * 100).toFixed(1)}%)` : "no >10% decline in the trailing 2 years — using the fixed default"}>
+              DD % {autoDD != null ? <span className="hint" style={{ marginLeft: 0 }}>(auto {(autoDD * 100).toFixed(0)}%)</span> : null}
+              <input type="number" min={1} max={60} step={1} value={minDD} style={{ width: 54 }}
+                     onChange={(e) => setMinDD(Math.max(1, Math.min(60, Number(e.target.value) || 5)))} />
+            </label>
+            <span>{candles.length} {tf === "D" ? "days" : tf === "W" ? "weeks" : "months"}</span>
+          </div>
+        </div>
         <div style={{ padding: 14 }}>
           <Candles series={candles} weeklyFull={weeklyFull} showLevels={showLevels} minDDpct={minDD} defaultCandles={DEFAULT_CANDLES_BY_TF[tf]} />
         </div>
@@ -774,9 +779,14 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
     flush();
     return out;
   };
-  // 2 nearest >=2-touch resistance zones above the close, 2 nearest support zones below
-  const above = dedupBySide(resZones.filter((z) => z.touches >= 2 && z.price > refClose), false).sort((a, b) => a.price - b.price).slice(0, 2);
-  const below = dedupBySide(supZones.filter((z) => z.touches >= 2 && z.price < refClose), true).sort((a, b) => b.price - a.price).slice(0, 2);
+  // Role (R vs S) is decided by CURRENT PRICE, not by whether a zone originated from pivot highs
+  // or lows: an old support shelf that price has since fallen below is the very next overhead
+  // level (a textbook support/resistance flip) and must be eligible as resistance even though it
+  // was built from pivot lows — so both populations are pooled before picking sides.
+  const allZones = [...resZones, ...supZones];
+  // 2 nearest >=2-touch zones above the close (resistance), 2 nearest below (support)
+  const above = dedupBySide(allZones.filter((z) => z.touches >= 2 && z.price > refClose), false).sort((a, b) => a.price - b.price).slice(0, 2);
+  const below = dedupBySide(allZones.filter((z) => z.touches >= 2 && z.price < refClose), true).sort((a, b) => b.price - a.price).slice(0, 2);
   const sel: Level[] = [];
   for (const z of above) sel.push({ price: z.price, kind: "R", touches: z.touches, firstDate: z.firstDate });
   for (const z of below) sel.push({ price: z.price, kind: "S", touches: z.touches, firstDate: z.firstDate });

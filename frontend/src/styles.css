@@ -294,6 +294,7 @@ select {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   padding: 14px 16px;
   border-bottom: 1px solid #e5ebe8;
@@ -303,6 +304,32 @@ select {
   margin: 0;
   font-size: 16px;
   letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.panel-title-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  color: #52625c;
+  font-size: 13px;
+}
+
+.panel-title-controls label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-title-controls select {
+  height: 32px;
+  padding: 0 8px;
+  font-size: 13px;
+}
+
+.panel-title-controls input[type="number"] {
+  height: 32px;
 }
 
 .panel-title span {
