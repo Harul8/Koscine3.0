@@ -79,7 +79,7 @@ export default function App() {
       {tab === "desk" && <SignalDesk {...props} />}
       {tab === "movers" && <DailyMovers {...props} />}
       {tab === "price" && <PriceHistory {...props} />}
-      {tab === "sell" && <SellStrategies />}
+      {tab === "sell" && <><SellStrategies /><SkewStrategy /></>}
       {tab === "ops" && <RunRetrain />}
     </main>
   );
@@ -1147,6 +1147,143 @@ function SellStrategies() {
                 </tr>
               ))}
               {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 11 : 10} className="empty-cell">No signals</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </>
+  );
+}
+
+// ----------------------------------------------------------------- Skew Strategy (directional leg)
+type SkewRow = {
+  symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
+  side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number;
+  short_strike: number; long_strike: number; credit: number; max_risk: number; max_profit: number;
+  ror_pct: number; breakeven: number; in_window: boolean;
+};
+type SkewResp = {
+  as_of: string | null; params: Record<string, number>;
+  backtest: { window: string; ev_on_risk: number; win_rate: number; worst: string; note: string };
+  candidates: SkewRow[];
+};
+type SkewHistRow = {
+  symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number;
+  side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number; short_strike: number; long_strike: number;
+  credit: number; max_risk: number; exit_value: number; pnl: number; ror_pct: number; max_dd_pct: number; outcome: string;
+};
+type SkewHist = {
+  rows: SkewHistRow[];
+  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+};
+
+function SkewStrategy() {
+  const [data, setData] = useState<SkewResp | null>(null);
+  const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
+  const [filterSym, setFilterSym] = useState("");
+  const [hist, setHist] = useState<SkewHist | null>(null);
+  useEffect(() => { getJson<SkewResp>("/prod2/skew_strategy").then(setData).catch(() => setData(null)); }, []);
+  useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => {
+    getJson<SkewHist>(`/prod2/skew_signal_history${filterSym ? `?symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
+  }, [filterSym]);
+
+  const bt = data?.backtest;
+  const cands = data?.candidates ?? [];
+  const daily = ["A_mcap30", "B_turn35"].flatMap((g) => cands.filter((c) => c.group === g).slice(0, 3));
+  const hs = hist?.summary;
+  const allSyms = filterSym === "";
+
+  return (
+    <>
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title"><h2>Directional credit spread — IV skew</h2>
+          <span>as of {data?.as_of ?? "—"} · top 3 per group</span></div>
+        <div className="sell-explain">
+          <div className="sell-rule">
+            <strong>Structure</strong> Sell only the side (call or put) whose ~2% OTM strike is priced with the <b>richer</b> Black-Scholes implied vol
+            (skew = CE-IV − PE-IV), buy the +5% wing on that same side — a single-leg defined-risk credit spread.
+            <b> Max loss is always capped</b> at (wing width − credit).
+            <span className="hint"> This is a relative-value read on option pricing, not a forecast of which way the stock moves — direction alone is ≈ coin-flip on this universe.</span>
+          </div>
+          <div className="sell-rule"><strong>Signal / entry</strong> Take it when IV is <b>rich</b> (atm-IV above its 1-yr median, iv_ratio ≥ 1.1)
+            and the near expiry is <b>≤ ~2 weeks out</b> (DTE ≤ 14). Rows meeting both are the <b>entry-window</b> picks (highlighted).</div>
+          <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first) — <b>no interim stop-loss</b>.
+            Every EOD stop level tested (15–50% of max risk) reduced win rate and mean return: at 5–12 DTE, day-close dips mostly mean-revert by expiry, so a stop just locks in a temporary drawdown.</div>
+          {bt ? (
+            <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
+              win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
+              <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
+          ) : null}
+        </div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>Sell</th>
+              <th>CE-IV / PE-IV</th><th>Short / Long</th><th>Credit</th><th>Max risk</th><th>Ret/risk</th><th>Breakeven</th>
+            </tr></thead>
+            <tbody>
+              {daily.map((r) => (
+                <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
+                  <td><strong>{r.symbol}</strong></td>
+                  <td>{r.group.slice(0, 1)}</td>
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{num(r.underlying, 0)}</td>
+                  <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
+                  <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
+                  <td className="hint">{r.ce_iv.toFixed(2)} / {r.pe_iv.toFixed(2)}</td>
+                  <td>{num(r.short_strike, 0)} / {num(r.long_strike, 0)}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td>{num(r.max_risk, 1)}</td>
+                  <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
+                  <td className="hint">{num(r.breakeven, 0)}</td>
+                </tr>
+              ))}
+              {!daily.length && <tr><td colSpan={12} className="empty-cell">No option-chain data</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title">
+          <h2>Signal history — returns per fired signal</h2>
+          <label className="chk"><Coins size={15} />
+            <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+              <option value="">All stocks</option>
+              {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+            </select>
+          </label>
+        </div>
+        {hs ? (
+          <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
+            mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
+            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk</div>
+        ) : null}
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th><th>Sell</th>
+              <th>Short / Long</th><th>Credit (entry)</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+            </tr></thead>
+            <tbody>
+              {(hist?.rows ?? []).map((r, i) => (
+                <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
+                  <td>{r.signal_date}</td>
+                  {allSyms ? <td><strong>{r.symbol}</strong> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{r.iv_ratio.toFixed(2)}×</td>
+                  <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
+                  <td>{num(r.short_strike, 0)} / {num(r.long_strike, 0)}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td>{num(r.exit_value, 1)}</td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</td>
+                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
+                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                </tr>
+              ))}
+              {!(hist?.rows ?? []).length && <tr><td colSpan={allSyms ? 12 : 11} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>

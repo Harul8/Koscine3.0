@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -346,6 +348,33 @@ def prod2_stock_history(symbol: str) -> list[dict[str, object]]:
 
 # ---- Sell Strategies (defined-risk premium selling) -------------------------------------------
 _SELL_CACHE: dict = {"mtime": None, "contracts": None, "iv": None}
+_RISK_FREE_RATE = 0.065  # flat India risk-free proxy; good enough for short-dated near-ATM IV
+
+
+def _bs_price(spot: float, strike: float, years: float, sigma: float, is_call: bool) -> float:
+    if sigma <= 0 or years <= 0:
+        return max(0.0, (spot - strike) if is_call else (strike - spot))
+    d1 = (np.log(spot / strike) + (_RISK_FREE_RATE + 0.5 * sigma ** 2) * years) / (sigma * np.sqrt(years))
+    d2 = d1 - sigma * np.sqrt(years)
+    if is_call:
+        return spot * norm.cdf(d1) - strike * np.exp(-_RISK_FREE_RATE * years) * norm.cdf(d2)
+    return strike * np.exp(-_RISK_FREE_RATE * years) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+
+
+def _implied_vol(price: float, spot: float, strike: float, years: float, is_call: bool) -> float | None:
+    """Black-Scholes implied vol via Brent's method; None if unsolvable (price below intrinsic, etc)."""
+    intrinsic = max(0.0, (spot - strike) if is_call else (strike - spot))
+    if price <= intrinsic + 1e-6 or years <= 0:
+        return None
+    try:
+        return float(brentq(lambda s: _bs_price(spot, strike, years, s, is_call) - price, 1e-4, 6.0, xtol=1e-4))
+    except ValueError:
+        return None
+
+
+def _opt_price(row) -> float:  # leg mark: prefer close, fall back to settle
+    p = row.get("close")
+    return float(p) if pd.notna(p) and p > 0 else (float(row["settle"]) if pd.notna(row.get("settle")) else np.nan)
 
 
 def _sell_sources():
@@ -387,10 +416,6 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                     & (contracts["underlying_price"] > 0)].copy()
     ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
 
-    def price(row):  # leg mid: prefer close, fall back to settle
-        p = row.get("close")
-        return float(p) if pd.notna(p) and p > 0 else (float(row["settle"]) if pd.notna(row.get("settle")) else np.nan)
-
     out = []
     for sym, sg in day.groupby("symbol"):
         exp = sg["expiry"].min()
@@ -405,7 +430,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             return r
         sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
         spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
-        psce, plce, pspe, plpe = price(sce), price(lce), price(spe), price(lpe)
+        psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
         if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
             continue
         credit = (psce + pspe) - (plce + plpe)
@@ -432,6 +457,106 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                      "ev_on_risk_all": 0.46, "ev_on_risk_iv_rich": 0.68, "win_rate": 0.93, "worst": "-0.84x (capped)"},
         "candidates": out,
     }
+
+
+@app.get("/prod2/skew_strategy")
+def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
+                        wing: float = Query(0.03, ge=0.01, le=0.08),
+                        dte_max: int = Query(14, ge=2, le=45),
+                        iv_rich: float = Query(1.1, ge=0.5, le=2.0)) -> dict[str, object]:
+    """Live DEFINED-RISK single-side credit spread on the A/B universe: back out BS implied vol
+    for the ~short_otm% OTM call and put separately, sell whichever side is relatively richer
+    (skew = ce_iv - pe_iv) with the +wing% wing bought (loss always capped) -- a relative-value
+    read on option pricing, not a forecast of which way the stock moves. Ranked by IV-richness x
+    return-on-risk. Backtest context (2y, pre-cost) is embedded."""
+    contracts, iv = _sell_sources()
+    if contracts is None:
+        return {"as_of": None, "candidates": [], "note": "no option-chain data"}
+    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    last = contracts["date"].max()
+    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
+                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & (contracts["underlying_price"] > 0)].copy()
+    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
+
+    out = []
+    for sym, sg in day.groupby("symbol"):
+        exp = sg["expiry"].min()
+        chain = sg[sg["expiry"] == exp]
+        u = float(chain["underlying_price"].iloc[0])
+        dte = int((exp - last).days)
+        ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
+        if ce.empty or pe.empty:
+            continue
+        def nearest(df, target):
+            return df.iloc[(df["strike"] - target).abs().argmin()]
+        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
+        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
+        if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
+            continue
+        years = dte / 365.0
+        ce_iv = _implied_vol(psce, u, float(sce["strike"]), years, True)
+        pe_iv = _implied_vol(pspe, u, float(spe["strike"]), years, False)
+        if ce_iv is None or pe_iv is None:
+            continue
+        skew = ce_iv - pe_iv
+        side = "CE" if skew > 0 else "PE"
+        if side == "CE":
+            short_leg, long_leg, credit = sce, lce, psce - plce
+        else:
+            short_leg, long_leg, credit = spe, lpe, pspe - plpe
+        width = abs(float(long_leg["strike"]) - float(short_leg["strike"]))
+        risk = width - credit
+        if credit <= 0 or risk <= 0:
+            continue
+        ivr = ivlast.get(sym)
+        breakeven = float(short_leg["strike"]) + credit if side == "CE" else float(short_leg["strike"]) - credit
+        out.append({
+            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
+            "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
+            "short_strike": float(short_leg["strike"]), "long_strike": float(long_leg["strike"]),
+            "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+            "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
+            "in_window": bool(dte <= dte_max and ivr is not None and pd.notna(ivr) and ivr >= iv_rich),
+        })
+    out.sort(key=lambda r: (r["in_window"], (r["iv_ratio"] or 0), r["ror_pct"]), reverse=True)
+    return {
+        "as_of": last.date().isoformat(),
+        "params": {"short_otm": short_otm, "wing": wing, "dte_max": dte_max, "iv_rich": iv_rich},
+        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE 5-12, pre-cost)",
+                     "ev_on_risk": 0.305, "win_rate": 0.844, "worst": "-0.44x (capped)",
+                     "note": "no interim stop-loss -- every tested EOD stop level (15-50% of max risk) "
+                             "reduced win rate and mean return vs holding to ~50% max profit / expiry"},
+        "candidates": out,
+    }
+
+
+@app.get("/prod2/skew_signal_history")
+def prod2_skew_signal_history(symbol: str | None = None) -> dict[str, object]:
+    """Historical skew-strategy signals (only dates a signal fired: IV-rich + entry window),
+    each with the side sold (CE/PE), entry credit / exit value / PnL / max intra-trade drawdown.
+    Optional ?symbol= filter. Also returns the aggregate track record for the filtered set."""
+    f = LM_LOCK_V2.parent / "prod_sell_strategies" / "skew_signal_history.csv"
+    if not f.exists():
+        return {"rows": [], "summary": None}
+    df = pd.read_csv(f)
+    if symbol:
+        df = df[df["symbol"].eq(symbol.upper())]
+    df = df.sort_values("entry_date", ascending=False)
+    summary = None
+    if not df.empty:
+        summary = {
+            "n": int(len(df)),
+            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
+            "median_ror_pct": round(float(df["ror_pct"].median()), 1),
+            "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
+            "worst_dd_pct": round(float(df["max_dd_pct"].min()), 1),
+            "total_pnl": round(float(df["pnl"].sum()), 1),
+        }
+    return {"rows": _records(df), "summary": summary}
 
 
 @app.get("/prod2/sell_signal_history")
