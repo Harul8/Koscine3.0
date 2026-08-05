@@ -705,7 +705,7 @@ type Zone = { price: number; touches: number; firstDate: string };
 // the last visible bar's date — no look-ahead — NOT clipped to the left edge of whatever x-range
 // happens to be panned/zoomed into; a separate display filter then decides whether to draw a
 // given line, based on whether its price falls in the currently visible y-axis range.
-// Every N-bar local pivot high/low is a raw candidate (no per-peak filter); candidates within 1%
+// Every N-bar local pivot high/low is a raw candidate (no per-peak filter); candidates within 2%
 // cluster into a price zone. Within a zone, pivots are walked in time order and only count as a
 // NEW touch (vs. still being part of the same ongoing test) if, since the last accepted touch,
 // price either pulled >= dd away from the zone OR stayed on the far side of it (below for
@@ -717,7 +717,7 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
   // N=2: needs to beat only its 2 nearest neighbors each side. N=3 was too wide — two genuinely
   // separate nearby peaks (e.g. 3 weeks apart on a weekly chart) could sit within each other's
   // pivot window and invalidate one another even though a real pullback separated them.
-  const N = 2, tol = 0.01, athTol = 0.02, G = 8;
+  const N = 2, tol = 0.02, athTol = 0.02, G = 8;
   const n = vis.length;
   if (n < 2 * N + 1) return [];
   const isPivotHigh = (i: number) => { for (let j = i - N; j <= i + N; j++) if (j !== i && vis[j].high >= vis[i].high) return false; return true; };
@@ -727,7 +727,7 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
     if (isPivotHigh(i)) highs.push({ i, p: vis[i].high });
     if (isPivotLow(i)) lows.push({ i, p: vis[i].low });
   }
-  // group raw pivots within 1% of each other into candidate price zones (member lists, not yet touch-counted)
+  // group raw pivots within 2% of each other into candidate price zones (member lists, not yet touch-counted)
   const clusterRaw = (pts: { i: number; p: number }[]): { i: number; p: number }[][] => {
     pts = pts.slice().sort((a, b) => a.p - b.p);
     const out: { i: number; p: number }[][] = [];
@@ -741,7 +741,11 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
   // OR >= G bars on the far side of the zone since the last accepted touch)
   const resolveZone = (members: { i: number; p: number }[], isResistance: boolean): Zone | null => {
     const byTime = members.slice().sort((a, b) => a.i - b.i);
-    const level = byTime.reduce((s, x) => s + x.p, 0) / byTime.length;
+    // The line must be a price every member actually touched, not an average none of them hit:
+    // for a highs-cluster (isResistance) every wick reached AT LEAST the lowest of the group, so
+    // that's the shared level; for a lows-cluster every wick dropped to AT MOST the highest of
+    // the group, so that's the shared level.
+    const level = isResistance ? Math.min(...byTime.map((x) => x.p)) : Math.max(...byTime.map((x) => x.p));
     let touches = 1, lastI = byTime[0].i;
     for (let k = 1; k < byTime.length; k++) {
       const curI = byTime[k].i;
