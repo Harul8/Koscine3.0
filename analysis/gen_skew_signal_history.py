@@ -69,6 +69,14 @@ mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str)
 mk["iv_ratio"] = mk.groupby("symbol")["atm_iv"].transform(lambda s: s / s.rolling(252, min_periods=60).median())
 IV = mk.set_index(["symbol", "date"])["iv_ratio"].to_dict()
 tdays = np.array(sorted(mk["date"].unique())); tpos = {d: k for k, d in enumerate(tdays)}
+
+from koscine.config import SILVER_DATA_ROOT  # noqa: E402
+lot_df = pd.read_parquet(SILVER_DATA_ROOT / "lot_size.parquet", columns=["symbol", "expiry_month", "lot"])
+LOT = lot_df.set_index(["symbol", pd.to_datetime(lot_df["expiry_month"]).dt.to_period("M")])["lot"].to_dict()
+
+def lot_size(sym, exp):
+    return LOT.get((sym, pd.Timestamp(exp).to_period("M")))
+
 cbar = {k: dict(zip(pd.to_datetime(g["date"]).values, zip(g["open"].values, g["close"].values, g["vol"].values)))
         for k, g in panel.groupby(["symbol", "opt_type", "expiry", "strike"], sort=False)}
 
@@ -149,6 +157,7 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if not vals:
         continue
     exit_value = vals[-1]; pnl = credit - exit_value
+    lot = lot_size(sym, exp)
     out.append({
         "symbol": sym, "group": g2[sym], "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
         "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
@@ -157,6 +166,8 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
         "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
         "credit": round(credit, 2), "max_risk": round(risk, 2), "entry_ror_pct": round(entry_ror, 1),
+        "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
+        "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
         "exit_value": round(exit_value, 2),
         "pnl": round(pnl, 2), "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
         "outcome": "win" if pnl > 0 else "loss",

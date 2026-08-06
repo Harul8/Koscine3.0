@@ -398,6 +398,24 @@ def _sell_sources():
     return _SELL_CACHE["contracts"], _SELL_CACHE["iv"]
 
 
+_LOT_SIZE_CACHE: dict = {"mtime": None, "latest": None}
+
+
+def _lot_sizes() -> dict:
+    """symbol -> current lot size (shares per contract), from the most recent expiry_month on
+    record for that symbol. NSE revises lot sizes periodically; this is the best current estimate."""
+    from koscine.config import SILVER_DATA_ROOT
+    f = SILVER_DATA_ROOT / "lot_size.parquet"
+    if not f.exists():
+        return {}
+    mt = os.path.getmtime(f)
+    if _LOT_SIZE_CACHE["mtime"] != mt:
+        df = pd.read_parquet(f, columns=["symbol", "expiry_month", "lot"])
+        latest = df.sort_values("expiry_month").groupby("symbol")["lot"].last().to_dict()
+        _LOT_SIZE_CACHE.update(mtime=mt, latest=latest)
+    return _LOT_SIZE_CACHE["latest"]
+
+
 CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 150.0   # safety floor (delivery-margin) + THE quality gate
 
 
@@ -417,6 +435,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    lots = _lot_sizes()
     last = contracts["date"].max()
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
                     & contracts["symbol"].isin(g2) & contracts["strike"].notna()
@@ -446,6 +465,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         if credit <= 0 or risk <= 0:
             continue
         ivr = ivlast.get(sym)
+        lot = lots.get(sym)
         out.append({
             "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
@@ -453,6 +473,8 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
             "sell_premium": round(psce + pspe, 2), "buy_premium": round(plce + plpe, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+            "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
+            "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
@@ -491,6 +513,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    lots = _lot_sizes()
     last = contracts["date"].max()
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
                     & contracts["symbol"].isin(g2) & contracts["strike"].notna()
@@ -530,6 +553,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         if credit <= 0 or risk <= 0:
             continue
         ivr = ivlast.get(sym)
+        lot = lots.get(sym)
         breakeven = float(short_leg["strike"]) + credit if side == "CE" else float(short_leg["strike"]) - credit
         out.append({
             "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
@@ -538,6 +562,8 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "short_strike": float(short_leg["strike"]), "long_strike": float(long_leg["strike"]),
             "sell_premium": round(sell_premium, 2), "buy_premium": round(buy_premium, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+            "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
+            "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
