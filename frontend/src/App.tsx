@@ -1186,7 +1186,10 @@ type CondorRow = {
 };
 type SellResp = {
   as_of: string | null; params: Record<string, number>;
-  backtest: { window: string; ev_on_risk: number; win_rate: number; worst: string };
+  backtest: {
+    window: string; ev_on_risk: number; win_rate: number; worst: string;
+    best_of_day?: { window: string; n: number; ev_on_risk: number; win_rate: number; worst: string; per_week: number };
+  };
   candidates: CondorRow[]; top_picks: CondorRow[];
 };
 type SellHistRow = {
@@ -1240,7 +1243,7 @@ function SellStrategies() {
     <>
       <section className="panel cockpit">
         <div className="panel-title"><h2>Sell Strategies — defined-risk iron condor</h2>
-          <span>as of {data?.as_of ?? "—"} · top 3 per group</span></div>
+          <span>as of {data?.as_of ?? "—"} · 1 pick a day</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
             <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
@@ -1249,13 +1252,18 @@ function SellStrategies() {
           <div className="sell-rule"><strong>Signal / entry</strong> THE gate is entry-time <b>credit/max-risk (ret/risk) &gt; 150%</b> — the theoretical
             max-profit/max-risk of the setup, knowable before the trade (unlike a realized outcome). Also requires <b>at least 9 days to expiry</b> —
             never closer, to stay clear of NSE's physical-delivery margin ramp (ITM margin escalates 10/25/45/70/100%+ of contract value starting
-            4 trading days before expiry). Rows meeting both are the <b>entry-window</b> picks (highlighted), ranked by ret/risk, top 3 per group shown;
-            a position still open when DTE drops to 4 is force-closed regardless of profit target.</div>
+            4 trading days before expiry). Only the single <b>richest</b> entry-window setup across both groups is shown each day (capped well under
+            10/week) — a position still open when DTE drops to 4 is force-closed regardless of profit target.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); it decays in your favour while price stays between the breakevens.</div>
           {bt ? (
-            <div className="sell-bt">Backtest ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
+            <div className="sell-bt">Full gated pool ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
               win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
               <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
+          ) : null}
+          {bt?.best_of_day ? (
+            <div className="sell-bt">This tab's rule (1 pick/day, ~{bt.best_of_day.per_week}/week, n={bt.best_of_day.n}):
+              <b> +{(bt.best_of_day.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
+              win rate <b>{(bt.best_of_day.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.best_of_day.worst}</b>.</div>
           ) : null}
         </div>
         <div className="table-wrap">
@@ -1430,6 +1438,7 @@ function SkewStrategy() {
               win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.worst}</b>.
               <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
           ) : null}
+          {bt?.note ? <div className="sell-bt" style={{ borderColor: "#d8a13a" }}><b>⚠ Unverified:</b> {bt.note}</div> : null}
         </div>
         <div className="table-wrap">
           <table>

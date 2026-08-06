@@ -39,6 +39,8 @@ from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 
 SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.03, 5, 4
 DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 150.0, 50
+MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
+                        # entry_ror ratio becomes numerically degenerate (blows toward infinity)
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -105,6 +107,8 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     risk = width - credit
     if credit <= 0 or risk <= 0:
         continue
+    if risk < MIN_RISK_FRAC * width:                 # exclude numerically degenerate near-zero-risk
+        continue                                      # spreads (credit~=width -> ROR blows toward infinity)
     entry_ror = credit / risk * 100
     if entry_ror <= MIN_ENTRY_ROR:                  # THE gating criterion: entry-time credit/max_risk
         continue

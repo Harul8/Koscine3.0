@@ -417,6 +417,8 @@ def _lot_sizes() -> dict:
 
 
 CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 150.0   # safety floor (delivery-margin) + THE quality gate
+MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
+                        # ror_pct ratio becomes numerically degenerate (blows toward infinity)
 
 
 @app.get("/prod2/sell_strategies")
@@ -467,7 +469,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         credit = (psce + pspe) - (plce + plpe)
         width = max(float(lce["strike"] - sce["strike"]), float(spe["strike"] - lpe["strike"]))
         risk = width - credit
-        if credit <= 0 or risk <= 0:
+        if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
             continue
         ivr = ivlast.get(sym)
         lot = lots.get(sym)
@@ -487,13 +489,17 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         })
     out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
     in_window = [c for c in out if c["in_window"]]
-    top_picks = [c for g in ("A_mcap30", "B_turn35")
-                for c in sorted([c for c in in_window if c["group"] == g], key=lambda c: c["ror_pct"], reverse=True)[:3]]
+    # single best-of-day pick (across both groups) -- backtested at ~4.6/week, 99.2% win, +110.5%
+    # mean ROR, worst -26.4% (vs the full gated pool's 86.2% win / +36.9% mean / worst -66.9%)
+    top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:1]
     return {
         "as_of": last.date().isoformat(),
         "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
         "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 0.729, "win_rate": 0.866, "worst": "-0.82x (capped)"},
+                     "ev_on_risk": 0.369, "win_rate": 0.862, "worst": "-0.67x (capped)",
+                     "best_of_day": {"window": "same 2y, 1 pick/day (highest ror_pct), capped 10/week",
+                                    "n": 484, "ev_on_risk": 1.105, "win_rate": 0.992, "worst": "-0.26x (capped)",
+                                    "per_week": 4.6}},
         "candidates": out,
         "top_picks": top_picks,
     }
@@ -561,7 +567,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         credit = sell_premium - buy_premium
         width = abs(float(long_leg["strike"]) - float(short_leg["strike"]))
         risk = width - credit
-        if credit <= 0 or risk <= 0:
+        if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
             continue
         ivr = ivlast.get(sym)
         lot = lots.get(sym)
@@ -587,9 +593,14 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         "as_of": last.date().isoformat(),
         "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
         "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15 w/ roll-forward, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 2.310, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
-                     "note": "small sample (n=462 over 2y) -- 100% win rate is what was observed, not a guarantee. "
-                             "No interim stop-loss finding carried over from an earlier backtest, not re-tested here."},
+                     "ev_on_risk": 1.352, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
+                     "note": "n=443 over 2y, 100% win rate. Checked for the data-quality issue found in the condor "
+                             "backtest (near-zero-risk entries with a degenerate ror ratio) and excluded those, but "
+                             "the 100% win rate persists -- could not find a bug explaining it. Treat as an unverified, "
+                             "small-sample finding, not a guarantee: this window may simply not include a loss for "
+                             "this specific narrow selection, even though the same market data clearly contains "
+                             "losses elsewhere (see the condor backtest). No interim stop-loss finding carried over "
+                             "from an earlier backtest, not re-tested here."},
         "candidates": out,
         "top_picks": top_picks,
     }
