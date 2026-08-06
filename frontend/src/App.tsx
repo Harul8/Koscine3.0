@@ -5,6 +5,7 @@ import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
 const GROUP_LABEL: Record<string, string> = { A_mcap30: "A · mega-cap", B_turn35: "B · movers" };
+const MAX_UNFILTERED_HIST_ROWS = 200; // cap the "All months" history view so the page doesn't balloon
 type Horizon = "5d" | "1d";
 type PageProps = { horizon: Horizon; setHorizon: (h: Horizon) => void };
 
@@ -1225,10 +1226,11 @@ function SellStrategies() {
   const daily = data?.top_picks ?? [];
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
-  const histRows = useMemo(() => {
+  const histRowsAll = useMemo(() => {
     const all = hist?.rows ?? [];
     return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
   }, [hist, filterMonth]);
+  const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = useMemo(() => {
     if (!histRows.length) return null;
     return {
@@ -1274,7 +1276,7 @@ function SellStrategies() {
         <div className="table-wrap">
           <table>
             <thead><tr>
-              <th></th><th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
+              <th></th><th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
               <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
               <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
             </tr></thead>
@@ -1283,7 +1285,6 @@ function SellStrategies() {
                 <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
                   <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
                   <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
-                  <td>{r.group.slice(0, 1)}</td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
@@ -1300,7 +1301,7 @@ function SellStrategies() {
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={15} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1322,7 +1323,8 @@ function SellStrategies() {
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
-            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk</div>
+            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk
+            {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}</div>
         ) : null}
         <div className="table-wrap">
           <table>
@@ -1407,10 +1409,11 @@ function SkewStrategy() {
   const daily = data?.top_picks ?? [];
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
-  const histRows = useMemo(() => {
+  const histRowsAll = useMemo(() => {
     const all = hist?.rows ?? [];
     return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
   }, [hist, filterMonth]);
+  const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = useMemo(() => {
     if (!histRows.length) return null;
     return {
@@ -1451,7 +1454,7 @@ function SkewStrategy() {
         <div className="table-wrap">
           <table>
             <thead><tr>
-              <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>Sell</th>
+              <th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>Sell</th>
               <th>CE-IV / PE-IV</th><th>Short / Long</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
               <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th><th>Breakeven</th>
             </tr></thead>
@@ -1459,7 +1462,6 @@ function SkewStrategy() {
               {daily.map((r) => (
                 <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
                   <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
-                  <td>{r.group.slice(0, 1)}</td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
@@ -1476,7 +1478,7 @@ function SkewStrategy() {
                   <td className="hint">{num(r.breakeven, 0)}</td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={15} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1498,7 +1500,8 @@ function SkewStrategy() {
         {hs ? (
           <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
             mean <b>{hs.ev_ror_pct >= 0 ? "+" : ""}{hs.ev_ror_pct}%</b> / median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
-            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk</div>
+            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk
+            {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}</div>
         ) : null}
         <div className="table-wrap">
           <table>
