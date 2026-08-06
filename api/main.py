@@ -444,7 +444,12 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
     out = []
     for sym, sg in day.groupby("symbol"):
-        exp = sg["expiry"].min()
+        # roll forward: earliest expiry that already clears the DTE safety floor, not the nearest
+        # calendar expiry -- avoids going quiet in the days right before each expiry.
+        candidate_exps = sorted(sg["expiry"].unique())
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - last).days >= dte_min), None)
+        if exp is None:
+            continue
         chain = sg[sg["expiry"] == exp]
         u = float(chain["underlying_price"].iloc[0])
         dte = int((exp - last).days)
@@ -475,6 +480,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
@@ -486,8 +492,8 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     return {
         "as_of": last.date().isoformat(),
         "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
-        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 0.840, "win_rate": 0.889, "worst": "-0.67x (capped)"},
+        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)",
+                     "ev_on_risk": 0.729, "win_rate": 0.866, "worst": "-0.82x (capped)"},
         "candidates": out,
         "top_picks": top_picks,
     }
@@ -522,7 +528,12 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
     out = []
     for sym, sg in day.groupby("symbol"):
-        exp = sg["expiry"].min()
+        # roll forward: earliest expiry that already clears the DTE safety floor, not the nearest
+        # calendar expiry -- avoids going quiet in the days right before each expiry.
+        candidate_exps = sorted(sg["expiry"].unique())
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - last).days >= dte_min), None)
+        if exp is None:
+            continue
         chain = sg[sg["expiry"] == exp]
         u = float(chain["underlying_price"].iloc[0])
         dte = int((exp - last).days)
@@ -564,6 +575,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
@@ -574,9 +586,9 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     return {
         "as_of": last.date().isoformat(),
         "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
-        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 2.377, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
-                     "note": "small sample (n=250 over 2y) -- 100% win rate is what was observed, not a guarantee. "
+        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15 w/ roll-forward, entry ror>150%, pre-cost)",
+                     "ev_on_risk": 2.310, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
+                     "note": "small sample (n=462 over 2y) -- 100% win rate is what was observed, not a guarantee. "
                              "No interim stop-loss finding carried over from an earlier backtest, not re-tested here."},
         "candidates": out,
         "top_picks": top_picks,

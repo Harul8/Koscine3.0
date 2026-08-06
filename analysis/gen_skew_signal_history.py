@@ -100,10 +100,14 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     t = pd.Timestamp(tdays[p - 1])
     ivr = IV.get((sym, t))                          # recorded for context, no longer a hard gate
     u = day["underlying"].iloc[0]
-    exp = day["expiry"].min(); chain = day[day["expiry"] == exp]   # always the nearest expiry
-    dte = int((exp - pd.Timestamp(e_date)).days)
-    if dte < DTE_MIN:                              # delivery-margin safety floor
+    # roll forward: use the EARLIEST expiry that already clears the DTE safety floor, rather than
+    # the nearest calendar expiry -- avoids the dead zone in the days right before each expiry.
+    candidate_exps = sorted(day["expiry"].unique())
+    exp = next((e for e in candidate_exps if (pd.Timestamp(e) - pd.Timestamp(e_date)).days >= DTE_MIN), None)
+    if exp is None:
         continue
+    chain = day[day["expiry"] == exp]
+    dte = int((exp - pd.Timestamp(e_date)).days)
     win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
 
     def pick(ot, tgt):
@@ -165,11 +169,14 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
         "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
         "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
-        "credit": round(credit, 2), "max_risk": round(risk, 2), "entry_ror_pct": round(entry_ror, 1),
+        "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+        "entry_ror_pct": round(entry_ror, 1),
         "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
         "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
+        "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
         "exit_value": round(exit_value, 2),
-        "pnl": round(pnl, 2), "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
+        "pnl": round(pnl, 2), "pnl_per_lot": round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None,
+        "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
         "outcome": "win" if pnl > 0 else "loss",
     })
 

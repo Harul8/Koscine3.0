@@ -1181,7 +1181,8 @@ type CondorRow = {
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
-  max_profit: number; ror_pct: number; be_low: number; be_high: number; in_window: boolean;
+  max_profit: number; max_profit_per_lot: number | null;
+  ror_pct: number; be_low: number; be_high: number; in_window: boolean;
 };
 type SellResp = {
   as_of: string | null; params: Record<string, number>;
@@ -1192,8 +1193,9 @@ type SellHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
   sell_premium: number; buy_premium: number;
-  credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null; exit_value: number;
-  pnl: number; ror_pct: number; max_dd_pct: number; outcome: string;
+  credit: number; max_risk: number; max_profit: number;
+  lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
+  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
 };
 type SellHist = {
   rows: SellHistRow[];
@@ -1260,7 +1262,8 @@ function SellStrategies() {
           <table>
             <thead><tr>
               <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th>
-              <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Credit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th><th>Ret/risk</th>
+              <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
+              <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
             </tr></thead>
             <tbody>
               {daily.map((r) => (
@@ -1273,13 +1276,15 @@ function SellStrategies() {
                   <td>{num(r.short_ce, 0)} / {num(r.long_ce, 0)} / <span className="hint">{num(r.be_high, 0)}</span></td>
                   <td>{num(r.short_pe, 0)} / {num(r.long_pe, 0)} / <span className="hint">{num(r.be_low, 0)}</span></td>
                   <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td className="move-up">{num(r.max_profit, 1)}</td>
                   <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
                   <td>{r.lot_size ?? "—"}</td>
+                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={12} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={14} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1307,7 +1312,8 @@ function SellStrategies() {
           <table>
             <thead><tr>
               <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
-              <th>Short C / P</th><th>Credit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <th>Short C / P</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
+              <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
               {histRows.map((r, i) => (
@@ -1318,17 +1324,19 @@ function SellStrategies() {
                   <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
                   <td>{num(r.short_ce, 0)} / {num(r.short_pe, 0)}</td>
                   <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td className="move-up">{num(r.max_profit, 1)} <span className="hint">{r.max_profit_per_lot != null ? `(₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
                   <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}
+                    <span className="hint"> {r.pnl_per_lot != null ? `(${r.pnl_per_lot >= 0 ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 14 : 13} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 16 : 15} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1343,7 +1351,8 @@ type SkewRow = {
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number;
   short_strike: number; long_strike: number; sell_premium: number; buy_premium: number;
-  credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null; max_profit: number;
+  credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
+  max_profit: number; max_profit_per_lot: number | null;
   ror_pct: number; breakeven: number; in_window: boolean;
 };
 type SkewResp = {
@@ -1355,8 +1364,9 @@ type SkewHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number; short_strike: number; long_strike: number;
   sell_premium: number; buy_premium: number;
-  credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
-  exit_value: number; pnl: number; ror_pct: number; max_dd_pct: number; outcome: string;
+  credit: number; max_risk: number; max_profit: number;
+  lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
+  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
 };
 type SkewHist = {
   rows: SkewHistRow[];
@@ -1425,7 +1435,8 @@ function SkewStrategy() {
           <table>
             <thead><tr>
               <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>Sell</th>
-              <th>CE-IV / PE-IV</th><th>Short / Long</th><th>Credit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th><th>Ret/risk</th><th>Breakeven</th>
+              <th>CE-IV / PE-IV</th><th>Short / Long</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
+              <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th><th>Breakeven</th>
             </tr></thead>
             <tbody>
               {daily.map((r) => (
@@ -1439,14 +1450,16 @@ function SkewStrategy() {
                   <td className="hint">{r.ce_iv.toFixed(2)} / {r.pe_iv.toFixed(2)}</td>
                   <td>{num(r.short_strike, 0)} / {num(r.long_strike, 0)}</td>
                   <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td className="move-up">{num(r.max_profit, 1)}</td>
                   <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.abs(r.long_strike - r.short_strike), 1)} / credit {num(r.credit, 1)})</span></td>
                   <td>{r.lot_size ?? "—"}</td>
+                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                   <td className="hint">{num(r.breakeven, 0)}</td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={14} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1474,7 +1487,8 @@ function SkewStrategy() {
           <table>
             <thead><tr>
               <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th><th>Sell</th>
-              <th>Short / Long</th><th>Credit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th><th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <th>Short / Long</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
+              <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
               {histRows.map((r, i) => (
@@ -1486,17 +1500,19 @@ function SkewStrategy() {
                   <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
                   <td>{num(r.short_strike, 0)} / {num(r.long_strike, 0)}</td>
                   <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td className="move-up">{num(r.max_profit, 1)} <span className="hint">{r.max_profit_per_lot != null ? `(₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
                   <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.abs(r.long_strike - r.short_strike), 1)} / credit {num(r.credit, 1)})</span></td>
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}
+                    <span className="hint"> {r.pnl_per_lot != null ? `(${r.pnl_per_lot >= 0 ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 15 : 14} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
