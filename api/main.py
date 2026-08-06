@@ -423,16 +423,17 @@ MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, cred
 
 @app.get("/prod2/sell_strategies")
 def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
-                          wing: float = Query(0.03, ge=0.01, le=0.08),
+                          wing: float = Query(0.05, ge=0.01, le=0.10),
                           dte_min: int = Query(CONDOR_DTE_MIN, ge=0, le=30),
                           min_ror: float = Query(CONDOR_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
     """Live DEFINED-RISK iron-condor candidates on the A/B universe: sell ~short_otm% OTM CE+PE,
-    buy the +wing% wings (loss always capped), on the nearest available expiry. Entry requires
-    DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry: 10/25/45/70/100%+ of contract
-    value -- dte_min=9 keeps a full 5-day hold clear of that window) AND entry-time
+    buy the +wing% wings (loss always capped), on the nearest available expiry. wing=5% (not 3%):
+    tested wider, similar win rate but meaningfully higher absolute rupee profit per lot. Entry
+    requires DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry: 10/25/45/70/100%+ of
+    contract value -- dte_min=9 keeps a full 5-day hold clear of that window) AND entry-time
     credit/max_risk (ror_pct) > min_ror -- THE gating criterion, knowable before the trade
-    (unlike a realized/backtested outcome). Ranked by ror_pct; top_picks is the top-3-per-group
-    shortlist among in_window candidates. Backtest context (2y, pre-cost) is embedded."""
+    (unlike a realized/backtested outcome). Ranked by ror_pct; top_picks is #1 (the backtested
+    1-pick/day rule) plus #2-#3 as additional options. Backtest context (2y, pre-cost) is embedded."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "candidates": [], "note": "no option-chain data"}
@@ -473,11 +474,22 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             continue
         ivr = ivlast.get(sym)
         lot = lots.get(sym)
+        ce_credit, pe_credit = psce - plce, pspe - plpe   # per-side contribution to total credit
+        richer_side = "CE" if ce_credit >= pe_credit else "PE"
+
+        def oi_lots(row):
+            v = row.get("open_int")
+            if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+                return None
+            return round(float(v) / float(lot))
+
         out.append({
             "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
             "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+            "oi_short_ce": oi_lots(sce), "oi_long_ce": oi_lots(lce),
+            "oi_short_pe": oi_lots(spe), "oi_long_pe": oi_lots(lpe),
             "sell_premium": round(psce + pspe, 2), "buy_premium": round(plce + plpe, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
@@ -485,21 +497,24 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
+            "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
     out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
     in_window = [c for c in out if c["in_window"]]
-    # single best-of-day pick (across both groups) -- backtested at ~4.6/week, 99.2% win, +110.5%
-    # mean ROR, worst -26.4% (vs the full gated pool's 86.2% win / +36.9% mean / worst -66.9%)
-    top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:1]
+    # single best-of-day pick (across both groups) -- backtested at ~4.3/week, 97.8% win, +69.6%
+    # mean ROR, worst -21.9% (vs the full gated pool's 89.8% win / +32.5% mean / worst -37.2%)
+    # #1 is the backtested rule (1 pick/day); #2-#3 are additional options, not part of that backtest
+    top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
     return {
         "as_of": last.date().isoformat(),
         "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
-        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +3%, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 0.369, "win_rate": 0.862, "worst": "-0.67x (capped)",
+        "backtest": {"window": "2024-08..2026-08 (2y, short 2% OTM / wing +5%, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)",
+                     "ev_on_risk": 0.325, "win_rate": 0.898, "worst": "-0.37x (capped)",
                      "best_of_day": {"window": "same 2y, 1 pick/day (highest ror_pct), capped 10/week",
-                                    "n": 484, "ev_on_risk": 1.105, "win_rate": 0.992, "worst": "-0.26x (capped)",
-                                    "per_week": 4.6}},
+                                    "n": 445, "ev_on_risk": 0.696, "win_rate": 0.978, "worst": "-0.22x (capped)",
+                                    "per_week": 4.3, "median_pnl_per_lot": 4121, "note": "wing widened from 3%->5%: "
+                                    "similar win rate, meaningfully higher absolute Rs profit per lot"}},
         "candidates": out,
         "top_picks": top_picks,
     }

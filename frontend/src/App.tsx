@@ -1179,16 +1179,18 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
 type CondorRow = {
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
+  oi_short_ce: number | null; oi_long_ce: number | null; oi_short_pe: number | null; oi_long_pe: number | null;
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
   max_profit: number; max_profit_per_lot: number | null;
-  ror_pct: number; be_low: number; be_high: number; in_window: boolean;
+  ror_pct: number; be_low: number; be_high: number;
+  richer_side: "CE" | "PE"; ce_credit: number; pe_credit: number; in_window: boolean;
 };
 type SellResp = {
   as_of: string | null; params: Record<string, number>;
   backtest: {
     window: string; ev_on_risk: number; win_rate: number; worst: string;
-    best_of_day?: { window: string; n: number; ev_on_risk: number; win_rate: number; worst: string; per_week: number };
+    best_of_day?: { window: string; n: number; ev_on_risk: number; win_rate: number; worst: string; per_week: number; median_pnl_per_lot?: number; note?: string };
   };
   candidates: CondorRow[]; top_picks: CondorRow[];
 };
@@ -1246,14 +1248,16 @@ function SellStrategies() {
           <span>as of {data?.as_of ?? "—"} · 1 pick a day</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
-            <strong>Structure</strong> Sell the ~2% OTM call & put, buy the ±5% wings — a delta-neutral iron condor.
+            <strong>Structure</strong> Sell the ~2% OTM call & put, buy the wings 5% further out (~7% OTM total) — a delta-neutral iron condor.
+            Widened from a 3% wing after testing showed a similar win rate but meaningfully higher absolute rupee profit per lot.
             <b> Max loss is always capped</b> at (wing width − credit); you can never lose more than the max-risk shown.
           </div>
           <div className="sell-rule"><strong>Signal / entry</strong> THE gate is entry-time <b>credit/max-risk (ret/risk) &gt; 150%</b> — the theoretical
             max-profit/max-risk of the setup, knowable before the trade (unlike a realized outcome). Also requires <b>at least 9 days to expiry</b> —
             never closer, to stay clear of NSE's physical-delivery margin ramp (ITM margin escalates 10/25/45/70/100%+ of contract value starting
-            4 trading days before expiry). Only the single <b>richest</b> entry-window setup across both groups is shown each day (capped well under
-            10/week) — a position still open when DTE drops to 4 is force-closed regardless of profit target.</div>
+            4 trading days before expiry). <b>#1</b> is the single richest entry-window setup across both groups (the backtested rule, capped well
+            under 10/week); <b>#2–#3</b> below are additional options, not part of that backtest. A position still open when DTE drops to 4 is
+            force-closed regardless of profit target.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first); it decays in your favour while price stays between the breakevens.</div>
           {bt ? (
             <div className="sell-bt">Full gated pool ({bt.window}): <b>+{(bt.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
@@ -1261,28 +1265,32 @@ function SellStrategies() {
               <span className="hint"> Gross of costs/STT — model these before sizing up.</span></div>
           ) : null}
           {bt?.best_of_day ? (
-            <div className="sell-bt">This tab's rule (1 pick/day, ~{bt.best_of_day.per_week}/week, n={bt.best_of_day.n}):
+            <div className="sell-bt">This tab's #1 rule (1 pick/day, ~{bt.best_of_day.per_week}/week, n={bt.best_of_day.n}):
               <b> +{(bt.best_of_day.ev_on_risk * 100).toFixed(0)}%</b> mean return-on-risk,
-              win rate <b>{(bt.best_of_day.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.best_of_day.worst}</b>.</div>
+              win rate <b>{(bt.best_of_day.win_rate * 100).toFixed(0)}%</b>, worst <b>{bt.best_of_day.worst}</b>
+              {bt.best_of_day.median_pnl_per_lot != null ? <> · median <b>₹{bt.best_of_day.median_pnl_per_lot.toLocaleString("en-IN")}/lot</b> realized</> : null}.</div>
           ) : null}
         </div>
         <div className="table-wrap">
           <table>
             <thead><tr>
-              <th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th>
+              <th></th><th>Symbol</th><th>Grp</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
               <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
               <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
             </tr></thead>
             <tbody>
-              {daily.map((r) => (
-                <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
+              {daily.map((r, i) => (
+                <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
+                  <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
                   <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
                   <td>{r.group.slice(0, 1)}</td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
-                  <td>{num(r.short_ce, 0)} / {num(r.long_ce, 0)} / <span className="hint">{num(r.be_high, 0)}</span></td>
-                  <td>{num(r.short_pe, 0)} / {num(r.long_pe, 0)} / <span className="hint">{num(r.be_low, 0)}</span></td>
+                  <td><span className={r.richer_side === "CE" ? "side long" : "side short"}>{r.richer_side === "CE" ? "Call" : "Put"} side</span>
+                    <span className="hint"> ({num(Math.max(r.ce_credit, r.pe_credit), 1)} of {num(r.credit, 1)})</span></td>
+                  <td>{num(r.short_ce, 0)}{r.oi_short_ce != null ? <span className="hint">({r.oi_short_ce})</span> : null} / {num(r.long_ce, 0)}{r.oi_long_ce != null ? <span className="hint">({r.oi_long_ce})</span> : null} / <span className="hint">{num(r.be_high, 0)}</span></td>
+                  <td>{num(r.short_pe, 0)}{r.oi_short_pe != null ? <span className="hint">({r.oi_short_pe})</span> : null} / {num(r.long_pe, 0)}{r.oi_long_pe != null ? <span className="hint">({r.oi_long_pe})</span> : null} / <span className="hint">{num(r.be_low, 0)}</span></td>
                   <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
                   <td className="move-up">{num(r.max_profit, 1)}</td>
                   <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
@@ -1292,7 +1300,7 @@ function SellStrategies() {
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!daily.length && <tr><td colSpan={14} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+              {!daily.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
             </tbody>
           </table>
         </div>

@@ -553,10 +553,31 @@ tr.sell-live {
 tr.sell-live td:first-child {
   box-shadow: inset 3px 0 0 #167c80;
 }
+tr.sell-secondary td {
+  opacity: 0.7;
+}
+.rank-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: #eef1f2;
+  color: #5e6670;
+}
+.rank-badge.primary {
+  background: #167c80;
+  color: #ffffff;
+}
 
 @media (prefers-color-scheme: dark) {
   .sell-bt { background: #17241f; border-color: #2c3a34; color: #d6e2dd; }
   tr.sell-live { background: #17281f; }
+  .rank-badge { background: #2a3733; color: #9fb0aa; }
 }
 
 .symbol-link {
