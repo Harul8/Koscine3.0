@@ -364,6 +364,7 @@ select {
 .table-wrap {
   width: 100%;
   overflow: auto;
+  position: relative;
 }
 
 table {
@@ -385,6 +386,31 @@ th {
   font-weight: 650;
   background: #fafbfa;
 }
+
+/* Freeze the leading identifier columns (rank/tier/date badge + Symbol) so they stay visible
+   while scrolling right through wide tables. Apply .freeze-cols to <table>, then .fz1/.fz2/.fz3
+   to the th/td of the columns to pin, in left-to-right order (fz1 = leftmost = left:0). Each
+   frozen cell needs an opaque background (matches the row state) so scrolled content doesn't
+   show through underneath it. */
+table.freeze-cols th.fz1, table.freeze-cols td.fz1 { position: sticky; left: 0; z-index: 2; min-width: 130px; max-width: 130px; }
+table.freeze-cols th.fz2, table.freeze-cols td.fz2 { position: sticky; left: 130px; z-index: 2; min-width: 110px; max-width: 110px; }
+table.freeze-cols th.fz3, table.freeze-cols td.fz3 { position: sticky; left: 240px; z-index: 2; }
+table.freeze-cols th.fz1, table.freeze-cols th.fz2, table.freeze-cols th.fz3 { z-index: 3; background: #fafbfa; }
+table.freeze-cols td.fz1, table.freeze-cols td.fz2, table.freeze-cols td.fz3 { background: #ffffff; }
+table.freeze-cols tr.sell-live td.fz1, table.freeze-cols tr.sell-live td.fz2, table.freeze-cols tr.sell-live td.fz3 { background: #f2f8f6; }
+table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right: 1px solid #d8dfdb; }
+
+.cash-signal-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+.cash-signal-tag.breakout { background: #e3f6ea; color: #1d9a4e; }
+.cash-signal-tag.breakdown { background: #fde8e8; color: #c0392b; }
+.cash-signal-tag.consolidation { background: #eef1f2; color: #5e6670; }
 
 .sort-header {
   display: inline-flex;
@@ -669,6 +695,14 @@ tr.sell-secondary td {
   .bw-tier-chip { background: #17241f; border-color: #2c3a34; color: #d6e2dd; }
   .bw-tier-chip.live { background: #17281f; border-color: #167c80; }
   .bw-symbol-strong .symbol-link { color: #4fd1c5; }
+  th { background: #172420; }
+  table.freeze-cols th.fz1, table.freeze-cols th.fz2, table.freeze-cols th.fz3 { background: #172420; }
+  table.freeze-cols td.fz1, table.freeze-cols td.fz2, table.freeze-cols td.fz3 { background: #101815; }
+  table.freeze-cols tr.sell-live td.fz1, table.freeze-cols tr.sell-live td.fz2, table.freeze-cols tr.sell-live td.fz3 { background: #17281f; }
+  table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right-color: #2c3a34; }
+  .cash-signal-tag.breakout { background: #17281f; color: #4fd18a; }
+  .cash-signal-tag.breakdown { background: #2c1717; color: #ef8080; }
+  .cash-signal-tag.consolidation { background: #1f2a26; color: #9fb0aa; }
 }
 
 .symbol-link {

@@ -121,6 +121,48 @@ function SymbolLink({ symbol, onOpen }: { symbol: string; onOpen: (s: string) =>
   return <button type="button" className="symbol-link" onClick={() => onOpen(symbol)}>{symbol}</button>;
 }
 
+// Generic click-to-sort utility for any row array: click a column to sort by it (defaults to
+// descending on first click of a new column, since most numeric columns here are "bigger is more
+// interesting"), click again to flip direction. Nulls/NaN always sort last regardless of direction.
+type GenericSortDir = "asc" | "desc";
+function useSortedRows<T>(rows: T[], defaultKey: keyof T, defaultDir: GenericSortDir = "desc") {
+  const [sort, setSort] = useState<{ key: keyof T; direction: GenericSortDir }>({ key: defaultKey, direction: defaultDir });
+  const sorted = useMemo(() => {
+    const copy = [...rows];
+    copy.sort((a, b) => {
+      const av = a[sort.key] as unknown, bv = b[sort.key] as unknown;
+      const aMissing = av == null || (typeof av === "number" && !Number.isFinite(av));
+      const bMissing = bv == null || (typeof bv === "number" && !Number.isFinite(bv));
+      if (aMissing && bMissing) return 0;
+      if (aMissing) return 1;
+      if (bMissing) return -1;
+      let cmp: number;
+      if (typeof av === "string" && typeof bv === "string") cmp = av.localeCompare(bv);
+      else if (typeof av === "boolean" && typeof bv === "boolean") cmp = av === bv ? 0 : av ? 1 : -1;
+      else cmp = av < (bv as never) ? -1 : av > (bv as never) ? 1 : 0;
+      return sort.direction === "asc" ? cmp : -cmp;
+    });
+    return copy;
+  }, [rows, sort]);
+  function onSort(key: keyof T) {
+    setSort((s) => (s.key === key ? { key, direction: s.direction === "asc" ? "desc" : "asc" } : { key, direction: "desc" }));
+  }
+  return { sorted, sort, onSort };
+}
+function SortTh<T>({ label, sortKey, sort, onSort, className }: {
+  label: React.ReactNode; sortKey: keyof T; sort: { key: keyof T; direction: GenericSortDir }; onSort: (k: keyof T) => void; className?: string;
+}) {
+  const active = sort.key === sortKey;
+  const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
+  return (
+    <th className={className} aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+      <button type="button" className="sort-header" onClick={() => onSort(sortKey)} aria-label={`Sort by ${label}`}>
+        {label}<Icon size={14} aria-hidden="true" />
+      </button>
+    </th>
+  );
+}
+
 // Modal chart preview: reuses the same Candles renderer as the Chart tab, for a quick look
 // without leaving the current tab. "Open in new window" deep-links to the full Chart tab.
 function ChartModal({ symbol, onClose }: { symbol: string; onClose: () => void }) {
@@ -1354,7 +1396,7 @@ function SellStrategies() {
             <thead><tr>
               <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
               <th>Short C / P</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
-              <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <th>Exit value</th><th>PnL/lot</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
               {histRows.map((r, i) => (
@@ -1370,8 +1412,12 @@ function SellStrategies() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}
-                    <span className="hint"> {r.pnl_per_lot != null ? `(${r.pnl_per_lot >= 0 ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                    {r.pnl_per_lot != null
+                      ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
+                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                  </td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
@@ -1465,6 +1511,9 @@ function BrokenWingStrategy() {
     return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
   }, [hist, filterMonth]);
   const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
+  const dailyFlat = useMemo(() => tiers.flatMap((t) => t.top_picks.map((r, i) => ({ ...r, tierId: t.id, tierLabel: t.label, rank: i + 1 }))), [tiers]);
+  const dailySort = useSortedRows(dailyFlat, "ror_pct" as never, "desc");
+  const histSort = useSortedRows(histRows, "signal_date" as never, "desc");
   const hs = useMemo(() => {
     if (!histRows.length) return null;
     return {
@@ -1514,47 +1563,52 @@ function BrokenWingStrategy() {
             </div>
           ))}
         </div>
-        {tiers.map((t) => (
-          <div key={t.id} style={{ marginTop: 14 }}>
-            <div className="panel-title" style={{ padding: "6px 2px" }}>
-              <h3 style={{ margin: 0, fontSize: 14 }}>{t.label} {t.fired_today ? <span className="pass yes" style={{ marginLeft: 8 }}>firing today</span> : <span className="pass" style={{ marginLeft: 8 }}>quiet</span>}</h3>
-              <span className="hint">win {(t.backtest.win_rate * 100).toFixed(0)}% · median ₹{t.backtest.median_pnl_per_lot.toLocaleString("en-IN")}/lot (₹{t.backtest.median_pnl_per_lot_per_day.toLocaleString("en-IN")}/lot/day) · {t.backtest.pct_trades_over_10k}% clear ₹10k/lot · ~{t.backtest.per_year}/yr</span>
-            </div>
-            <div className="table-wrap">
-              <table>
-                <thead><tr>
-                  <th></th><th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
-                  <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Wings</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
-                  <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
-                </tr></thead>
-                <tbody>
-                  {t.top_picks.map((r, i) => (
-                    <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
-                      <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
-                      <td><BWSymbol symbol={r.symbol} stats={symStats?.symbols[r.symbol]} onOpen={setOpenSymbol} /></td>
-                      <td>{r.expiry.slice(5)} · {r.dte}d</td>
-                      <td>{num(r.underlying, 0)}</td>
-                      <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
-                      <td><span className={r.richer_side === "CE" ? "side long" : "side short"}>{r.richer_side === "CE" ? "Call" : "Put"} side</span>
-                        <span className="hint"> ({num(Math.max(r.ce_credit, r.pe_credit), 1)} of {num(r.credit, 1)})</span></td>
-                      <td>{num(r.short_ce, 0)}{r.oi_short_ce != null ? <span className="hint">({r.oi_short_ce})</span> : null} / {num(r.long_ce, 0)}{r.oi_long_ce != null ? <span className="hint">({r.oi_long_ce})</span> : null} / <span className="hint">{num(r.be_high, 0)}</span></td>
-                      <td>{num(r.short_pe, 0)}{r.oi_short_pe != null ? <span className="hint">({r.oi_short_pe})</span> : null} / {num(r.long_pe, 0)}{r.oi_long_pe != null ? <span className="hint">({r.oi_long_pe})</span> : null} / <span className="hint">{num(r.be_low, 0)}</span></td>
-                      <td className="hint">{r.call_width_pct.toFixed(1)}% / {r.put_width_pct.toFixed(1)}%</td>
-                      <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
-                      <td className="move-up">{num(r.max_profit, 1)}</td>
-                      <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
-                      <td>{r.lot_size ?? "—"}</td>
-                      <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
-                      <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
-                      <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
-                    </tr>
-                  ))}
-                  {!t.top_picks.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        ))}
+        <div className="table-wrap">
+          <table className="freeze-cols">
+            <thead><tr>
+              <SortTh className="fz1" label="Tier" sortKey="tierId" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <th className="fz2"></th>
+              <SortTh className="fz3" label="Symbol" sortKey="symbol" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Exp / DTE" sortKey="dte" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Spot" sortKey="underlying" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="IV rich" sortKey="iv_ratio" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <th>More profitable</th>
+              <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Wings</th>
+              <SortTh label="Credit" sortKey="credit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={dailySort.sort} onSort={dailySort.onSort} />
+            </tr></thead>
+            <tbody>
+              {dailySort.sorted.map((r) => (
+                <tr key={`${r.tierId}-${r.symbol}`} className={r.rank === 1 ? "sell-live" : "sell-secondary"}>
+                  <td className="fz1"><span className="hint">{r.tierLabel}</span></td>
+                  <td className="fz2"><span className={`rank-badge ${r.rank === 1 ? "primary" : ""}`}>#{r.rank}</span></td>
+                  <td className="fz3"><BWSymbol symbol={r.symbol} stats={symStats?.symbols[r.symbol]} onOpen={setOpenSymbol} /></td>
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{num(r.underlying, 0)}</td>
+                  <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
+                  <td><span className={r.richer_side === "CE" ? "side long" : "side short"}>{r.richer_side === "CE" ? "Call" : "Put"} side</span>
+                    <span className="hint"> ({num(Math.max(r.ce_credit, r.pe_credit), 1)} of {num(r.credit, 1)})</span></td>
+                  <td>{num(r.short_ce, 0)}{r.oi_short_ce != null ? <span className="hint">({r.oi_short_ce})</span> : null} / {num(r.long_ce, 0)}{r.oi_long_ce != null ? <span className="hint">({r.oi_long_ce})</span> : null} / <span className="hint">{num(r.be_high, 0)}</span></td>
+                  <td>{num(r.short_pe, 0)}{r.oi_short_pe != null ? <span className="hint">({r.oi_short_pe})</span> : null} / {num(r.long_pe, 0)}{r.oi_long_pe != null ? <span className="hint">({r.oi_long_pe})</span> : null} / <span className="hint">{num(r.be_low, 0)}</span></td>
+                  <td className="hint">{r.call_width_pct.toFixed(1)}% / {r.put_width_pct.toFixed(1)}%</td>
+                  <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                  <td className="move-up">{num(r.max_profit, 1)}</td>
+                  <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
+                  <td>{r.lot_size ?? "—"}</td>
+                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                  <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                  <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
+                </tr>
+              ))}
+              {!dailyFlat.length && <tr><td colSpan={17} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="panel cockpit" style={{ marginTop: 14 }}>
@@ -1583,18 +1637,32 @@ function BrokenWingStrategy() {
             {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}</div>
         ) : null}
         <div className="table-wrap">
-          <table>
+          <table className="freeze-cols">
             <thead><tr>
-              <th>Tier</th><th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
-              <th>Short C / P</th><th>Wings</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
-              <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <SortTh className="fz1" label="Tier" sortKey="tier" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh className="fz2" label="Signal date" sortKey="signal_date" sort={histSort.sort} onSort={histSort.onSort} />
+              {allSyms ? <SortTh className="fz3" label="Symbol" sortKey="symbol" sort={histSort.sort} onSort={histSort.onSort} /> : null}
+              <SortTh label="Exp / DTE" sortKey="dte" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="IV" sortKey="iv_ratio" sort={histSort.sort} onSort={histSort.onSort} />
+              <th>Short C / P</th>
+              <th>Wings</th>
+              <SortTh label="Credit" sortKey="credit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Exit value" sortKey="exit_value" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="PnL/lot" sortKey="pnl_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max DD" sortKey="max_dd_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <th></th>
             </tr></thead>
             <tbody>
-              {histRows.map((r, i) => (
+              {histSort.sorted.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
-                  <td className="hint">{BW_TIER_LABEL[r.tier] ?? r.tier}</td>
-                  <td>{r.signal_date}</td>
-                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  <td className="fz1 hint">{BW_TIER_LABEL[r.tier] ?? r.tier}</td>
+                  <td className="fz2">{r.signal_date}</td>
+                  {allSyms ? <td className="fz3"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
                   <td>{num(r.short_ce, 0)} / {num(r.short_pe, 0)}</td>
@@ -1605,8 +1673,12 @@ function BrokenWingStrategy() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}
-                    <span className="hint"> {r.pnl_per_lot != null ? `(${r.pnl_per_lot >= 0 ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                    {r.pnl_per_lot != null
+                      ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
+                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                  </td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
@@ -1683,6 +1755,8 @@ function SkewStrategy() {
       total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
     };
   }, [histRows]);
+  const dailySort = useSortedRows(daily, "ror_pct" as never, "desc");
+  const histSort = useSortedRows(histRows, "signal_date" as never, "desc");
 
   return (
     <>
@@ -1710,16 +1784,27 @@ function SkewStrategy() {
           {bt?.note ? <div className="sell-bt" style={{ borderColor: "#d8a13a" }}><b>⚠ Unverified:</b> {bt.note}</div> : null}
         </div>
         <div className="table-wrap">
-          <table>
+          <table className="freeze-cols">
             <thead><tr>
-              <th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>Sell</th>
-              <th>CE-IV / PE-IV</th><th>Short / Long</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
-              <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th><th>Breakeven</th>
+              <SortTh className="fz1" label="Symbol" sortKey="symbol" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Exp / DTE" sortKey="dte" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Spot" sortKey="underlying" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="IV rich" sortKey="iv_ratio" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Sell" sortKey="side" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <th>CE-IV / PE-IV</th><th>Short / Long</th>
+              <SortTh label="Credit" sortKey="credit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Breakeven" sortKey="breakeven" sort={dailySort.sort} onSort={dailySort.onSort} />
             </tr></thead>
             <tbody>
-              {daily.map((r) => (
+              {dailySort.sorted.map((r) => (
                 <tr key={r.symbol} className={r.in_window ? "sell-live" : ""}>
-                  <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
+                  <td className="fz1"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{num(r.underlying, 0)}</td>
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
@@ -1762,17 +1847,30 @@ function SkewStrategy() {
             {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}</div>
         ) : null}
         <div className="table-wrap">
-          <table>
+          <table className="freeze-cols">
             <thead><tr>
-              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th><th>Sell</th>
-              <th>Short / Long</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
-              <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
+              <SortTh className="fz1" label="Signal date" sortKey="signal_date" sort={histSort.sort} onSort={histSort.onSort} />
+              {allSyms ? <SortTh className="fz2" label="Symbol" sortKey="symbol" sort={histSort.sort} onSort={histSort.onSort} /> : null}
+              <SortTh label="Exp / DTE" sortKey="dte" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="IV" sortKey="iv_ratio" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Sell" sortKey="side" sort={histSort.sort} onSort={histSort.onSort} />
+              <th>Short / Long</th>
+              <SortTh label="Credit" sortKey="credit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Exit value" sortKey="exit_value" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="PnL/lot" sortKey="pnl_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max DD" sortKey="max_dd_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <th></th>
             </tr></thead>
             <tbody>
-              {histRows.map((r, i) => (
+              {histSort.sorted.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
-                  <td>{r.signal_date}</td>
-                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  <td className="fz1">{r.signal_date}</td>
+                  {allSyms ? <td className="fz2"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
                   <td><span className={r.side === "CE" ? "side long" : "side short"}>{r.side === "CE" ? "Call" : "Put"}</span></td>
@@ -1783,8 +1881,12 @@ function SkewStrategy() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}
-                    <span className="hint"> {r.pnl_per_lot != null ? `(${r.pnl_per_lot >= 0 ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot)` : ""}</span></td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                    {r.pnl_per_lot != null
+                      ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
+                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                  </td>
                   <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
@@ -1839,22 +1941,30 @@ function CashTrackRecord({ s }: { s: CashSummary }) {
 }
 
 function CashZoneTable({ rows, side, onOpen }: { rows: CashPick[]; side: "breakout" | "breakdown"; onOpen: (s: string) => void }) {
-  const levelKey = side === "breakout" ? "resistance_level" : "support_level";
-  const touchesKey = side === "breakout" ? "resistance_valid_touches" : "support_valid_touches";
-  const strengthKey = side === "breakout" ? "resistance_zone_strength" : "support_zone_strength";
-  const ageKey = side === "breakout" ? "resistance_zone_age_weeks" : "support_zone_age_weeks";
+  const levelKey = (side === "breakout" ? "resistance_level" : "support_level") as keyof CashPick;
+  const touchesKey = (side === "breakout" ? "resistance_valid_touches" : "support_valid_touches") as keyof CashPick;
+  const strengthKey = (side === "breakout" ? "resistance_zone_strength" : "support_zone_strength") as keyof CashPick;
+  const ageKey = (side === "breakout" ? "resistance_zone_age_weeks" : "support_zone_age_weeks") as keyof CashPick;
+  const s = useSortedRows(rows, strengthKey, "desc");
   return (
     <div className="table-wrap">
-      <table>
+      <table className="freeze-cols">
         <thead><tr>
-          <th></th><th>Symbol</th><th>Close</th><th>{side === "breakout" ? "Resistance" : "Support"}</th>
-          <th>% beyond</th><th>Touches</th><th>Zone strength</th><th>Zone age</th><th>Volume vs 20d</th>
+          <th className="fz1"></th>
+          <SortTh className="fz2" label="Symbol" sortKey="symbol" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Close" sortKey="close" sort={s.sort} onSort={s.onSort} />
+          <SortTh label={side === "breakout" ? "Resistance" : "Support"} sortKey={levelKey} sort={s.sort} onSort={s.onSort} />
+          <SortTh label="% beyond" sortKey="pct_beyond_level" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Touches" sortKey={touchesKey} sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Zone strength" sortKey={strengthKey} sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Zone age" sortKey={ageKey} sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Volume vs 20d" sortKey="vol_ratio_20d" sort={s.sort} onSort={s.onSort} />
         </tr></thead>
         <tbody>
-          {rows.map((r, i) => (
+          {s.sorted.map((r, i) => (
             <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
-              <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
-              <td><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
+              <td className="fz1"><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
+              <td className="fz2"><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
               <td>{num(r.close ?? undefined, 1)}</td>
               <td>{num((r as unknown as Record<string, number | null>)[levelKey] ?? undefined, 1)}</td>
               <td className={side === "breakout" ? "move-up" : "move-down"}>
@@ -1874,17 +1984,24 @@ function CashZoneTable({ rows, side, onOpen }: { rows: CashPick[]; side: "breako
 }
 
 function CashConsolidationTable({ rows, onOpen }: { rows: CashPick[]; onOpen: (s: string) => void }) {
+  const s = useSortedRows(rows, "zone_box_width_pct" as never, "asc");
   return (
     <div className="table-wrap">
-      <table>
+      <table className="freeze-cols">
         <thead><tr>
-          <th></th><th>Symbol</th><th>Close</th><th>Support</th><th>Resistance</th><th>Box width</th><th>Weeks in box</th>
+          <th className="fz1"></th>
+          <SortTh className="fz2" label="Symbol" sortKey="symbol" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Close" sortKey="close" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Support" sortKey="support_level" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Resistance" sortKey="resistance_level" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Box width" sortKey="zone_box_width_pct" sort={s.sort} onSort={s.onSort} />
+          <SortTh label="Weeks in box" sortKey="weeks_in_box" sort={s.sort} onSort={s.onSort} />
         </tr></thead>
         <tbody>
-          {rows.map((r, i) => (
+          {s.sorted.map((r, i) => (
             <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
-              <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
-              <td><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
+              <td className="fz1"><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
+              <td className="fz2"><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
               <td>{num(r.close ?? undefined, 1)}</td>
               <td>{num(r.support_level ?? undefined, 1)}</td>
               <td>{num(r.resistance_level ?? undefined, 1)}</td>
@@ -1903,7 +2020,7 @@ function CashSignals() {
   const [data, setData] = useState<CashSignalsResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [catSummaries, setCatSummaries] = useState<Partial<Record<CashSignalType, CashSummary>>>({});
-  const [signalType, setSignalType] = useState<CashSignalType>("breakout");
+  const [signalType, setSignalType] = useState<CashSignalType | "">("");
   const [filterSym, setFilterSym] = useState("");
   const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<CashHist | null>(null);
@@ -1919,7 +2036,7 @@ function CashSignals() {
     });
   }, []);
   useEffect(() => {
-    const q = new URLSearchParams({ signal_type: signalType, ...(filterSym ? { symbol: filterSym } : {}) });
+    const q = new URLSearchParams({ ...(signalType ? { signal_type: signalType } : {}), ...(filterSym ? { symbol: filterSym } : {}) });
     getJson<CashHist>(`/prod2/cash_signal_history?${q}`).then(setHist).catch(() => setHist(null));
   }, [signalType, filterSym]);
   useEffect(() => setFilterMonth(""), [filterSym, signalType]);
@@ -1932,6 +2049,7 @@ function CashSignals() {
   const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = hist?.summary ?? null;
   const allSyms = filterSym === "";
+  const histSort = useSortedRows(histRows, "signal_date" as never, "desc");
 
   return (
     <>
@@ -1971,7 +2089,8 @@ function CashSignals() {
           <h2>Signal history — realized outcome per fired signal</h2>
           <div className="panel-title-controls">
             <label className="chk"><Waves size={15} />
-              <select value={signalType} onChange={(e) => setSignalType(e.target.value as CashSignalType)} style={{ minWidth: 150 }}>
+              <select value={signalType} onChange={(e) => setSignalType(e.target.value as CashSignalType | "")} style={{ minWidth: 150 }}>
+                <option value="">All types</option>
                 <option value="breakout">Breakout</option>
                 <option value="breakdown">Breakdown</option>
                 <option value="consolidation">Consolidation</option>
@@ -1992,16 +2111,21 @@ function CashSignals() {
           </div>
         ) : null}
         <div className="table-wrap">
-          <table>
+          <table className="freeze-cols">
             <thead><tr>
-              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Entry close</th>
-              <th>Level</th><th>Strength / box</th><th>Outcome</th>
+              <SortTh className="fz1" label="Signal" sortKey="signal_type" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh className="fz2" label="Signal date" sortKey="signal_date" sort={histSort.sort} onSort={histSort.onSort} />
+              {allSyms ? <SortTh className="fz3" label="Symbol" sortKey="symbol" sort={histSort.sort} onSort={histSort.onSort} /> : null}
+              <SortTh label="Entry close" sortKey="entry_close" sort={histSort.sort} onSort={histSort.onSort} />
+              <th>Level</th><th>Strength / box</th>
+              <SortTh label="Outcome" sortKey="outcome" sort={histSort.sort} onSort={histSort.onSort} />
             </tr></thead>
             <tbody>
-              {histRows.map((r, i) => (
+              {histSort.sorted.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
-                  <td>{r.signal_date}</td>
-                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td> : null}
+                  <td className="fz1"><span className={`cash-signal-tag ${r.signal_type}`}>{r.signal_type}</span></td>
+                  <td className="fz2">{r.signal_date}</td>
+                  {allSyms ? <td className="fz3"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td> : null}
                   <td>{num(r.entry_close, 1)}</td>
                   <td>{num((r.signal_type === "breakdown" ? r.support_level : r.resistance_level) ?? undefined, 1)}</td>
                   <td>{r.signal_type === "consolidation"
@@ -2014,7 +2138,7 @@ function CashSignals() {
                   </td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 6 : 5} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 7 : 6} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
