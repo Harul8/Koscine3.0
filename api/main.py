@@ -622,46 +622,40 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
 
 BW_DTE_MIN, BW_MIN_ROR = 9, 150.0   # same safety floor + gate as the symmetric condor
+# Three narrow-call/wide-put tiers, all live simultaneously. t1 is the everyday base signal
+# (fires most often); t2 and t3 are progressively rarer and higher-quality -- when they ALSO
+# fire alongside t1 on a given day, that's a genuine higher-conviction setup, not a duplicate.
+BW_TIERS = [
+    {"id": "t1_2x6", "label": "Tier 1 (2%/6%)", "wing_ce": 0.02, "wing_pe": 0.06,
+     "backtest": {"win_rate": 0.954, "median_pnl_per_lot": 7535, "median_pnl_per_lot_per_day": 1781,
+                  "per_year": 150, "pct_trades_over_10k": 39.5}},
+    {"id": "t2_3x8", "label": "Tier 2 (3%/8%)", "wing_ce": 0.03, "wing_pe": 0.08,
+     "backtest": {"win_rate": 0.956, "median_pnl_per_lot": 9695, "median_pnl_per_lot_per_day": 2270,
+                  "per_year": 71, "pct_trades_over_10k": 48.1}},
+    {"id": "t3_2x10", "label": "Tier 3 (2%/10%)", "wing_ce": 0.02, "wing_pe": 0.10,
+     "backtest": {"win_rate": 0.991, "median_pnl_per_lot": 19811, "median_pnl_per_lot_per_day": 4656,
+                  "per_year": 16, "pct_trades_over_10k": 80.0}},
+]
+BW_NOTE = ("Asymmetric wings beat the symmetric 5%/5% condor by up to ~8.6x median profit/lot at "
+           "matched entry-ror gate: max loss at expiry is set by the WIDER wing only (one side "
+           "breaches at a time), so a wide put wing banks rich put-skew premium cheaply while a "
+           "narrow call wing still collects decent credit. This direction (narrow call/wide put) "
+           "beat the mirror image at every asymmetry level tested. More asymmetry = better quality "
+           "but fewer signals -- Tier 1 is the everyday base signal; Tier 2/3 firing alongside it "
+           "is a genuine higher-conviction setup. Gross of costs/STT.")
 
 
-@app.get("/prod2/broken_wing_strategy")
-def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
-                               wing_ce: float = Query(0.03, ge=0.01, le=0.12),
-                               wing_pe: float = Query(0.08, ge=0.01, le=0.15),
-                               dte_min: int = Query(BW_DTE_MIN, ge=0, le=30),
-                               min_ror: float = Query(BW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
-    """Live DEFINED-RISK broken-wing iron condor: sell ~short_otm% OTM CE+PE like the symmetric
-    condor, but buy ASYMMETRIC wings -- narrow call wing (wing_ce=3%), wide put wing (wing_pe=8%).
-    Max loss at expiry = max(call_wing, put_wing) - total_credit (only one side breaches at
-    expiry, so risk is set by whichever wing is WIDER, not their sum). Indian equity/index
-    options carry a persistent put skew (crash premium): a wide put wing buys cheap far-OTM
-    protection while banking most of the rich put credit; a narrow call wing still collects
-    decent call credit since calls aren't as richly priced. Backtested on a 7-year, both-
-    direction-tested panel: this direction (narrow call/wide put) beat the mirror image at
-    every asymmetry level tried, and ~4.2x the symmetric condor's median profit/lot at 3%/8%.
-    Same DTE_MIN/entry-ror gate as the symmetric condor. Ranked by ror_pct; top_picks is the
-    top-3 in-window candidates (this structure already fires far less often than the symmetric
-    condor -- ~71/yr vs ~1,522/yr -- so no extra 1-pick/day layer is applied)."""
-    contracts, iv = _sell_sources()
-    if contracts is None:
-        return {"as_of": None, "candidates": [], "note": "no option-chain data"}
-    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
-    lots = _lot_sizes()
-    last = contracts["date"].max()
-    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
-                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
-                    & (contracts["underlying_price"] > 0)].copy()
-    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
-
+def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe: float,
+                   dte_min: float, min_ror: float, g2: dict, lots: dict, ivlast: dict) -> list[dict]:
     out = []
     for sym, sg in day.groupby("symbol"):
         candidate_exps = sorted(sg["expiry"].unique())
-        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - last).days >= dte_min), None)
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - day["date"].iloc[0]).days >= dte_min), None)
         if exp is None:
             continue
         chain = sg[sg["expiry"] == exp]
         u = float(chain["underlying_price"].iloc[0])
-        dte = int((exp - last).days)
+        dte = int((exp - day["date"].iloc[0]).days)
         ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
         if ce.empty or pe.empty:
             continue
@@ -707,38 +701,67 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
-    out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
-    in_window = [c for c in out if c["in_window"]]
-    top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
+    return out
+
+
+@app.get("/prod2/broken_wing_strategy")
+def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
+                               dte_min: int = Query(BW_DTE_MIN, ge=0, le=30),
+                               min_ror: float = Query(BW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+    """Live DEFINED-RISK broken-wing iron condor, evaluated at THREE asymmetry tiers simultaneously
+    (all narrow-call/wide-put): Tier 1 2%/6% (everyday base signal, fires most often), Tier 2 3%/8%,
+    Tier 3 2%/10% (rarest, highest quality). Max loss at expiry = max(call_wing, put_wing) -
+    total_credit (only one side breaches at expiry, so risk is set by whichever wing is WIDER, not
+    their sum). Indian equity/index options carry a persistent put skew (crash premium): a wide put
+    wing buys cheap far-OTM protection while banking most of the rich put credit; a narrow call wing
+    still collects decent call credit since calls aren't as richly priced. Backtested on a 7-year,
+    both-direction-tested panel: this direction beat the mirror image at every asymmetry level tried.
+    Each tier's `fired_today` flag tells you which tier(s) are live -- Tier 2/3 firing alongside
+    Tier 1 is a genuine higher-conviction setup, not a duplicate signal."""
+    contracts, iv = _sell_sources()
+    if contracts is None:
+        return {"as_of": None, "tiers": []}
+    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    lots = _lot_sizes()
+    last = contracts["date"].max()
+    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
+                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & (contracts["underlying_price"] > 0)].copy()
+    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
+
+    tiers_out = []
+    for tier in BW_TIERS:
+        out = _bw_candidates(day, short_otm, tier["wing_ce"], tier["wing_pe"], dte_min, min_ror, g2, lots, ivlast)
+        out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
+        in_window = [c for c in out if c["in_window"]]
+        top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
+        tiers_out.append({
+            "id": tier["id"], "label": tier["label"], "wing_ce": tier["wing_ce"], "wing_pe": tier["wing_pe"],
+            "fired_today": bool(in_window),
+            "backtest": {**tier["backtest"], "note": BW_NOTE,
+                        "window": "2019-2026 (7y, short 2% OTM, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)"},
+            "candidates": out, "top_picks": top_picks,
+        })
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing_ce": wing_ce, "wing_pe": wing_pe, "dte_min": dte_min, "min_ror": min_ror},
-        "backtest": {"window": "2019-2026 (7y, short 2% OTM, wing_ce +3% / wing_pe +8%, DTE>=9 w/ roll-forward, "
-                                "entry ror>150%, pre-cost)",
-                     "win_rate": 0.956, "median_pnl_per_lot": 9695, "median_pnl_per_lot_per_day": 2270,
-                     "per_year": 71, "pct_trades_over_10k": 48.1,
-                     "note": "Asymmetric wings beat the symmetric 5%/5% condor by ~4.2x median profit/lot at "
-                             "matched entry-ror gate: max loss at expiry is set by the WIDER wing only (one side "
-                             "breaches at a time), so a wide put wing banks rich put-skew premium cheaply while a "
-                             "narrow call wing still collects decent credit. This direction (narrow call/wide put) "
-                             "beat the mirror image at every asymmetry level tested. More asymmetry = better "
-                             "quality but fewer signals -- 3%/8% chosen to stay well clear of the thin-sample "
-                             "(n<130 over 7y) extreme end of that curve. Gross of costs/STT."},
-        "candidates": out,
-        "top_picks": top_picks,
+        "params": {"short_otm": short_otm, "dte_min": dte_min, "min_ror": min_ror},
+        "tiers": tiers_out,
     }
 
 
 @app.get("/prod2/broken_wing_signal_history")
-def prod2_broken_wing_signal_history(symbol: str | None = None) -> dict[str, object]:
-    """Historical broken-wing-condor signals (only dates a signal fired), each with entry
-    credit / exit value / PnL / max intra-trade drawdown."""
+def prod2_broken_wing_signal_history(symbol: str | None = None, tier: str | None = None) -> dict[str, object]:
+    """Historical broken-wing-condor signals across all 3 tiers (only dates a signal fired), each
+    with entry credit / exit value / PnL / max intra-trade drawdown, tagged by `tier`. Optional
+    ?tier= filter (t1_2x6 / t2_3x8 / t3_2x10)."""
     f = LM_LOCK_V2.parent / "prod_sell_strategies" / "broken_wing_signal_history.csv"
     if not f.exists():
         return {"rows": [], "summary": None}
     df = pd.read_csv(f)
     if symbol:
         df = df[df["symbol"].eq(symbol.upper())]
+    if tier:
+        df = df[df["tier"].eq(tier)]
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:

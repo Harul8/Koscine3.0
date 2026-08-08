@@ -463,6 +463,39 @@ th {
   background: #e6edfd;
 }
 
+.bw-tier-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 4px 2px 10px;
+}
+.bw-tier-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 1px solid #d8dfdb;
+  border-radius: 8px;
+  background: #f4f6f5;
+  min-width: 190px;
+}
+.bw-tier-chip .bw-tier-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #b8c2bd;
+  margin-right: 6px;
+}
+.bw-tier-chip.live {
+  border-color: #167c80;
+  background: #eef6f3;
+}
+.bw-tier-chip.live .bw-tier-dot {
+  background: #1d9a4e;
+  box-shadow: 0 0 0 3px rgba(29, 154, 78, 0.18);
+}
+
 .job-tail {
   margin: 0;
   max-width: 520px;
@@ -624,6 +657,8 @@ tr.sell-secondary td {
   .rank-badge { background: #2a3733; color: #9fb0aa; }
   .job-tail { background: #17241f; border-color: #2c3a34; color: #d6e2dd; }
   .job-tail-live { background: #1a2338; border-color: #2f3f6e; }
+  .bw-tier-chip { background: #17241f; border-color: #2c3a34; color: #d6e2dd; }
+  .bw-tier-chip.live { background: #17281f; border-color: #167c80; }
 }
 
 .symbol-link {

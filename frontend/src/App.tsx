@@ -1391,7 +1391,7 @@ function SellStrategies() {
   );
 }
 
-// ----------------------------------------------------------------- Broken-Wing Condor (asymmetric wings)
+// ----------------------------------------------------------------- Broken-Wing Condor (3 tiers, asymmetric wings)
 type BWRow = {
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
@@ -1403,14 +1403,15 @@ type BWRow = {
   ror_pct: number; be_low: number; be_high: number;
   richer_side: "CE" | "PE"; ce_credit: number; pe_credit: number; in_window: boolean;
 };
-type BWResp = {
-  as_of: string | null; params: Record<string, number>;
-  backtest: { window: string; win_rate: number; median_pnl_per_lot: number; median_pnl_per_lot_per_day: number;
-              per_year: number; pct_trades_over_10k: number; note: string };
-  candidates: BWRow[]; top_picks: BWRow[];
+type BWTierBacktest = { window: string; win_rate: number; median_pnl_per_lot: number; median_pnl_per_lot_per_day: number;
+                         per_year: number; pct_trades_over_10k: number; note: string };
+type BWTier = {
+  id: string; label: string; wing_ce: number; wing_pe: number; fired_today: boolean;
+  backtest: BWTierBacktest; candidates: BWRow[]; top_picks: BWRow[];
 };
+type BWResp = { as_of: string | null; params: Record<string, number>; tiers: BWTier[] };
 type BWHistRow = {
-  symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
+  tier: string; symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
   call_width_pct: number; put_width_pct: number;
   sell_premium: number; buy_premium: number;
@@ -1422,23 +1423,25 @@ type BWHist = {
   rows: BWHistRow[];
   summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
+const BW_TIER_LABEL: Record<string, string> = { t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%" };
 
 function BrokenWingStrategy() {
   const [data, setData] = useState<BWResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [filterSym, setFilterSym] = useState("");
+  const [filterTier, setFilterTier] = useState("");
   const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<BWHist | null>(null);
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
   useEffect(() => { getJson<BWResp>("/prod2/broken_wing_strategy").then(setData).catch(() => setData(null)); }, []);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => {
-    getJson<BWHist>(`/prod2/broken_wing_signal_history${filterSym ? `?symbol=${filterSym}` : ""}`).then(setHist).catch(() => setHist(null));
-  }, [filterSym]);
-  useEffect(() => setFilterMonth(""), [filterSym]);
+    const q = [filterSym && `symbol=${filterSym}`, filterTier && `tier=${filterTier}`].filter(Boolean).join("&");
+    getJson<BWHist>(`/prod2/broken_wing_signal_history${q ? `?${q}` : ""}`).then(setHist).catch(() => setHist(null));
+  }, [filterSym, filterTier]);
+  useEffect(() => setFilterMonth(""), [filterSym, filterTier]);
 
-  const bt = data?.backtest;
-  const daily = data?.top_picks ?? [];
+  const tiers = data?.tiers ?? [];
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
   const histRowsAll = useMemo(() => {
@@ -1461,67 +1464,87 @@ function BrokenWingStrategy() {
   return (
     <>
       <section className="panel cockpit">
-        <div className="panel-title"><h2>Broken-Wing Condor — asymmetric defined-risk</h2>
-          <span>as of {data?.as_of ?? "—"} · ~{bt?.per_year ?? "—"}/yr</span></div>
+        <div className="panel-title"><h2>Broken-Wing Condor — asymmetric defined-risk, 3 tiers</h2>
+          <span>as of {data?.as_of ?? "—"}</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
-            <strong>Structure</strong> Sell the ~2% OTM call &amp; put like the regular condor, but buy the wings ASYMMETRICALLY:
-            a narrow 3% call wing and a wide 8% put wing. <b>Max loss is always capped</b> at (wider wing − credit) — only
-            one side can be breached at expiry, so risk is set by the wider (put) wing alone, not the sum of both.
-            Indian equity/index options carry a persistent put skew (crash premium): the wide put wing buys cheap far-OTM
-            protection while banking most of that rich put premium as credit; the narrow call wing still collects a
-            decent call credit since calls aren't as richly priced. Backtested ~4.2x the symmetric condor's median profit/lot.
+            <strong>Structure</strong> Sell the ~2% OTM call &amp; put like the regular condor, but buy the wings ASYMMETRICALLY —
+            always a narrow call wing / wide put wing, at three increasing levels of asymmetry (tiers below).
+            <b> Max loss is always capped</b> at (wider wing − credit) — only one side can be breached at expiry, so risk is
+            set by the wider (put) wing alone, not the sum of both. Indian equity/index options carry a persistent put skew
+            (crash premium): the wide put wing buys cheap far-OTM protection while banking most of that rich put premium as
+            credit; the narrow call wing still collects decent credit since calls aren't as richly priced.
           </div>
-          <div className="sell-rule"><strong>Signal / entry</strong> Same gate as the regular condor: entry-time <b>credit/max-risk &gt; 150%</b>,
-            <b> at least 9 days to expiry</b>. This structure fires far less often than the symmetric condor (~{bt?.per_year ?? "—"}/year
-            vs ~1,500/year) — top 3 in-window candidates shown, no extra 1-pick/day layer needed.</div>
+          <div className="sell-rule"><strong>Tiers — all live simultaneously</strong> Tier 1 (2%/6%) is the everyday base signal
+            (fires most often, ~150/yr). Tier 2 (3%/8%) and Tier 3 (2%/10%) are progressively rarer and higher-quality
+            (~71/yr and ~16/yr). <b>When Tier 2 or 3 also fires alongside Tier 1 on a given day, that's a genuine
+            higher-conviction setup</b> — size accordingly. Same entry gate as the regular condor: credit/max-risk &gt; 150%,
+            at least 9 days to expiry.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first).</div>
-          {bt ? (
-            <div className="sell-bt">Backtest ({bt.window}): win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b>,
-              median <b>₹{bt.median_pnl_per_lot.toLocaleString("en-IN")}/lot</b> (<b>₹{bt.median_pnl_per_lot_per_day.toLocaleString("en-IN")}/lot/day</b>),
-              <b> {bt.pct_trades_over_10k}%</b> of trades clear ₹10k/lot.
-              <span className="hint"> Gross of costs/STT — model these before sizing up. {bt.note}</span></div>
-          ) : null}
         </div>
-        <div className="table-wrap">
-          <table>
-            <thead><tr>
-              <th></th><th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
-              <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Wings</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
-              <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
-            </tr></thead>
-            <tbody>
-              {daily.map((r, i) => (
-                <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
-                  <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
-                  <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
-                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
-                  <td>{num(r.underlying, 0)}</td>
-                  <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
-                  <td><span className={r.richer_side === "CE" ? "side long" : "side short"}>{r.richer_side === "CE" ? "Call" : "Put"} side</span>
-                    <span className="hint"> ({num(Math.max(r.ce_credit, r.pe_credit), 1)} of {num(r.credit, 1)})</span></td>
-                  <td>{num(r.short_ce, 0)}{r.oi_short_ce != null ? <span className="hint">({r.oi_short_ce})</span> : null} / {num(r.long_ce, 0)}{r.oi_long_ce != null ? <span className="hint">({r.oi_long_ce})</span> : null} / <span className="hint">{num(r.be_high, 0)}</span></td>
-                  <td>{num(r.short_pe, 0)}{r.oi_short_pe != null ? <span className="hint">({r.oi_short_pe})</span> : null} / {num(r.long_pe, 0)}{r.oi_long_pe != null ? <span className="hint">({r.oi_long_pe})</span> : null} / <span className="hint">{num(r.be_low, 0)}</span></td>
-                  <td className="hint">{r.call_width_pct.toFixed(1)}% / {r.put_width_pct.toFixed(1)}%</td>
-                  <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
-                  <td className="move-up">{num(r.max_profit, 1)}</td>
-                  <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
-                  <td>{r.lot_size ?? "—"}</td>
-                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
-                  <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
-                  <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
-                </tr>
-              ))}
-              {!daily.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
-            </tbody>
-          </table>
+        <div className="bw-tier-status">
+          {tiers.map((t) => (
+            <div key={t.id} className={`bw-tier-chip ${t.fired_today ? "live" : ""}`}>
+              <span className="bw-tier-dot" />
+              <strong>{t.label}</strong>
+              <span>{t.fired_today ? "firing today" : "quiet today"}</span>
+              <span className="hint">{(t.backtest.win_rate * 100).toFixed(0)}% win · ₹{t.backtest.median_pnl_per_lot.toLocaleString("en-IN")}/lot median · ~{t.backtest.per_year}/yr</span>
+            </div>
+          ))}
         </div>
+        {tiers.map((t) => (
+          <div key={t.id} style={{ marginTop: 14 }}>
+            <div className="panel-title" style={{ padding: "6px 2px" }}>
+              <h3 style={{ margin: 0, fontSize: 14 }}>{t.label} {t.fired_today ? <span className="pass yes" style={{ marginLeft: 8 }}>firing today</span> : <span className="pass" style={{ marginLeft: 8 }}>quiet</span>}</h3>
+              <span className="hint">win {(t.backtest.win_rate * 100).toFixed(0)}% · median ₹{t.backtest.median_pnl_per_lot.toLocaleString("en-IN")}/lot (₹{t.backtest.median_pnl_per_lot_per_day.toLocaleString("en-IN")}/lot/day) · {t.backtest.pct_trades_over_10k}% clear ₹10k/lot · ~{t.backtest.per_year}/yr</span>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead><tr>
+                  <th></th><th>Symbol</th><th>Exp / DTE</th><th>Spot</th><th>IV rich</th><th>More profitable</th>
+                  <th>Short C / Long / BE</th><th>Short P / Long / BE</th><th>Wings</th><th>Credit</th><th>Max profit</th><th>Max risk</th>
+                  <th>Lot size</th><th>Max profit/lot</th><th>Max risk/lot</th><th>Ret/risk</th>
+                </tr></thead>
+                <tbody>
+                  {t.top_picks.map((r, i) => (
+                    <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
+                      <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
+                      <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
+                      <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                      <td>{num(r.underlying, 0)}</td>
+                      <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
+                      <td><span className={r.richer_side === "CE" ? "side long" : "side short"}>{r.richer_side === "CE" ? "Call" : "Put"} side</span>
+                        <span className="hint"> ({num(Math.max(r.ce_credit, r.pe_credit), 1)} of {num(r.credit, 1)})</span></td>
+                      <td>{num(r.short_ce, 0)}{r.oi_short_ce != null ? <span className="hint">({r.oi_short_ce})</span> : null} / {num(r.long_ce, 0)}{r.oi_long_ce != null ? <span className="hint">({r.oi_long_ce})</span> : null} / <span className="hint">{num(r.be_high, 0)}</span></td>
+                      <td>{num(r.short_pe, 0)}{r.oi_short_pe != null ? <span className="hint">({r.oi_short_pe})</span> : null} / {num(r.long_pe, 0)}{r.oi_long_pe != null ? <span className="hint">({r.oi_long_pe})</span> : null} / <span className="hint">{num(r.be_low, 0)}</span></td>
+                      <td className="hint">{r.call_width_pct.toFixed(1)}% / {r.put_width_pct.toFixed(1)}%</td>
+                      <td>{num(r.credit, 1)} <span className="hint">(sell {num(r.sell_premium, 1)} / buy {num(r.buy_premium, 1)})</span></td>
+                      <td className="move-up">{num(r.max_profit, 1)}</td>
+                      <td>{num(r.max_risk, 1)} <span className="hint">(width {num(Math.max(r.long_ce - r.short_ce, r.short_pe - r.long_pe), 1)} / credit {num(r.credit, 1)})</span></td>
+                      <td>{r.lot_size ?? "—"}</td>
+                      <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                      <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                      <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
+                    </tr>
+                  ))}
+                  {!t.top_picks.length && <tr><td colSpan={16} className="empty-cell">No candidate clears the 150% ret/risk bar today</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))}
       </section>
 
       <section className="panel cockpit" style={{ marginTop: 14 }}>
         <div className="panel-title">
           <h2>Signal history — returns per fired signal</h2>
           <div className="panel-title-controls">
+            <label className="chk"><Coins size={15} />
+              <select value={filterTier} onChange={(e) => setFilterTier(e.target.value)} style={{ minWidth: 140 }}>
+                <option value="">All tiers</option>
+                {Object.entries(BW_TIER_LABEL).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+              </select>
+            </label>
             <label className="chk"><Coins size={15} />
               <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
                 <option value="">All stocks</option>
@@ -1540,13 +1563,14 @@ function BrokenWingStrategy() {
         <div className="table-wrap">
           <table>
             <thead><tr>
-              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
+              <th>Tier</th><th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Exp / DTE</th><th>IV</th>
               <th>Short C / P</th><th>Wings</th><th>Credit</th><th>Max profit</th><th>Max risk</th><th>Lot size</th><th>Max risk/lot</th>
               <th>Exit value</th><th>PnL</th><th>Ret/risk</th><th>Max DD</th><th></th>
             </tr></thead>
             <tbody>
               {histRows.map((r, i) => (
                 <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
+                  <td className="hint">{BW_TIER_LABEL[r.tier] ?? r.tier}</td>
                   <td>{r.signal_date}</td>
                   {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
@@ -1566,7 +1590,7 @@ function BrokenWingStrategy() {
                   <td>{r.outcome === "win" ? "✓" : "✕"}</td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 16 : 15} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
