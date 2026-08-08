@@ -621,6 +621,139 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     }
 
 
+BW_DTE_MIN, BW_MIN_ROR = 9, 150.0   # same safety floor + gate as the symmetric condor
+
+
+@app.get("/prod2/broken_wing_strategy")
+def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
+                               wing_ce: float = Query(0.03, ge=0.01, le=0.12),
+                               wing_pe: float = Query(0.08, ge=0.01, le=0.15),
+                               dte_min: int = Query(BW_DTE_MIN, ge=0, le=30),
+                               min_ror: float = Query(BW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+    """Live DEFINED-RISK broken-wing iron condor: sell ~short_otm% OTM CE+PE like the symmetric
+    condor, but buy ASYMMETRIC wings -- narrow call wing (wing_ce=3%), wide put wing (wing_pe=8%).
+    Max loss at expiry = max(call_wing, put_wing) - total_credit (only one side breaches at
+    expiry, so risk is set by whichever wing is WIDER, not their sum). Indian equity/index
+    options carry a persistent put skew (crash premium): a wide put wing buys cheap far-OTM
+    protection while banking most of the rich put credit; a narrow call wing still collects
+    decent call credit since calls aren't as richly priced. Backtested on a 7-year, both-
+    direction-tested panel: this direction (narrow call/wide put) beat the mirror image at
+    every asymmetry level tried, and ~4.2x the symmetric condor's median profit/lot at 3%/8%.
+    Same DTE_MIN/entry-ror gate as the symmetric condor. Ranked by ror_pct; top_picks is the
+    top-3 in-window candidates (this structure already fires far less often than the symmetric
+    condor -- ~71/yr vs ~1,522/yr -- so no extra 1-pick/day layer is applied)."""
+    contracts, iv = _sell_sources()
+    if contracts is None:
+        return {"as_of": None, "candidates": [], "note": "no option-chain data"}
+    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    lots = _lot_sizes()
+    last = contracts["date"].max()
+    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
+                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & (contracts["underlying_price"] > 0)].copy()
+    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
+
+    out = []
+    for sym, sg in day.groupby("symbol"):
+        candidate_exps = sorted(sg["expiry"].unique())
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - last).days >= dte_min), None)
+        if exp is None:
+            continue
+        chain = sg[sg["expiry"] == exp]
+        u = float(chain["underlying_price"].iloc[0])
+        dte = int((exp - last).days)
+        ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
+        if ce.empty or pe.empty:
+            continue
+        def nearest(df, target):
+            return df.iloc[(df["strike"] - target).abs().argmin()]
+        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing_ce))
+        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing_pe))
+        psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
+        if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
+            continue
+        credit = (psce + pspe) - (plce + plpe)
+        call_width = float(lce["strike"]) - float(sce["strike"]); put_width = float(spe["strike"]) - float(lpe["strike"])
+        width = max(call_width, put_width)
+        risk = width - credit
+        if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
+            continue
+        ivr = ivlast.get(sym)
+        lot = lots.get(sym)
+        ce_credit, pe_credit = psce - plce, pspe - plpe
+        richer_side = "CE" if ce_credit >= pe_credit else "PE"
+
+        def oi_lots(row):
+            v = row.get("open_int")
+            if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+                return None
+            return round(float(v) / float(lot))
+
+        out.append({
+            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
+            "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
+            "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+            "call_width_pct": round(call_width / u * 100, 1), "put_width_pct": round(put_width / u * 100, 1),
+            "oi_short_ce": oi_lots(sce), "oi_long_ce": oi_lots(lce),
+            "oi_short_pe": oi_lots(spe), "oi_long_pe": oi_lots(lpe),
+            "sell_premium": round(psce + pspe, 2), "buy_premium": round(plce + plpe, 2),
+            "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
+            "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
+            "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "ror_pct": round(credit / risk * 100, 1),
+            "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
+            "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
+        })
+    out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
+    in_window = [c for c in out if c["in_window"]]
+    top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
+    return {
+        "as_of": last.date().isoformat(),
+        "params": {"short_otm": short_otm, "wing_ce": wing_ce, "wing_pe": wing_pe, "dte_min": dte_min, "min_ror": min_ror},
+        "backtest": {"window": "2019-2026 (7y, short 2% OTM, wing_ce +3% / wing_pe +8%, DTE>=9 w/ roll-forward, "
+                                "entry ror>150%, pre-cost)",
+                     "win_rate": 0.956, "median_pnl_per_lot": 9695, "median_pnl_per_lot_per_day": 2270,
+                     "per_year": 71, "pct_trades_over_10k": 48.1,
+                     "note": "Asymmetric wings beat the symmetric 5%/5% condor by ~4.2x median profit/lot at "
+                             "matched entry-ror gate: max loss at expiry is set by the WIDER wing only (one side "
+                             "breaches at a time), so a wide put wing banks rich put-skew premium cheaply while a "
+                             "narrow call wing still collects decent credit. This direction (narrow call/wide put) "
+                             "beat the mirror image at every asymmetry level tested. More asymmetry = better "
+                             "quality but fewer signals -- 3%/8% chosen to stay well clear of the thin-sample "
+                             "(n<130 over 7y) extreme end of that curve. Gross of costs/STT."},
+        "candidates": out,
+        "top_picks": top_picks,
+    }
+
+
+@app.get("/prod2/broken_wing_signal_history")
+def prod2_broken_wing_signal_history(symbol: str | None = None) -> dict[str, object]:
+    """Historical broken-wing-condor signals (only dates a signal fired), each with entry
+    credit / exit value / PnL / max intra-trade drawdown."""
+    f = LM_LOCK_V2.parent / "prod_sell_strategies" / "broken_wing_signal_history.csv"
+    if not f.exists():
+        return {"rows": [], "summary": None}
+    df = pd.read_csv(f)
+    if symbol:
+        df = df[df["symbol"].eq(symbol.upper())]
+    df = df.sort_values("entry_date", ascending=False)
+    summary = None
+    if not df.empty:
+        summary = {
+            "n": int(len(df)),
+            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
+            "median_ror_pct": round(float(df["ror_pct"].median()), 1),
+            "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
+            "worst_dd_pct": round(float(df["max_dd_pct"].min()), 1),
+            "total_pnl": round(float(df["pnl"].sum()), 1),
+        }
+    return {"rows": _records(df), "summary": summary}
+
+
 @app.get("/prod2/skew_signal_history")
 def prod2_skew_signal_history(symbol: str | None = None) -> dict[str, object]:
     """Historical skew-strategy signals (only dates a signal fired: IV-rich + entry window),
