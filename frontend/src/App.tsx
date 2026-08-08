@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, X } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, Waves, X } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
@@ -52,6 +52,7 @@ function MonthFilter({ months, value, onChange }: { months: string[]; value: str
 
 const TABS = [
   { id: "sell", label: "Sell Signals", icon: <Coins size={16} /> },
+  { id: "cash", label: "Cash Signals", icon: <Waves size={16} /> },
   { id: "desk", label: "Buy Signals", icon: <Flame size={16} /> },
   { id: "movers", label: "Universe", icon: <Filter size={16} /> },
   { id: "price", label: "Chart", icon: <LineChart size={16} /> },
@@ -100,7 +101,8 @@ export default function App() {
           <button key={t.id} className={`tab ${tab === t.id ? "active" : ""}`} onClick={() => setTab(t.id)}>{t.icon} {t.label}</button>
         ))}
       </nav>
-      {tab === "sell" && <><SellStrategies /><SkewStrategy /></>}
+      {tab === "sell" && <SellSignalsTab />}
+      {tab === "cash" && <CashSignals />}
       {tab === "desk" && <SignalDesk {...props} />}
       {tab === "movers" && <DailyMovers {...props} />}
       {tab === "price" && <PriceHistory {...props} initialSymbol={initialSymbol} />}
@@ -1208,6 +1210,27 @@ type SellHist = {
   summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 
+function SellSignalsTab() {
+  const [structure, setStructure] = useState<"condor" | "skew">(() => (urlParam("structure") === "skew" ? "skew" : "condor"));
+  function pick(s: "condor" | "skew") {
+    setStructure(s);
+    const url = new URL(window.location.href);
+    url.searchParams.set("structure", s);
+    window.history.replaceState({}, "", url);
+  }
+  return (
+    <>
+      <section className="controls-band">
+        <div className="structure-toggle">
+          <button type="button" className={structure === "condor" ? "active" : ""} onClick={() => pick("condor")}>Condor</button>
+          <button type="button" className={structure === "skew" ? "active" : ""} onClick={() => pick("skew")}>IV Skew</button>
+        </div>
+      </section>
+      {structure === "condor" ? <SellStrategies /> : <SkewStrategy />}
+    </>
+  );
+}
+
 function SellStrategies() {
   const [data, setData] = useState<SellResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
@@ -1542,8 +1565,241 @@ function SkewStrategy() {
   );
 }
 
+// ----------------------------------------------------------------- Cash Signals (support/resistance zones)
+type CashPick = {
+  symbol: string; as_of: string; close: number | null; vol_ratio_20d: number | null; compression_composite: number | null;
+  resistance_level?: number | null; support_level?: number | null; pct_beyond_level?: number | null;
+  resistance_valid_touches?: number; resistance_zone_strength?: number; resistance_zone_age_weeks?: number | null;
+  support_valid_touches?: number; support_zone_strength?: number; support_zone_age_weeks?: number | null;
+  zone_box_width_pct?: number | null; weeks_in_box?: number | null;
+};
+type CashSignalsResp = {
+  as_of: string | null; universe_size: number | null;
+  breakout: CashPick[]; breakdown: CashPick[]; consolidation: CashPick[];
+};
+type CashSignalType = "breakout" | "breakdown" | "consolidation";
+type CashHistRow = {
+  signal_type: CashSignalType; symbol: string; signal_date: string; entry_close: number;
+  resistance_level?: number | null; support_level?: number | null;
+  resistance_zone_strength?: number | null; support_zone_strength?: number | null;
+  fwd_return_5d?: number | null; fwd_return_10d?: number | null; fwd_return_20d?: number | null; held_10d?: boolean | null;
+  zone_box_width_pct?: number | null; realized_range_10d_pct?: number | null;
+  outcome: "win" | "loss";
+};
+type CashSummary = {
+  n: number; win_rate: number;
+  avg_fwd_return_10d?: number | null; median_fwd_return_10d?: number | null; held_rate_10d?: number | null;
+  avg_realized_range_10d?: number | null;
+} | null;
+type CashHist = { rows: CashHistRow[]; summary: CashSummary };
+
+function CashTrackRecord({ s }: { s: CashSummary }) {
+  if (!s) return <span className="hint">no historical signals yet</span>;
+  return (
+    <>{s.n} historical signals · win rate <b>{(s.win_rate * 100).toFixed(0)}%</b>
+      {s.avg_fwd_return_10d != null ? <> · mean fwd 10d <b>{s.avg_fwd_return_10d >= 0 ? "+" : ""}{s.avg_fwd_return_10d}%</b></> : null}
+      {s.held_rate_10d != null ? <> · level held <b>{(s.held_rate_10d * 100).toFixed(0)}%</b> of the time</> : null}
+      {s.avg_realized_range_10d != null ? <> · avg realized range <b>{s.avg_realized_range_10d}%</b></> : null}</>
+  );
+}
+
+function CashZoneTable({ rows, side, onOpen }: { rows: CashPick[]; side: "breakout" | "breakdown"; onOpen: (s: string) => void }) {
+  const levelKey = side === "breakout" ? "resistance_level" : "support_level";
+  const touchesKey = side === "breakout" ? "resistance_valid_touches" : "support_valid_touches";
+  const strengthKey = side === "breakout" ? "resistance_zone_strength" : "support_zone_strength";
+  const ageKey = side === "breakout" ? "resistance_zone_age_weeks" : "support_zone_age_weeks";
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <th></th><th>Symbol</th><th>Close</th><th>{side === "breakout" ? "Resistance" : "Support"}</th>
+          <th>% beyond</th><th>Touches</th><th>Zone strength</th><th>Zone age</th><th>Volume vs 20d</th>
+        </tr></thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
+              <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
+              <td><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
+              <td>{num(r.close ?? undefined, 1)}</td>
+              <td>{num((r as unknown as Record<string, number | null>)[levelKey] ?? undefined, 1)}</td>
+              <td className={side === "breakout" ? "move-up" : "move-down"}>
+                {r.pct_beyond_level != null ? `${r.pct_beyond_level >= 0 ? "+" : ""}${r.pct_beyond_level.toFixed(2)}%` : "—"}</td>
+              <td>{(r as unknown as Record<string, number | undefined>)[touchesKey] ?? "—"}</td>
+              <td>{num((r as unknown as Record<string, number | undefined>)[strengthKey] ?? undefined, 2)}</td>
+              <td>{(r as unknown as Record<string, number | null | undefined>)[ageKey] != null
+                ? `${num((r as unknown as Record<string, number>)[ageKey], 0)}w` : "—"}</td>
+              <td>{r.vol_ratio_20d != null ? `${r.vol_ratio_20d.toFixed(2)}×` : "—"}</td>
+            </tr>
+          ))}
+          {!rows.length && <tr><td colSpan={8} className="empty-cell">No {side} today</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CashConsolidationTable({ rows, onOpen }: { rows: CashPick[]; onOpen: (s: string) => void }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead><tr>
+          <th></th><th>Symbol</th><th>Close</th><th>Support</th><th>Resistance</th><th>Box width</th><th>Weeks in box</th>
+        </tr></thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
+              <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
+              <td><SymbolLink symbol={r.symbol} onOpen={onOpen} /></td>
+              <td>{num(r.close ?? undefined, 1)}</td>
+              <td>{num(r.support_level ?? undefined, 1)}</td>
+              <td>{num(r.resistance_level ?? undefined, 1)}</td>
+              <td>{r.zone_box_width_pct != null ? `${r.zone_box_width_pct.toFixed(2)}%` : "—"}</td>
+              <td>{r.weeks_in_box ?? "—"}</td>
+            </tr>
+          ))}
+          {!rows.length && <tr><td colSpan={7} className="empty-cell">No tight consolidation today</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CashSignals() {
+  const [data, setData] = useState<CashSignalsResp | null>(null);
+  const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
+  const [catSummaries, setCatSummaries] = useState<Partial<Record<CashSignalType, CashSummary>>>({});
+  const [signalType, setSignalType] = useState<CashSignalType>("breakout");
+  const [filterSym, setFilterSym] = useState("");
+  const [filterMonth, setFilterMonth] = useState("");
+  const [hist, setHist] = useState<CashHist | null>(null);
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null);
+
+  useEffect(() => { getJson<CashSignalsResp>("/prod2/cash_signals").then(setData).catch(() => setData(null)); }, []);
+  useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => {
+    (["breakout", "breakdown", "consolidation"] as const).forEach((t) => {
+      getJson<CashHist>(`/prod2/cash_signal_history?signal_type=${t}`)
+        .then((d) => setCatSummaries((prev) => ({ ...prev, [t]: d.summary })))
+        .catch(() => {});
+    });
+  }, []);
+  useEffect(() => {
+    const q = new URLSearchParams({ signal_type: signalType, ...(filterSym ? { symbol: filterSym } : {}) });
+    getJson<CashHist>(`/prod2/cash_signal_history?${q}`).then(setHist).catch(() => setHist(null));
+  }, [signalType, filterSym]);
+  useEffect(() => setFilterMonth(""), [filterSym, signalType]);
+
+  const months = useMemo(() => monthsOf(hist?.rows ?? [], (r) => r.signal_date), [hist]);
+  const histRowsAll = useMemo(() => {
+    const all = hist?.rows ?? [];
+    return filterMonth ? all.filter((r) => r.signal_date.startsWith(filterMonth)) : all;
+  }, [hist, filterMonth]);
+  const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
+  const hs = hist?.summary ?? null;
+  const allSyms = filterSym === "";
+
+  return (
+    <>
+      <section className="panel cockpit">
+        <div className="panel-title"><h2>Cash Signals — support / resistance zones</h2>
+          <span>as of {data?.as_of ?? "—"} · {data?.universe_size ?? "—"} F&O symbols scanned</span></div>
+        <div className="sell-explain">
+          <div className="sell-rule">
+            <strong>Zones</strong> Weekly swing highs/lows are clustered into support &amp; resistance bands (±2%); a touch only counts once price has
+            retreated ≥5% since the last one, so sitting at a level for days doesn't inflate its strength. <b>Zone strength</b> = valid touches × log(zone age).
+          </div>
+          <div className="sell-rule">
+            <strong>Breakout / breakdown</strong> Close has moved beyond the nearest zone's band within the last 5 trading days — ranked by the
+            strength of the level that broke (a level tested many times over a long period is more significant than a fresh one).
+          </div>
+          <div className="sell-rule">
+            <strong>Consolidation</strong> Price has sat inside a support/resistance box for ≥5 days without breaking out — ranked by tightest box width first.
+            This is a "stays range-bound" read, not a directional call.
+          </div>
+        </div>
+
+        <h3 style={{ margin: "14px 16px 4px" }}>Breaking out of resistance</h3>
+        <div className="sell-bt" style={{ margin: "0 16px 8px" }}><CashTrackRecord s={catSummaries.breakout ?? null} /></div>
+        <CashZoneTable rows={data?.breakout ?? []} side="breakout" onOpen={setOpenSymbol} />
+
+        <h3 style={{ margin: "14px 16px 4px" }}>Breaking down through support</h3>
+        <div className="sell-bt" style={{ margin: "0 16px 8px" }}><CashTrackRecord s={catSummaries.breakdown ?? null} /></div>
+        <CashZoneTable rows={data?.breakdown ?? []} side="breakdown" onOpen={setOpenSymbol} />
+
+        <h3 style={{ margin: "14px 16px 4px" }}>Tight consolidation</h3>
+        <div className="sell-bt" style={{ margin: "0 16px 8px" }}><CashTrackRecord s={catSummaries.consolidation ?? null} /></div>
+        <CashConsolidationTable rows={data?.consolidation ?? []} onOpen={setOpenSymbol} />
+      </section>
+
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title">
+          <h2>Signal history — realized outcome per fired signal</h2>
+          <div className="panel-title-controls">
+            <label className="chk"><Waves size={15} />
+              <select value={signalType} onChange={(e) => setSignalType(e.target.value as CashSignalType)} style={{ minWidth: 150 }}>
+                <option value="breakout">Breakout</option>
+                <option value="breakdown">Breakdown</option>
+                <option value="consolidation">Consolidation</option>
+              </select>
+            </label>
+            <label className="chk"><Coins size={15} />
+              <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+                <option value="">All stocks</option>
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+              </select>
+            </label>
+            <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
+          </div>
+        </div>
+        {hs ? (
+          <div className="sell-bt"><CashTrackRecord s={hs} />
+            {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}
+          </div>
+        ) : null}
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Signal date</th>{allSyms ? <th>Symbol</th> : null}<th>Entry close</th>
+              <th>Level</th><th>Strength / box</th><th>Outcome</th>
+            </tr></thead>
+            <tbody>
+              {histRows.map((r, i) => (
+                <tr key={`${r.symbol}-${r.signal_date}-${i}`}>
+                  <td>{r.signal_date}</td>
+                  {allSyms ? <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td> : null}
+                  <td>{num(r.entry_close, 1)}</td>
+                  <td>{num((r.signal_type === "breakdown" ? r.support_level : r.resistance_level) ?? undefined, 1)}</td>
+                  <td>{r.signal_type === "consolidation"
+                    ? (r.zone_box_width_pct != null ? `${r.zone_box_width_pct.toFixed(2)}%` : "—")
+                    : num((r.signal_type === "breakdown" ? r.support_zone_strength : r.resistance_zone_strength) ?? undefined, 2)}</td>
+                  <td className={r.outcome === "win" ? "move-up" : "move-down"}>
+                    {r.outcome === "win" ? "✓" : "✕"}
+                    {r.fwd_return_10d != null ? <span className="hint"> ({r.fwd_return_10d >= 0 ? "+" : ""}{r.fwd_return_10d}%)</span> : null}
+                    {r.realized_range_10d_pct != null ? <span className="hint"> (range {r.realized_range_10d_pct}%)</span> : null}
+                  </td>
+                </tr>
+              ))}
+              {!histRows.length && <tr><td colSpan={allSyms ? 6 : 5} className="empty-cell">No signals</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
+    </>
+  );
+}
+
 // ----------------------------------------------------------------- Run / Retrain
 function fmtTime(t: number | null | undefined): string { return t ? new Date(t * 1000).toLocaleString() : "—"; }
+function JobTail({ text, live }: { text: string; live: boolean }) {
+  const ref = useRef<HTMLPreElement | null>(null);
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [text]);
+  if (!text) return <span className="hint">{live ? "starting…" : ""}</span>;
+  return (
+    <pre ref={ref} className={`job-tail${live ? " job-tail-live" : ""}`}>{text}</pre>
+  );
+}
+
 function RunRetrain() {
   const [st, setSt] = useState<Status | null>(null);
   const [nd, setNd] = useState<{ rows?: number; modified?: number } | null>(null);
@@ -1557,13 +1813,18 @@ function RunRetrain() {
       setSt(a); setNd(b);
     } catch (e) { setMsg(`${(e as Error).message}`); }
   }
-  useEffect(() => { refresh(); const t = setInterval(refresh, 4000); return () => clearInterval(t); }, []);
+  const jobs = st?.jobs ?? {};
+  const anyRunning = Object.values(jobs).some((v) => v.status === "running");
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, anyRunning ? 1200 : 4000);
+    return () => clearInterval(t);
+  }, [anyRunning]);
   async function run(path: string, label: string) {
     setMsg(`starting ${label}…`);
-    try { const r = await postJson<{ status: string }>(path); setMsg(`${label}: ${r.status}`); setTimeout(refresh, 800); }
+    try { const r = await postJson<{ status: string }>(path); setMsg(`${label}: ${r.status}`); setTimeout(refresh, 500); }
     catch (e) { setMsg(`error: ${(e as Error).message}`); }
   }
-  const jobs = st?.jobs ?? {};
   return (
     <>
       <section className="controls-band">
@@ -1582,7 +1843,7 @@ function RunRetrain() {
         <div className="ops-card"><h4>Engine</h4><strong>{st?.version ?? "—"}</strong><br /><span className="hint">rank {String((st?.selector as any)?.ranker ?? "atm_iv")} · top-{String((st?.selector as any)?.picks_per_group_per_day ?? 3)}/grp</span></div>
       </section>
       <section className="panel cockpit" style={{ marginTop: 14 }}>
-        <div className="panel-title"><h2>Jobs</h2><span>auto-refresh 4s</span></div>
+        <div className="panel-title"><h2>Jobs</h2><span>{anyRunning ? "live · auto-refresh 1.2s" : "auto-refresh 4s"}</span></div>
         <div className="table-wrap">
           <table>
             <thead><tr><th>job</th><th>module</th><th>status</th><th>output (tail)</th></tr></thead>
@@ -1590,7 +1851,7 @@ function RunRetrain() {
               {Object.entries(jobs).map(([k, v]) => (
                 <tr key={k}><td>{k}</td><td className="byyear">{v.module ?? "—"}</td>
                   <td><span className={`pass ${v.status === "done" ? "yes" : v.status === "failed" ? "no" : "live"}`}>{v.status}</span></td>
-                  <td className="byyear" style={{ whiteSpace: "pre-wrap", maxWidth: 520 }}>{v.tail ?? ""}</td></tr>
+                  <td className="byyear"><JobTail text={v.tail ?? ""} live={v.status === "running"} /></td></tr>
               ))}
               {!Object.keys(jobs).length && <tr><td colSpan={4} className="empty-cell">No runs this session</td></tr>}
             </tbody>

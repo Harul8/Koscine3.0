@@ -673,6 +673,55 @@ def prod2_sell_signal_history(symbol: str | None = None) -> dict[str, object]:
     return {"rows": _records(df), "summary": summary}
 
 
+CASH_LOCK = LM_LOCK_V2.parent / "prod_cash_signals"
+
+
+@app.get("/prod2/cash_signals")
+def prod2_cash_signals() -> dict[str, object]:
+    """Live Cash Signals picks across the F&O universe: stocks breaking out of a resistance
+    zone, breaking down through a support zone, or consolidating tightly inside one. Built
+    offline by analysis/gen_cash_signals.py from pipeline/zones.py's support/resistance zone
+    engine (gold/zones.parquet); this just serves the latest written snapshot."""
+    data = _read_json(CASH_LOCK / "cash_signals.json")
+    if not data:
+        return {"as_of": None, "universe_size": None, "breakout": [], "breakdown": [], "consolidation": []}
+    return data
+
+
+@app.get("/prod2/cash_signal_history")
+def prod2_cash_signal_history(signal_type: str | None = None, symbol: str | None = None) -> dict[str, object]:
+    """Historical Cash Signals track record (only the dates a breakout/breakdown/consolidation
+    signal actually fired), with the realized forward outcome. Optional ?signal_type=
+    (breakout|breakdown|consolidation) and ?symbol= filters. Also returns the aggregate track
+    record for the filtered set."""
+    f = CASH_LOCK / "cash_signal_history.csv"
+    if not f.exists():
+        return {"rows": [], "summary": None}
+    df = pd.read_csv(f)
+    if signal_type:
+        df = df[df["signal_type"].eq(signal_type)]
+    if symbol:
+        df = df[df["symbol"].eq(symbol.upper())]
+    df = df.sort_values("signal_date", ascending=False)
+    summary = None
+    if not df.empty:
+        if "fwd_return_10d" in df.columns and df["fwd_return_10d"].notna().any():
+            summary = {
+                "n": int(len(df)),
+                "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+                "avg_fwd_return_10d": round(float(df["fwd_return_10d"].mean()), 2),
+                "median_fwd_return_10d": round(float(df["fwd_return_10d"].median()), 2),
+                "held_rate_10d": round(float(df["held_10d"].mean()), 3) if "held_10d" in df.columns and df["held_10d"].notna().any() else None,
+            }
+        else:
+            summary = {
+                "n": int(len(df)),
+                "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+                "avg_realized_range_10d": round(float(df["realized_range_10d_pct"].mean()), 2) if "realized_range_10d_pct" in df.columns else None,
+            }
+    return {"rows": _records(df), "summary": summary}
+
+
 @app.get("/prod2/price_history")
 def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=4000)) -> dict[str, object]:
     """Daily price (close/high/low) for a symbol with pick markers + the ATM option premium OHLC per pick."""
@@ -770,28 +819,34 @@ def prod2_universe_day(date: str | None = Query(default=None)) -> dict[str, obje
 _LM_JOBS: dict[str, dict] = {}
 
 
-def _subprocess_tail(result: subprocess.CompletedProcess[str], limit: int) -> str:
-    """Return useful output for both successful and failed background jobs."""
-    chunks = []
-    if result.stdout:
-        chunks.append(result.stdout.rstrip())
-    if result.stderr:
-        chunks.append("[stderr]\n" + result.stderr.rstrip())
-    return "\n".join(chunks)[-limit:]
+def _stream_subprocess_run(kind: str, cmd: list[str], label: str, cwd: Path, env: dict, limit: int) -> None:
+    """Run a subprocess with stdout+stderr merged and streamed line-by-line into
+    _LM_JOBS[kind]["tail"] as it's produced, so the frontend's poll shows live progress
+    instead of a blank cell until the whole process exits."""
+    import time
+    started = time.time()
+    _LM_JOBS[kind] = {"status": "running", "started": started, "module": label, "tail": ""}
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        lines: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line.rstrip("\n"))
+            tail = "\n".join(lines)[-limit:]
+            _LM_JOBS[kind] = {"status": "running", "started": started, "module": label, "tail": tail}
+        proc.wait()
+        tail = "\n".join(lines)[-limit:]
+        _LM_JOBS[kind] = {"status": "done" if proc.returncode == 0 else "failed", "module": label,
+                          "started": started, "ended": time.time(), "tail": tail}
+    except Exception as exc:  # noqa: BLE001
+        _LM_JOBS[kind] = {"status": "failed", "module": label, "started": started,
+                          "ended": time.time(), "error": str(exc)}
 
 
 def _lm_module_run(kind: str, module: str) -> None:
-    import time
-    _LM_JOBS[kind] = {"status": "running", "started": time.time(), "module": module}
     env = {**os.environ, "PYTHONPATH": f"{SRC_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
-    try:
-        r = subprocess.run([sys.executable, "-m", module], cwd=str(PROJECT_ROOT), env=env,
-                           capture_output=True, text=True)
-        _LM_JOBS[kind] = {"status": "done" if r.returncode == 0 else "failed", "module": module,
-                          "started": _LM_JOBS[kind]["started"], "ended": time.time(),
-                          "tail": _subprocess_tail(r, 4000)}
-    except Exception as exc:  # noqa: BLE001
-        _LM_JOBS[kind] = {"status": "failed", "module": module, "error": str(exc)}
+    _stream_subprocess_run(kind, [sys.executable, "-u", "-m", module], module, PROJECT_ROOT, env, 4000)
 
 
 @app.get("/prod2/status")
@@ -841,18 +896,10 @@ def prod2_run_all(background_tasks: BackgroundTasks) -> dict[str, object]:
 
 def _pipeline_run(start: str, end: str) -> None:
     """Full daily pipeline (fetch -> FII -> silver -> features -> books) for a date range, in one subprocess."""
-    import time
     label = f"daily_pipeline {start}..{end}"
-    _LM_JOBS["refresh"] = {"status": "running", "started": time.time(), "module": label}
     env = {**os.environ, "PYTHONPATH": f"{SRC_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
-    try:
-        r = subprocess.run([sys.executable, "-u", str(PROJECT_ROOT / "analysis" / "run_daily_pipeline.py"), start, end],
-                           cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True)
-        _LM_JOBS["refresh"] = {"status": "done" if r.returncode == 0 else "failed", "module": label,
-                               "started": _LM_JOBS["refresh"]["started"], "ended": time.time(),
-                               "tail": _subprocess_tail(r, 6000)}
-    except Exception as exc:  # noqa: BLE001
-        _LM_JOBS["refresh"] = {"status": "failed", "module": label, "error": str(exc)}
+    _stream_subprocess_run("refresh", [sys.executable, "-u", str(PROJECT_ROOT / "analysis" / "run_daily_pipeline.py"), start, end],
+                           label, PROJECT_ROOT, env, 6000)
 
 
 @app.post("/prod2/refresh")
