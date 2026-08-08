@@ -463,6 +463,15 @@ th {
   background: #e6edfd;
 }
 
+.bw-symbol-strong .symbol-link {
+  color: #0d7a3f;
+  font-weight: 800;
+}
+.bw-symbol-strong .symbol-link::after {
+  content: " ★";
+  font-size: 11px;
+}
+
 .bw-tier-status {
   display: flex;
   flex-wrap: wrap;
@@ -659,6 +668,7 @@ tr.sell-secondary td {
   .job-tail-live { background: #1a2338; border-color: #2f3f6e; }
   .bw-tier-chip { background: #17241f; border-color: #2c3a34; color: #d6e2dd; }
   .bw-tier-chip.live { background: #17281f; border-color: #167c80; }
+  .bw-symbol-strong .symbol-link { color: #4fd1c5; }
 }
 
 .symbol-link {

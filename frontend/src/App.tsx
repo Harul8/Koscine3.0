@@ -1211,11 +1211,8 @@ type SellHist = {
 };
 
 function SellSignalsTab() {
-  const [structure, setStructure] = useState<"condor" | "skew" | "brokenwing">(() => {
-    const p = urlParam("structure");
-    return p === "skew" || p === "brokenwing" ? p : "condor";
-  });
-  function pick(s: "condor" | "skew" | "brokenwing") {
+  const [structure, setStructure] = useState<"skew" | "brokenwing">(() => (urlParam("structure") === "skew" ? "skew" : "brokenwing"));
+  function pick(s: "skew" | "brokenwing") {
     setStructure(s);
     const url = new URL(window.location.href);
     url.searchParams.set("structure", s);
@@ -1225,12 +1222,11 @@ function SellSignalsTab() {
     <>
       <section className="controls-band">
         <div className="structure-toggle">
-          <button type="button" className={structure === "condor" ? "active" : ""} onClick={() => pick("condor")}>Condor</button>
-          <button type="button" className={structure === "skew" ? "active" : ""} onClick={() => pick("skew")}>IV Skew</button>
           <button type="button" className={structure === "brokenwing" ? "active" : ""} onClick={() => pick("brokenwing")}>Broken-Wing</button>
+          <button type="button" className={structure === "skew" ? "active" : ""} onClick={() => pick("skew")}>IV Skew</button>
         </div>
       </section>
-      {structure === "condor" ? <SellStrategies /> : structure === "skew" ? <SkewStrategy /> : <BrokenWingStrategy />}
+      {structure === "skew" ? <SkewStrategy /> : <BrokenWingStrategy />}
     </>
   );
 }
@@ -1424,6 +1420,24 @@ type BWHist = {
   summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 const BW_TIER_LABEL: Record<string, string> = { t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%" };
+type BWSymbolStatEntry = { n: number; median_pnl_per_lot: number; mean_pnl_per_lot: number; win_rate: number;
+  last10: { entry_date: string; pnl_per_lot: number; ror_pct: number; outcome: string; tier: string }[] };
+type BWSymbolStats = { symbols: Record<string, BWSymbolStatEntry> };
+// Highlight threshold: only color a symbol once it has >=3 signals (avoids overclaiming on thin
+// samples) AND its historical median PnL/lot clears a "worth noting" bar.
+const BW_HIGHLIGHT_MEDIAN = 6000;
+function BWSymbol({ symbol, stats, onOpen }: { symbol: string; stats: BWSymbolStatEntry | undefined; onOpen: (s: string) => void }) {
+  const strong = stats && stats.n >= 3 && stats.median_pnl_per_lot >= BW_HIGHLIGHT_MEDIAN;
+  const title = stats
+    ? `${symbol} — ${stats.n} signals, median ₹${Math.round(stats.median_pnl_per_lot).toLocaleString("en-IN")}/lot, ${(stats.win_rate * 100).toFixed(0)}% win\nLast ${stats.last10.length}:\n` +
+      stats.last10.map((r) => `${r.entry_date}  ${r.outcome === "win" ? "+" : ""}₹${Math.round(r.pnl_per_lot).toLocaleString("en-IN")}/lot  (${r.ror_pct >= 0 ? "+" : ""}${r.ror_pct.toFixed(0)}%, ${BW_TIER_LABEL[r.tier] ?? r.tier})`).join("\n")
+    : undefined;
+  return (
+    <span title={title} className={strong ? "bw-symbol-strong" : undefined}>
+      <SymbolLink symbol={symbol} onOpen={onOpen} />
+    </span>
+  );
+}
 
 function BrokenWingStrategy() {
   const [data, setData] = useState<BWResp | null>(null);
@@ -1433,8 +1447,10 @@ function BrokenWingStrategy() {
   const [filterMonth, setFilterMonth] = useState("");
   const [hist, setHist] = useState<BWHist | null>(null);
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
+  const [symStats, setSymStats] = useState<BWSymbolStats | null>(null);
   useEffect(() => { getJson<BWResp>("/prod2/broken_wing_strategy").then(setData).catch(() => setData(null)); }, []);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => { getJson<BWSymbolStats>("/prod2/broken_wing_symbol_stats").then(setSymStats).catch(() => setSymStats(null)); }, []);
   useEffect(() => {
     const q = [filterSym && `symbol=${filterSym}`, filterTier && `tier=${filterTier}`].filter(Boolean).join("&");
     getJson<BWHist>(`/prod2/broken_wing_signal_history${q ? `?${q}` : ""}`).then(setHist).catch(() => setHist(null));
@@ -1476,10 +1492,16 @@ function BrokenWingStrategy() {
             credit; the narrow call wing still collects decent credit since calls aren't as richly priced.
           </div>
           <div className="sell-rule"><strong>Tiers — all live simultaneously</strong> Tier 1 (2%/6%) is the everyday base signal
-            (fires most often, ~150/yr). Tier 2 (3%/8%) and Tier 3 (2%/10%) are progressively rarer and higher-quality
-            (~71/yr and ~16/yr). <b>When Tier 2 or 3 also fires alongside Tier 1 on a given day, that's a genuine
-            higher-conviction setup</b> — size accordingly. Same entry gate as the regular condor: credit/max-risk &gt; 150%,
-            at least 9 days to expiry.</div>
+            (fires most often, ~143/yr). Tier 2 (3%/8%) and Tier 3 (2%/10%) are progressively rarer and higher-quality
+            (~51/yr and ~12/yr). <b>When Tier 2 or 3 also fires alongside Tier 1 on a given day, that's a genuine
+            higher-conviction setup</b> — size accordingly. ~206 signals/yr combined (~4/week).</div>
+          <div className="sell-rule"><strong>Universe &amp; entry gate</strong> Scanned universe is the static A/B stock
+            groups plus each day's dynamic top-50-by-open-interest-in-lots stocks (not raw share OI, which is dominated
+            by cheap high-share-count names — OI-in-lots correctly surfaces mega-caps). The entry gate is
+            <b> stratified</b>: mega-caps need credit/max-risk &gt; 120% (they're structurally lower-IV/steadier, so a
+            uniform bar under-represented them), everyone else needs &gt; 150%. At least 9 days to expiry either way.
+            Does <b>not</b> exclude F&amp;O-ban-listed stocks (no ban-list data source available) — cross-check live picks
+            against NSE's published ban list before trading.</div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first).</div>
         </div>
         <div className="bw-tier-status">
@@ -1509,7 +1531,7 @@ function BrokenWingStrategy() {
                   {t.top_picks.map((r, i) => (
                     <tr key={r.symbol} className={i === 0 ? "sell-live" : "sell-secondary"}>
                       <td><span className={`rank-badge ${i === 0 ? "primary" : ""}`}>#{i + 1}</span></td>
-                      <td><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /></td>
+                      <td><BWSymbol symbol={r.symbol} stats={symStats?.symbols[r.symbol]} onOpen={setOpenSymbol} /></td>
                       <td>{r.expiry.slice(5)} · {r.dte}d</td>
                       <td>{num(r.underlying, 0)}</td>
                       <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>

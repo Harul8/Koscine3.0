@@ -16,13 +16,23 @@ buying the long call close by). This direction (narrow call / wide put) beat the
 at every asymmetry level tested.
 
 Three tiers, all live in production simultaneously -- more asymmetry = better quality but
-fewer signals (clean, monotonic trade-off, confirmed at both moderate and extreme levels):
-  t1 2%/6%:  ~150 signals/yr, 95.4% win, median  Rs.7,535/lot,  Rs.1,781/lot/day  (base/default)
-  t2 3%/8%:   ~71 signals/yr, 95.6% win, median  Rs.9,695/lot,  Rs.2,270/lot/day
-  t3 2%/10%:  ~16 signals/yr, 99.1% win, median Rs.19,811/lot,  Rs.4,656/lot/day
-t1 is the everyday base signal; when t2 and/or t3 ALSO fire alongside t1 on a given day, that's
-a genuine higher-quality/higher-conviction setup, not a duplicate -- each tier is evaluated
-independently against the same day's option chain.
+fewer signals (clean, monotonic trade-off, confirmed at both moderate and extreme levels).
+
+Universe: UNION of the static A/B universe_groups.json (65 symbols) and each day's dynamic
+top-50-by-OI-in-lots stocks (see build_broken_wing_panel.py for why -- top-50-only actually
+REDUCED both frequency and mega-cap share vs the static universe).
+
+Entry gate is STRATIFIED, not a single threshold: mega-caps (A_mcap30) need entry_ror >
+MCAP_MIN_ROR (120%), everyone else needs > OTHER_MIN_ROR (150%, unchanged). Why: mega-caps are
+structurally lower-IV (steadier, less wing-breach risk -- itself a quality trait for a defined-
+risk seller) so they rarely clear a uniform 150% bar; relaxing it specifically for them lifted
+mega-cap share from ~13% to 13-28%/tier and pushed unique-symbol diversity from ~28-40 to
+17-68/tier, at the cost of a modest 150->~200/yr frequency increase and no win-rate loss
+(98-100% in backtest). A uniform lower threshold for everyone was tried first and overshot to
+~314 signals/yr -- too far from the 150-200/yr, 3-4/week target.
+
+KNOWN GAP: does not exclude F&O-ban-listed stocks (no ban-list data source in this codebase).
+Cross-check live picks against NSE's published ban list before trading.
 
 Same safety rules as the symmetric condor: DTE >= DTE_MIN at entry, forced exit at
 DTE<=SAFE_DTE, per-day liquidity guard, [0, width] daily-mark clamp, MIN_RISK_FRAC
@@ -46,7 +56,8 @@ from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from koscine.config import SILVER_DATA_ROOT  # noqa: E402
 
 SHORT_OTM, FWD, SAFE_DTE = 0.02, 5, 4
-DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 150.0, 50
+DTE_MIN, MIN_VOL = 9, 50
+MCAP_MIN_ROR, OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate -- see module docstring
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of the (wider) wing; below that, credit~=width
                         # and the entry_ror ratio becomes numerically degenerate
 
@@ -59,6 +70,7 @@ TIERS = [
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
+A_MCAP = set(json.loads((LOCK_V2 / "universe_groups.json").read_text()).get("A_mcap30", []))
 
 mk = load_market_data(columns=["date", "symbol", "atm_iv"])
 mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str); mk = mk.sort_values(["symbol", "date"])
@@ -127,7 +139,8 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
         if risk < MIN_RISK_FRAC * width:
             continue
         entry_ror = credit / risk * 100
-        if entry_ror <= MIN_ENTRY_ROR:
+        min_ror_here = MCAP_MIN_ROR if sym in A_MCAP else OTHER_MIN_ROR
+        if entry_ror <= min_ror_here:
             continue
         vals, dd = [], 0.0
         for i in range(FWD):
@@ -145,7 +158,7 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
         exit_value = vals[-1][1]; pnl = credit - exit_value
         lot = lot_size(sym, exp)
         out.append({
-            "tier": tier_id, "symbol": sym, "group": g2[sym], "signal_date": t.date().isoformat(),
+            "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
             "entry_date": pd.Timestamp(e_date).date().isoformat(),
             "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
             "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,

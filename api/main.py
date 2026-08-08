@@ -621,32 +621,65 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     }
 
 
-BW_DTE_MIN, BW_MIN_ROR = 9, 150.0   # same safety floor + gate as the symmetric condor
+BW_DTE_MIN = 9   # same safety floor as the symmetric condor
+BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate: mega-caps are
+    # structurally lower-IV (steadier, less wing-breach risk -- itself a quality trait for a
+    # defined-risk seller) so they rarely clear a uniform 150% bar; relaxing it specifically for
+    # them lifted mega-cap share from ~13% to 13-28%/tier without a win-rate cost in backtest.
+_BW_TOP50_CACHE: dict = {"mtime": None, "by_date": None}
+
+
+def _top50_oi_today() -> set:
+    """Today's top-50-by-OI-in-lots symbols (fut_oi / that month's lot size -- NOT raw share OI,
+    which is dominated by cheap high-share-count names). Cached on eod_deriv_daily's mtime."""
+    from koscine.config import SILVER_DATA_ROOT
+    f = SILVER_DATA_ROOT / "eod_deriv_daily.parquet"
+    if not f.exists():
+        return set()
+    mt = os.path.getmtime(f)
+    if _BW_TOP50_CACHE["mtime"] != mt:
+        oi = pd.read_parquet(f, columns=["date", "symbol", "fut_oi"])
+        oi["date"] = pd.to_datetime(oi["date"])
+        oi = oi[oi["fut_oi"].notna() & (oi["fut_oi"] > 0)]
+        last = oi["date"].max()
+        today = oi[oi["date"] == last].copy()
+        lots = _lot_sizes()
+        today["lot"] = today["symbol"].map(lots)
+        today = today.dropna(subset=["lot"])
+        today["oi_lots"] = today["fut_oi"] / today["lot"]
+        _BW_TOP50_CACHE.update(mtime=mt, by_date=set(today.nlargest(50, "oi_lots")["symbol"]))
+    return _BW_TOP50_CACHE["by_date"] or set()
 # Three narrow-call/wide-put tiers, all live simultaneously. t1 is the everyday base signal
 # (fires most often); t2 and t3 are progressively rarer and higher-quality -- when they ALSO
 # fire alongside t1 on a given day, that's a genuine higher-conviction setup, not a duplicate.
 BW_TIERS = [
     {"id": "t1_2x6", "label": "Tier 1 (2%/6%)", "wing_ce": 0.02, "wing_pe": 0.06,
-     "backtest": {"win_rate": 0.954, "median_pnl_per_lot": 7535, "median_pnl_per_lot_per_day": 1781,
-                  "per_year": 150, "pct_trades_over_10k": 39.5}},
+     "backtest": {"win_rate": 0.993, "median_pnl_per_lot": 6025, "median_pnl_per_lot_per_day": 1205,
+                  "per_year": 143, "pct_trades_over_10k": 23.8}},
     {"id": "t2_3x8", "label": "Tier 2 (3%/8%)", "wing_ce": 0.03, "wing_pe": 0.08,
-     "backtest": {"win_rate": 0.956, "median_pnl_per_lot": 9695, "median_pnl_per_lot_per_day": 2270,
-                  "per_year": 71, "pct_trades_over_10k": 48.1}},
+     "backtest": {"win_rate": 0.980, "median_pnl_per_lot": 7402, "median_pnl_per_lot_per_day": 1480,
+                  "per_year": 51, "pct_trades_over_10k": 32.4}},
     {"id": "t3_2x10", "label": "Tier 3 (2%/10%)", "wing_ce": 0.02, "wing_pe": 0.10,
-     "backtest": {"win_rate": 0.991, "median_pnl_per_lot": 19811, "median_pnl_per_lot_per_day": 4656,
-                  "per_year": 16, "pct_trades_over_10k": 80.0}},
+     "backtest": {"win_rate": 1.000, "median_pnl_per_lot": 17614, "median_pnl_per_lot_per_day": 3523,
+                  "per_year": 12, "pct_trades_over_10k": 73.9}},
 ]
-BW_NOTE = ("Asymmetric wings beat the symmetric 5%/5% condor by up to ~8.6x median profit/lot at "
+BW_NOTE = ("Asymmetric wings beat the symmetric 5%/5% condor by up to ~7.6x median profit/lot at "
            "matched entry-ror gate: max loss at expiry is set by the WIDER wing only (one side "
            "breaches at a time), so a wide put wing banks rich put-skew premium cheaply while a "
            "narrow call wing still collects decent credit. This direction (narrow call/wide put) "
            "beat the mirror image at every asymmetry level tested. More asymmetry = better quality "
            "but fewer signals -- Tier 1 is the everyday base signal; Tier 2/3 firing alongside it "
-           "is a genuine higher-conviction setup. Gross of costs/STT.")
+           "is a genuine higher-conviction setup. Universe = static A/B groups + today's dynamic "
+           "top-50-by-OI-in-lots; entry gate is stratified (mega-caps 120%, everyone else 150%) "
+           "to lift mega-cap representation without cutting frequency -- combined ~206 signals/yr "
+           "across all 3 tiers, ~68/41/17 unique symbols firing per tier (vs ~28-40 before). Does "
+           "NOT exclude F&O-ban-listed stocks (no ban-list data source available) -- cross-check "
+           "live picks against NSE's published ban list. Gross of costs/STT.")
 
 
 def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe: float,
-                   dte_min: float, min_ror: float, g2: dict, lots: dict, ivlast: dict) -> list[dict]:
+                   dte_min: float, mcap_min_ror: float, other_min_ror: float, a_mcap: set,
+                   g2: dict, lots: dict, ivlast: dict) -> list[dict]:
     out = []
     for sym, sg in day.groupby("symbol"):
         candidate_exps = sorted(sg["expiry"].unique())
@@ -683,8 +716,9 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
                 return None
             return round(float(v) / float(lot))
 
+        min_ror_here = mcap_min_ror if sym in a_mcap else other_min_ror
         out.append({
-            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "symbol": sym, "group": g2.get(sym, "C_top50oi"), "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
             "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
@@ -699,7 +733,8 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
             "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
-            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
+            "min_ror_applied": min_ror_here,
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror_here),
         })
     return out
 
@@ -707,7 +742,8 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
 @app.get("/prod2/broken_wing_strategy")
 def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                                dte_min: int = Query(BW_DTE_MIN, ge=0, le=30),
-                               min_ror: float = Query(BW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+                               mcap_min_ror: float = Query(BW_MCAP_MIN_ROR, ge=0, le=1000),
+                               other_min_ror: float = Query(BW_OTHER_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
     """Live DEFINED-RISK broken-wing iron condor, evaluated at THREE asymmetry tiers simultaneously
     (all narrow-call/wide-put): Tier 1 2%/6% (everyday base signal, fires most often), Tier 2 3%/8%,
     Tier 3 2%/10% (rarest, highest quality). Max loss at expiry = max(call_wing, put_wing) -
@@ -717,21 +753,32 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     still collects decent call credit since calls aren't as richly priced. Backtested on a 7-year,
     both-direction-tested panel: this direction beat the mirror image at every asymmetry level tried.
     Each tier's `fired_today` flag tells you which tier(s) are live -- Tier 2/3 firing alongside
-    Tier 1 is a genuine higher-conviction setup, not a duplicate signal."""
+    Tier 1 is a genuine higher-conviction setup, not a duplicate signal.
+
+    Universe is the UNION of the static A/B groups and today's dynamic top-50-by-OI-in-lots
+    stocks (not raw share OI, which is dominated by cheap high-share-count names -- OI-in-lots
+    correctly surfaces mega-caps). Entry gate is STRATIFIED: mega-caps (A_mcap30) need
+    entry_ror > mcap_min_ror (120% default, lower than the uniform 150% -- they're structurally
+    lower-IV/steadier, so a uniform bar under-represents them), everyone else needs > other_min_ror
+    (150%, unchanged). KNOWN GAP: does not exclude F&O-ban-listed stocks -- no ban-list data
+    source exists in this codebase; cross-check live picks against NSE's published ban list."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "tiers": []}
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    a_mcap = set(_read_json(LM_LOCK_V2 / "universe_groups.json").get("A_mcap30", []))
+    universe = set(g2) | _top50_oi_today()
     lots = _lot_sizes()
     last = contracts["date"].max()
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
-                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & contracts["symbol"].isin(universe) & contracts["strike"].notna()
                     & (contracts["underlying_price"] > 0)].copy()
     ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
 
     tiers_out = []
     for tier in BW_TIERS:
-        out = _bw_candidates(day, short_otm, tier["wing_ce"], tier["wing_pe"], dte_min, min_ror, g2, lots, ivlast)
+        out = _bw_candidates(day, short_otm, tier["wing_ce"], tier["wing_pe"], dte_min,
+                             mcap_min_ror, other_min_ror, a_mcap, g2, lots, ivlast)
         out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
         in_window = [c for c in out if c["in_window"]]
         top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
@@ -739,12 +786,14 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "id": tier["id"], "label": tier["label"], "wing_ce": tier["wing_ce"], "wing_pe": tier["wing_pe"],
             "fired_today": bool(in_window),
             "backtest": {**tier["backtest"], "note": BW_NOTE,
-                        "window": "2019-2026 (7y, short 2% OTM, DTE>=9 w/ roll-forward, entry ror>150%, pre-cost)"},
+                        "window": "2024-08..2026-08 (2y, short 2% OTM, DTE>=9 w/ roll-forward, "
+                                  "stratified entry gate, pre-cost)"},
             "candidates": out, "top_picks": top_picks,
         })
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "dte_min": dte_min, "min_ror": min_ror},
+        "params": {"short_otm": short_otm, "dte_min": dte_min, "mcap_min_ror": mcap_min_ror, "other_min_ror": other_min_ror},
+        "universe_size": len(universe),
         "tiers": tiers_out,
     }
 
@@ -775,6 +824,34 @@ def prod2_broken_wing_signal_history(symbol: str | None = None, tier: str | None
             "total_pnl": round(float(df["pnl"].sum()), 1),
         }
     return {"rows": _records(df), "summary": summary}
+
+
+@app.get("/prod2/broken_wing_symbol_stats")
+def prod2_broken_wing_symbol_stats(min_n: int = Query(3, ge=1, le=20)) -> dict[str, object]:
+    """Per-symbol historical PnL/lot summary across all broken-wing signals (all tiers combined),
+    for highlighting which symbols have historically fired the biggest realized profits -- so a
+    live pick from a strong-track-record symbol stands out. Only symbols with lot_size known
+    (2024+) and >= min_n signals are included (small samples aren't a reliable signal). Each entry
+    also carries its last 10 signals (date + pnl_per_lot + outcome) for a hover/detail view."""
+    f = LM_LOCK_V2.parent / "prod_sell_strategies" / "broken_wing_signal_history.csv"
+    if not f.exists():
+        return {"symbols": {}}
+    df = pd.read_csv(f)
+    df = df[df["lot_size"].notna() & df["pnl_per_lot"].notna()]
+    out: dict[str, object] = {}
+    for sym, g in df.groupby("symbol"):
+        if len(g) < min_n:
+            continue
+        g = g.sort_values("entry_date", ascending=False)
+        last10 = g.head(10)[["entry_date", "pnl_per_lot", "ror_pct", "outcome", "tier"]].to_dict("records")
+        out[sym] = {
+            "n": int(len(g)),
+            "median_pnl_per_lot": round(float(g["pnl_per_lot"].median()), 0),
+            "mean_pnl_per_lot": round(float(g["pnl_per_lot"].mean()), 0),
+            "win_rate": round(float((g["outcome"].eq("win")).mean()), 3),
+            "last10": last10,
+        }
+    return {"symbols": out}
 
 
 @app.get("/prod2/skew_signal_history")
