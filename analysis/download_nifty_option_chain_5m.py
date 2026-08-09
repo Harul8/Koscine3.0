@@ -201,7 +201,9 @@ def main() -> None:
     print(f"[option_chain_5m] underlying spot join: {'available' if spot is not None else 'NOT FOUND (run download_nifty_5m.py first for underlying_close)'}", flush=True)
 
     expiries = list_expiries(token, args.instrument)
-    print(f"[option_chain_5m] {args.instrument}: {len(expiries)} expired expiries found", flush=True)
+    expiries = sorted(expiries, reverse=True)  # latest expiry first, walk backward in time
+    print(f"[option_chain_5m] {args.instrument}: {len(expiries)} expired expiries found, "
+          f"walking latest-first ({expiries[0]} -> {expiries[-1]})", flush=True)
 
     t0 = time.time()
     total_contracts = 0
