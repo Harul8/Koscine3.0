@@ -521,43 +521,40 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
 
 SKEW_DTE_MIN, SKEW_MIN_ROR = 15, 150.0   # safety floor (delivery-margin) + THE quality gate
+# Three tiers mirroring Broken-Wing's design: wider wing -> more credit banked, fewer signals.
+# t1 is the everyday base tier (>=~Rs.7k median PnL/lot floor), t2/t3 progressively rarer.
+# 10% wing tested and found to plateau exactly at 8%'s payout with fewer signals -- not used.
+SKEW_TIERS = [
+    {"id": "t1_skew35", "label": "Tier 1 (3.5% wing)", "wing": 0.035,
+     "backtest": {"per_year": 126, "median_pnl_per_lot": 7175, "win_rate": 1.0, "pct_trades_over_10k": 24.3}},
+    {"id": "t2_skew6", "label": "Tier 2 (6% wing)", "wing": 0.06,
+     "backtest": {"per_year": 12, "median_pnl_per_lot": 13681, "win_rate": 1.0, "pct_trades_over_10k": 62.5}},
+    {"id": "t3_skew8", "label": "Tier 3 (8% wing)", "wing": 0.08,
+     "backtest": {"per_year": 4, "median_pnl_per_lot": 11988, "win_rate": 1.0, "pct_trades_over_10k": 55.6}},
+]
+SKEW_NOTE = ("Wider wing -> more credit banked, fewer signals clear the gate (same pattern as "
+             "the Broken-Wing Condor). De-duplicated against Broken-Wing: a skew candidate is "
+             "dropped if the same symbol already has a Broken-Wing signal today -- skew is a "
+             "secondary/complementary signal, not a duplicate (roughly a third to two-thirds of "
+             "raw skew candidates overlap with Broken-Wing depending on tier, so de-dup removes "
+             "a meaningful chunk -- Tier 3 is down to n=9 over 2y post-dedup, thin enough that "
+             "its median should be treated as directional, not precise). 100% win rate in the "
+             "backtest is flagged unverified/small-sample -- not a guarantee. Gross of costs/STT.")
 
 
-@app.get("/prod2/skew_strategy")
-def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
-                        wing: float = Query(0.03, ge=0.01, le=0.08),
-                        dte_min: int = Query(SKEW_DTE_MIN, ge=0, le=30),
-                        min_ror: float = Query(SKEW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
-    """Live DEFINED-RISK single-side credit spread on the A/B universe: back out BS implied vol
-    for the ~short_otm% OTM call and put separately, sell whichever side is relatively richer
-    (skew = ce_iv - pe_iv) with the +wing% wing bought (loss always capped), on the nearest
-    available expiry. Entry requires DTE >= dte_min (NSE ITM delivery-margin ramps E-4..expiry --
-    unlike the condor, skew backtests best further from expiry, not closer) AND entry-time
-    credit/max_risk (ror_pct) > min_ror -- THE gating criterion. Ranked by ror_pct; top_picks
-    is the top-3-per-group shortlist among in_window candidates. Backtest context (2y, pre-cost)
-    is embedded."""
-    contracts, iv = _sell_sources()
-    if contracts is None:
-        return {"as_of": None, "candidates": [], "note": "no option-chain data"}
-    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
-    lots = _lot_sizes()
-    last = contracts["date"].max()
-    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
-                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
-                    & (contracts["underlying_price"] > 0)].copy()
-    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
-
+def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: float, min_ror: float,
+                     g2: dict, lots: dict, ivlast: dict, exclude_symbols: set) -> list[dict]:
     out = []
     for sym, sg in day.groupby("symbol"):
-        # roll forward: earliest expiry that already clears the DTE safety floor, not the nearest
-        # calendar expiry -- avoids going quiet in the days right before each expiry.
+        if sym in exclude_symbols:
+            continue
         candidate_exps = sorted(sg["expiry"].unique())
-        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - last).days >= dte_min), None)
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - day["date"].iloc[0]).days >= dte_min), None)
         if exp is None:
             continue
         chain = sg[sg["expiry"] == exp]
         u = float(chain["underlying_price"].iloc[0])
-        dte = int((exp - last).days)
+        dte = int((exp - day["date"].iloc[0]).days)
         ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
         if ce.empty or pe.empty:
             continue
@@ -588,7 +585,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         lot = lots.get(sym)
         breakeven = float(short_leg["strike"]) + credit if side == "CE" else float(short_leg["strike"]) - credit
         out.append({
-            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "symbol": sym, "group": g2.get(sym, "C_top50oi"), "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_leg["strike"]), "long_strike": float(long_leg["strike"]),
@@ -600,26 +597,67 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
             "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
         })
-    out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
-    in_window = [c for c in out if c["in_window"]]
-    top_picks = [c for g in ("A_mcap30", "B_turn35")
-                for c in sorted([c for c in in_window if c["group"] == g], key=lambda c: c["ror_pct"], reverse=True)[:3]]
+    return out
+
+
+@app.get("/prod2/skew_strategy")
+def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
+                        dte_min: int = Query(SKEW_DTE_MIN, ge=0, le=30),
+                        min_ror: float = Query(SKEW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+    """Live DEFINED-RISK single-side credit spread, evaluated at THREE wing-width tiers
+    simultaneously (mirroring Broken-Wing's tiering): back out BS implied vol for the
+    ~short_otm% OTM call and put separately, sell whichever side is relatively richer
+    (skew = ce_iv - pe_iv), buy the tier's wing on that same side. Wider wing -> more credit
+    banked, fewer signals clear the gate (same pattern found for the condor/broken-wing).
+    De-duplicated against Broken-Wing Condor: a symbol already firing a Broken-Wing signal
+    today is excluded here -- skew is a secondary/complementary signal source, not a duplicate.
+    Entry requires DTE >= dte_min AND entry-time credit/max_risk > min_ror. Each tier's
+    `fired_today` flag tells you which tier(s) are live."""
+    contracts, iv = _sell_sources()
+    if contracts is None:
+        return {"as_of": None, "tiers": []}
+    g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
+    lots = _lot_sizes()
+    last = contracts["date"].max()
+    universe = set(g2) | _top50_oi_today()
+    day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
+                    & contracts["symbol"].isin(universe) & contracts["strike"].notna()
+                    & (contracts["underlying_price"] > 0)].copy()
+    ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
+
+    # live de-dup: symbols with a Broken-Wing signal firing today (any tier), same universe/day.
+    bw_a_mcap = set(_read_json(LM_LOCK_V2 / "universe_groups.json").get("A_mcap30", []))
+    exclude = set(EXCLUDE_SYMBOLS)
+    for tier in BW_TIERS:
+        bw_out = _bw_candidates(day, 0.02, tier["wing_ce"], tier["wing_pe"], BW_DTE_MIN,
+                                BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR, bw_a_mcap, g2, lots, ivlast)
+        exclude |= {c["symbol"] for c in bw_out if c["in_window"]}
+
+    tiers_out = []
+    for tier in SKEW_TIERS:
+        out = _skew_candidates(day, short_otm, tier["wing"], dte_min, min_ror, g2, lots, ivlast, exclude)
+        out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
+        in_window = [c for c in out if c["in_window"]]
+        top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
+        tiers_out.append({
+            "id": tier["id"], "label": tier["label"], "wing": tier["wing"], "fired_today": bool(in_window),
+            "backtest": {**tier["backtest"], "note": SKEW_NOTE,
+                        "window": "2024-08..2026-08 (2y, richer-side 2% OTM, DTE>=15 w/ roll-forward, "
+                                  "entry ror>150%, de-duped vs Broken-Wing, pre-cost)"},
+            "candidates": out, "top_picks": top_picks,
+        })
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "wing": wing, "dte_min": dte_min, "min_ror": min_ror},
-        "backtest": {"window": "2024-08..2026-08 (2y, richer-side 2% OTM / wing +3%, DTE>=15 w/ roll-forward, entry ror>150%, pre-cost)",
-                     "ev_on_risk": 1.352, "win_rate": 1.00, "worst": "+0.08x (best of the worst -- no losses observed)",
-                     "note": "n=443 over 2y, 100% win rate. Checked for the data-quality issue found in the condor "
-                             "backtest (near-zero-risk entries with a degenerate ror ratio) and excluded those, but "
-                             "the 100% win rate persists -- could not find a bug explaining it. Treat as an unverified, "
-                             "small-sample finding, not a guarantee: this window may simply not include a loss for "
-                             "this specific narrow selection, even though the same market data clearly contains "
-                             "losses elsewhere (see the condor backtest). No interim stop-loss finding carried over "
-                             "from an earlier backtest, not re-tested here."},
-        "candidates": out,
-        "top_picks": top_picks,
+        "params": {"short_otm": short_otm, "dte_min": dte_min, "min_ror": min_ror},
+        "excluded_by_broken_wing": sorted(exclude),
+        "tiers": tiers_out,
     }
 
+
+# Non-mega-cap symbols with a consistently weak (n>=3) historical track record across the
+# combined Broken-Wing + Skew signal set, excluded outright: ANGELONE median Rs.608/lot over 8
+# signals -- 4.6x below the next-weakest name (TMPV, Rs.2,820) -- not a fluke of a small sample.
+EXCLUDE_SYMBOLS = {"ANGELONE"}
 
 BW_DTE_MIN = 9   # same safety floor as the symmetric condor
 BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate: mega-caps are
@@ -654,11 +692,11 @@ def _top50_oi_today() -> set:
 # fire alongside t1 on a given day, that's a genuine higher-conviction setup, not a duplicate.
 BW_TIERS = [
     {"id": "t1_2x6", "label": "Tier 1 (2%/6%)", "wing_ce": 0.02, "wing_pe": 0.06,
-     "backtest": {"win_rate": 0.993, "median_pnl_per_lot": 6025, "median_pnl_per_lot_per_day": 1205,
-                  "per_year": 143, "pct_trades_over_10k": 23.8}},
+     "backtest": {"win_rate": 0.993, "median_pnl_per_lot": 6149, "median_pnl_per_lot_per_day": 1230,
+                  "per_year": 140, "pct_trades_over_10k": 24.4}},
     {"id": "t2_3x8", "label": "Tier 2 (3%/8%)", "wing_ce": 0.03, "wing_pe": 0.08,
-     "backtest": {"win_rate": 0.980, "median_pnl_per_lot": 7402, "median_pnl_per_lot_per_day": 1480,
-                  "per_year": 51, "pct_trades_over_10k": 32.4}},
+     "backtest": {"win_rate": 0.980, "median_pnl_per_lot": 7410, "median_pnl_per_lot_per_day": 1482,
+                  "per_year": 51, "pct_trades_over_10k": 32.7}},
     {"id": "t3_2x10", "label": "Tier 3 (2%/10%)", "wing_ce": 0.02, "wing_pe": 0.10,
      "backtest": {"win_rate": 1.000, "median_pnl_per_lot": 17614, "median_pnl_per_lot_per_day": 3523,
                   "per_year": 12, "pct_trades_over_10k": 73.9}},
@@ -682,6 +720,8 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
                    g2: dict, lots: dict, ivlast: dict) -> list[dict]:
     out = []
     for sym, sg in day.groupby("symbol"):
+        if sym in EXCLUDE_SYMBOLS:
+            continue
         candidate_exps = sorted(sg["expiry"].unique())
         exp = next((e for e in candidate_exps if (pd.Timestamp(e) - day["date"].iloc[0]).days >= dte_min), None)
         if exp is None:
@@ -828,15 +868,23 @@ def prod2_broken_wing_signal_history(symbol: str | None = None, tier: str | None
 
 @app.get("/prod2/broken_wing_symbol_stats")
 def prod2_broken_wing_symbol_stats(min_n: int = Query(3, ge=1, le=20)) -> dict[str, object]:
-    """Per-symbol historical PnL/lot summary across all broken-wing signals (all tiers combined),
-    for highlighting which symbols have historically fired the biggest realized profits -- so a
-    live pick from a strong-track-record symbol stands out. Only symbols with lot_size known
-    (2024+) and >= min_n signals are included (small samples aren't a reliable signal). Each entry
-    also carries its last 10 signals (date + pnl_per_lot + outcome) for a hover/detail view."""
-    f = LM_LOCK_V2.parent / "prod_sell_strategies" / "broken_wing_signal_history.csv"
-    if not f.exists():
+    """Per-symbol historical PnL/lot summary across ALL signals (Broken-Wing + Skew, all tiers
+    combined -- the two strategies are already de-duped against each other so this is a clean
+    union), for highlighting which symbols have historically fired the biggest realized profits
+    -- so a live pick from a strong-track-record symbol stands out. Only symbols with lot_size
+    known (2024+) and >= min_n signals are included (small samples aren't a reliable signal).
+    Each entry also carries its last 10 signals (date + pnl_per_lot + outcome + tier) for a
+    hover/detail view."""
+    bw_f = LM_LOCK_V2.parent / "prod_sell_strategies" / "broken_wing_signal_history.csv"
+    sk_f = LM_LOCK_V2.parent / "prod_sell_strategies" / "skew_signal_history.csv"
+    frames = []
+    if bw_f.exists():
+        frames.append(pd.read_csv(bw_f)[["symbol", "entry_date", "pnl_per_lot", "ror_pct", "outcome", "tier", "lot_size"]])
+    if sk_f.exists():
+        frames.append(pd.read_csv(sk_f)[["symbol", "entry_date", "pnl_per_lot", "ror_pct", "outcome", "tier", "lot_size"]])
+    if not frames:
         return {"symbols": {}}
-    df = pd.read_csv(f)
+    df = pd.concat(frames, ignore_index=True)
     df = df[df["lot_size"].notna() & df["pnl_per_lot"].notna()]
     out: dict[str, object] = {}
     for sym, g in df.groupby("symbol"):
@@ -855,16 +903,19 @@ def prod2_broken_wing_symbol_stats(min_n: int = Query(3, ge=1, le=20)) -> dict[s
 
 
 @app.get("/prod2/skew_signal_history")
-def prod2_skew_signal_history(symbol: str | None = None) -> dict[str, object]:
-    """Historical skew-strategy signals (only dates a signal fired: IV-rich + entry window),
-    each with the side sold (CE/PE), entry credit / exit value / PnL / max intra-trade drawdown.
-    Optional ?symbol= filter. Also returns the aggregate track record for the filtered set."""
+def prod2_skew_signal_history(symbol: str | None = None, tier: str | None = None) -> dict[str, object]:
+    """Historical skew-strategy signals across all 3 wing-width tiers (only dates a signal
+    fired: IV-rich + entry window, de-duped vs Broken-Wing), each with the side sold (CE/PE),
+    entry credit / exit value / PnL / max intra-trade drawdown, tagged by `tier`. Optional
+    ?symbol= and ?tier= (t1_skew4 / t2_skew6 / t3_skew8) filters."""
     f = LM_LOCK_V2.parent / "prod_sell_strategies" / "skew_signal_history.csv"
     if not f.exists():
         return {"rows": [], "summary": None}
     df = pd.read_csv(f)
     if symbol:
         df = df[df["symbol"].eq(symbol.upper())]
+    if tier:
+        df = df[df["tier"].eq(tier)]
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:

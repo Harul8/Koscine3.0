@@ -71,6 +71,10 @@ panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
 A_MCAP = set(json.loads((LOCK_V2 / "universe_groups.json").read_text()).get("A_mcap30", []))
+# Non-mega-cap symbols with a consistently weak (n>=3) historical track record across the
+# combined Broken-Wing + Skew signal set, excluded outright: ANGELONE median Rs.608/lot over 8
+# signals -- 4.6x below the next-weakest name (TMPV, Rs.2,820) -- not a fluke of a small sample.
+EXCLUDE_SYMBOLS = {"ANGELONE"}
 
 mk = load_market_data(columns=["date", "symbol", "atm_iv"])
 mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str); mk = mk.sort_values(["symbol", "date"])
@@ -101,6 +105,8 @@ def legseq(sym, ot, exp, strike, win):
 def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
     out = []
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
+        if sym in EXCLUDE_SYMBOLS:
+            continue
         p = tpos.get(pd.Timestamp(e_date))
         if p is None or p == 0 or p + FWD - 1 >= len(tdays):
             continue

@@ -1253,22 +1253,273 @@ type SellHist = {
 };
 
 function SellSignalsTab() {
-  const [structure, setStructure] = useState<"skew" | "brokenwing">(() => (urlParam("structure") === "skew" ? "skew" : "brokenwing"));
-  function pick(s: "skew" | "brokenwing") {
-    setStructure(s);
-    const url = new URL(window.location.href);
-    url.searchParams.set("structure", s);
-    window.history.replaceState({}, "", url);
-  }
+  return <MergedSellSignals />;
+}
+
+// ----------------------------------------------------------------- Merged Sell Signals (Broken-Wing + IV Skew)
+// Skew is filtered server-side to exclude any symbol already firing a Broken-Wing signal that
+// day (see /prod2/skew_strategy's `excluded_by_broken_wing`) -- Broken-Wing is the default/
+// primary structure, Skew is a secondary source of additional, non-duplicate signals.
+type MergedRow = {
+  strategy: "BW" | "SIV"; tierId: string; tierLabel: string; rank: number;
+  symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
+  sideDesc: string; positionDesc: string;
+  credit: number; max_profit: number; max_risk: number; lot_size: number | null;
+  max_profit_per_lot: number | null; max_risk_per_lot: number | null; ror_pct: number;
+};
+type MergedHistRow = {
+  strategy: "BW" | "SIV"; tierId: string; symbol: string; group: string; signal_date: string;
+  expiry: string; dte: number; iv_ratio: number | null; positionDesc: string;
+  credit: number; max_profit: number; max_risk: number;
+  lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
+  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+};
+const MERGED_TIER_LABEL: Record<string, string> = {
+  t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%",
+  t1_skew35: "Skew T1 · 3.5%", t2_skew6: "Skew T2 · 6%", t3_skew8: "Skew T3 · 8%",
+};
+
+function MergedSellSignals() {
+  const [bwData, setBwData] = useState<BWResp | null>(null);
+  const [skewData, setSkewData] = useState<SkewTieredResp | null>(null);
+  const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
+  const [symStats, setSymStats] = useState<BWSymbolStats | null>(null);
+  const [filterSym, setFilterSym] = useState("");
+  const [filterStrategy, setFilterStrategy] = useState<"" | "BW" | "SIV">("");
+  const [filterMonth, setFilterMonth] = useState("");
+  const [bwHist, setBwHist] = useState<BWHist | null>(null);
+  const [skewHist, setSkewHist] = useState<SkewTieredHist | null>(null);
+  const [openSymbol, setOpenSymbol] = useState<string | null>(null);
+
+  useEffect(() => { getJson<BWResp>("/prod2/broken_wing_strategy").then(setBwData).catch(() => setBwData(null)); }, []);
+  useEffect(() => { getJson<SkewTieredResp>("/prod2/skew_strategy").then(setSkewData).catch(() => setSkewData(null)); }, []);
+  useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
+  useEffect(() => { getJson<BWSymbolStats>("/prod2/broken_wing_symbol_stats").then(setSymStats).catch(() => setSymStats(null)); }, []);
+  useEffect(() => {
+    const q = filterSym ? `?symbol=${filterSym}` : "";
+    getJson<BWHist>(`/prod2/broken_wing_signal_history${q}`).then(setBwHist).catch(() => setBwHist(null));
+    getJson<SkewTieredHist>(`/prod2/skew_signal_history${q}`).then(setSkewHist).catch(() => setSkewHist(null));
+  }, [filterSym]);
+  useEffect(() => setFilterMonth(""), [filterSym, filterStrategy]);
+
+  const bwTiers = bwData?.tiers ?? [];
+  const skewTiers = skewData?.tiers ?? [];
+
+  const dailyFlat: MergedRow[] = useMemo(() => {
+    const bwRows: MergedRow[] = bwTiers.flatMap((t) => t.top_picks.map((r, i) => ({
+      strategy: "BW" as const, tierId: t.id, tierLabel: t.label, rank: i + 1,
+      symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
+      sideDesc: `${r.richer_side === "CE" ? "Call" : "Put"} richer`,
+      positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
+    })));
+    const skewRows: MergedRow[] = skewTiers.flatMap((t) => t.top_picks.map((r, i) => ({
+      strategy: "SIV" as const, tierId: t.id, tierLabel: t.label, rank: i + 1,
+      symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
+      sideDesc: `Sell ${r.side === "CE" ? "Call" : "Put"}`,
+      positionDesc: `${num(r.short_strike, 0)}/${num(r.long_strike, 0)} BE ${num(r.breakeven, 0)}`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
+    })));
+    return [...bwRows, ...skewRows];
+  }, [bwTiers, skewTiers]);
+
+  const histFlat: MergedHistRow[] = useMemo(() => {
+    const bwRows: MergedHistRow[] = (bwHist?.rows ?? []).map((r) => ({
+      strategy: "BW" as const, tierId: r.tier, symbol: r.symbol, group: r.group, signal_date: r.signal_date,
+      expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
+      positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot,
+      exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
+    }));
+    const skewRows: MergedHistRow[] = (skewHist?.rows ?? []).map((r) => ({
+      strategy: "SIV" as const, tierId: r.tier, symbol: r.symbol, group: r.group, signal_date: r.signal_date,
+      expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
+      positionDesc: `${num(r.short_strike, 0)}/${num(r.long_strike, 0)} (${r.side})`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot,
+      exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
+    }));
+    let all = [...bwRows, ...skewRows];
+    if (filterStrategy) all = all.filter((r) => r.strategy === filterStrategy);
+    return all;
+  }, [bwHist, skewHist, filterStrategy]);
+
+  const allSyms = filterSym === "";
+  const months = useMemo(() => monthsOf(histFlat, (r) => r.signal_date), [histFlat]);
+  const histRowsAll = useMemo(() => (filterMonth ? histFlat.filter((r) => r.signal_date.startsWith(filterMonth)) : histFlat), [histFlat, filterMonth]);
+  const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
+  const hs = useMemo(() => {
+    if (!histRows.length) return null;
+    return {
+      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
+      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
+    };
+  }, [histRows]);
+  const dailySort = useSortedRows(dailyFlat, "ror_pct" as never, "desc");
+  const histSort = useSortedRows(histRows, "signal_date" as never, "desc");
+
+  const allTierChips = [
+    ...bwTiers.map((t) => ({ strategy: "BW" as const, id: t.id, label: t.label, fired_today: t.fired_today, backtest: t.backtest })),
+    ...skewTiers.map((t) => ({ strategy: "SIV" as const, id: t.id, label: t.label, fired_today: t.fired_today, backtest: t.backtest })),
+  ];
+
   return (
     <>
-      <section className="controls-band">
-        <div className="structure-toggle">
-          <button type="button" className={structure === "brokenwing" ? "active" : ""} onClick={() => pick("brokenwing")}>Broken-Wing</button>
-          <button type="button" className={structure === "skew" ? "active" : ""} onClick={() => pick("skew")}>IV Skew</button>
+      <section className="panel cockpit">
+        <div className="panel-title"><h2>Sell Signals — Broken-Wing Condor + IV Skew (merged)</h2>
+          <span>as of {bwData?.as_of ?? skewData?.as_of ?? "—"}</span></div>
+        <div className="sell-explain">
+          <div className="sell-rule">
+            <strong>Broken-Wing Condor (primary)</strong> Sell the ~2% OTM call &amp; put, buy the wings ASYMMETRICALLY
+            (narrow call wing / wide put wing) at 3 increasing asymmetry tiers. Max loss always capped at (wider wing − credit).
+          </div>
+          <div className="sell-rule">
+            <strong>IV Skew (secondary)</strong> Sell only the richer-IV side (CE or PE), buy a wing on that same side, at 3
+            increasing wing-width tiers. <b>Only shown when the symbol doesn't already have a live Broken-Wing signal that
+            day</b> — Skew adds coverage, it never duplicates a Broken-Wing pick.
+          </div>
+          <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first). Same DTE-floor /
+            entry-ror safety rules as before (9 days for Broken-Wing, 15 for Skew).</div>
+        </div>
+        <div className="bw-tier-status">
+          {allTierChips.map((t) => (
+            <div key={`${t.strategy}-${t.id}`} className={`bw-tier-chip ${t.fired_today ? "live" : ""}`}>
+              <span className="bw-tier-dot" />
+              <strong>{t.strategy === "BW" ? "BW" : "SIV"} · {t.label}</strong>
+              <span>{t.fired_today ? "firing today" : "quiet today"}</span>
+              <span className="hint">{(t.backtest.win_rate * 100).toFixed(0)}% win · ₹{t.backtest.median_pnl_per_lot.toLocaleString("en-IN")}/lot median · ~{t.backtest.per_year}/yr</span>
+            </div>
+          ))}
+        </div>
+        <div className="table-wrap">
+          <table className="freeze-cols">
+            <thead><tr>
+              <SortTh className="fz1" label="Strategy" sortKey="strategy" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh className="fz2" label="Tier" sortKey="tierLabel" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh className="fz3" label="Symbol" sortKey="symbol" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Exp / DTE" sortKey="dte" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Spot" sortKey="underlying" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="IV rich" sortKey="iv_ratio" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <th>Side</th><th>Position</th>
+              <SortTh label="Credit" sortKey="credit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={dailySort.sort} onSort={dailySort.onSort} />
+            </tr></thead>
+            <tbody>
+              {dailySort.sorted.map((r) => (
+                <tr key={`${r.strategy}-${r.tierId}-${r.symbol}`} className={r.rank === 1 ? "sell-live" : "sell-secondary"}>
+                  <td className="fz1"><span className={`strategy-tag ${r.strategy}`}>{r.strategy}</span></td>
+                  <td className="fz2"><span className="hint">{r.tierLabel} #{r.rank}</span></td>
+                  <td className="fz3"><BWSymbol symbol={r.symbol} stats={symStats?.symbols[r.symbol]} onOpen={setOpenSymbol} /></td>
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{num(r.underlying, 0)}</td>
+                  <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
+                  <td className="hint">{r.sideDesc}</td>
+                  <td className="hint">{r.positionDesc}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td className="move-up">{num(r.max_profit, 1)}</td>
+                  <td>{num(r.max_risk, 1)}</td>
+                  <td>{r.lot_size ?? "—"}</td>
+                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                  <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                  <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
+                </tr>
+              ))}
+              {!dailyFlat.length && <tr><td colSpan={14} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
+            </tbody>
+          </table>
         </div>
       </section>
-      {structure === "skew" ? <SkewStrategy /> : <BrokenWingStrategy />}
+
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title">
+          <h2>Signal history — returns per fired signal</h2>
+          <div className="panel-title-controls">
+            <label className="chk"><Coins size={15} />
+              <select value={filterStrategy} onChange={(e) => setFilterStrategy(e.target.value as "" | "BW" | "SIV")} style={{ minWidth: 130 }}>
+                <option value="">Both strategies</option>
+                <option value="BW">Broken-Wing</option>
+                <option value="SIV">IV Skew</option>
+              </select>
+            </label>
+            <label className="chk"><Coins size={15} />
+              <select value={filterSym} onChange={(e) => setFilterSym(e.target.value)} style={{ minWidth: 160 }}>
+                <option value="">All stocks</option>
+                {symbols.map((s) => <option key={s.symbol} value={s.symbol}>{s.symbol} ({GROUP_LABEL[s.group] ?? s.group})</option>)}
+              </select>
+            </label>
+            <MonthFilter months={months} value={filterMonth} onChange={setFilterMonth} />
+          </div>
+        </div>
+        {hs ? (
+          <div className="sell-bt">{hs.n} signals · win rate <b>{(hs.win_rate * 100).toFixed(0)}%</b> ·
+            median <b>{hs.median_ror_pct >= 0 ? "+" : ""}{hs.median_ror_pct}%</b> return-on-risk ·
+            worst trade <b>{hs.worst_ror_pct}%</b> · worst drawdown <b>{hs.worst_dd_pct}%</b> of risk
+            {!filterMonth && histRowsAll.length > histRows.length ? <span className="hint"> · showing the most recent {histRows.length} of {histRowsAll.length} — pick a month to see more</span> : null}</div>
+        ) : null}
+        <div className="table-wrap">
+          <table className="freeze-cols">
+            <thead><tr>
+              <SortTh className="fz1" label="Strategy" sortKey="strategy" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh className="fz2" label="Signal date" sortKey="signal_date" sort={histSort.sort} onSort={histSort.onSort} />
+              {allSyms ? <SortTh className="fz3" label="Symbol" sortKey="symbol" sort={histSort.sort} onSort={histSort.onSort} /> : null}
+              <th>Tier</th>
+              <SortTh label="Exp / DTE" sortKey="dte" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="IV" sortKey="iv_ratio" sort={histSort.sort} onSort={histSort.onSort} />
+              <th>Position</th>
+              <SortTh label="Credit" sortKey="credit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max profit" sortKey="max_profit" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk" sortKey="max_risk" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Lot size" sortKey="lot_size" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Exit value" sortKey="exit_value" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="PnL/lot" sortKey="pnl_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Ret/risk" sortKey="ror_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max DD" sortKey="max_dd_pct" sort={histSort.sort} onSort={histSort.onSort} />
+              <th></th>
+            </tr></thead>
+            <tbody>
+              {histSort.sorted.map((r, i) => (
+                <tr key={`${r.strategy}-${r.symbol}-${r.signal_date}-${i}`}>
+                  <td className="fz1"><span className={`strategy-tag ${r.strategy}`}>{r.strategy}</span></td>
+                  <td className="fz2">{r.signal_date}</td>
+                  {allSyms ? <td className="fz3"><SymbolLink symbol={r.symbol} onOpen={setOpenSymbol} /> <span className="hint">{r.group.slice(0, 1)}</span></td> : null}
+                  <td className="hint">{MERGED_TIER_LABEL[r.tierId] ?? r.tierId}</td>
+                  <td>{r.expiry.slice(5)} · {r.dte}d</td>
+                  <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
+                  <td className="hint">{r.positionDesc}</td>
+                  <td>{num(r.credit, 1)}</td>
+                  <td className="move-up">{num(r.max_profit, 1)}</td>
+                  <td>{num(r.max_risk, 1)}</td>
+                  <td>{r.lot_size ?? "—"}</td>
+                  <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
+                  <td>{num(r.exit_value, 1)}</td>
+                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                    {r.pnl_per_lot != null
+                      ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
+                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                  </td>
+                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
+                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                </tr>
+              ))}
+              {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
     </>
   );
 }
@@ -1694,7 +1945,32 @@ function BrokenWingStrategy() {
   );
 }
 
-// ----------------------------------------------------------------- Skew Strategy (directional leg)
+// Tiered skew response shape (mirrors BWTier/BWResp, but with skew's row shape)
+type SkewTierRow = {
+  symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
+  side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number;
+  short_strike: number; long_strike: number; sell_premium: number; buy_premium: number;
+  credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
+  max_profit: number; max_profit_per_lot: number | null;
+  ror_pct: number; breakeven: number; in_window: boolean;
+};
+type SkewTierBacktest = { window: string; win_rate: number; median_pnl_per_lot: number; per_year: number; pct_trades_over_10k: number; note: string };
+type SkewTier = { id: string; label: string; wing: number; fired_today: boolean; backtest: SkewTierBacktest; candidates: SkewTierRow[]; top_picks: SkewTierRow[] };
+type SkewTieredResp = { as_of: string | null; params: Record<string, number>; excluded_by_broken_wing: string[]; tiers: SkewTier[] };
+type SkewTieredHistRow = {
+  tier: string; symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
+  side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number; short_strike: number; long_strike: number;
+  sell_premium: number; buy_premium: number;
+  credit: number; max_risk: number; max_profit: number;
+  lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
+  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+};
+type SkewTieredHist = {
+  rows: SkewTieredHistRow[];
+  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+};
+
+// ----------------------------------------------------------------- Skew Strategy (directional leg) -- LEGACY, unused (merged into MergedSellSignals above)
 type SkewRow = {
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number;

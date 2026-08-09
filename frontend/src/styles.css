@@ -400,6 +400,16 @@ table.freeze-cols td.fz1, table.freeze-cols td.fz2, table.freeze-cols td.fz3 { b
 table.freeze-cols tr.sell-live td.fz1, table.freeze-cols tr.sell-live td.fz2, table.freeze-cols tr.sell-live td.fz3 { background: #f2f8f6; }
 table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right: 1px solid #d8dfdb; }
 
+.strategy-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+.strategy-tag.BW { background: #eef6f3; color: #167c80; }
+.strategy-tag.SIV { background: #fdf3e3; color: #b8791a; }
+
 .cash-signal-tag {
   display: inline-block;
   padding: 2px 8px;
@@ -703,6 +713,8 @@ tr.sell-secondary td {
   .cash-signal-tag.breakout { background: #17281f; color: #4fd18a; }
   .cash-signal-tag.breakdown { background: #2c1717; color: #ef8080; }
   .cash-signal-tag.consolidation { background: #1f2a26; color: #9fb0aa; }
+  .strategy-tag.BW { background: #17281f; color: #4fd1c5; }
+  .strategy-tag.SIV { background: #2c2417; color: #e0a848; }
 }
 
 .symbol-link {
