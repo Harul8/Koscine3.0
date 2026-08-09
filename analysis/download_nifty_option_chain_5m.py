@@ -49,40 +49,58 @@ ROOT = Path(r"C:\Users\rahul\Koscine 3.0")
 V2_BASE = "https://api.upstox.com/v2"
 DEFAULT_INSTRUMENT = "NSE_INDEX|Nifty 50"
 MAX_CHUNK_DAYS = 20        # same safe margin as the index downloader (Upstox's ~30-day cap is unreliable)
-RATE_LIMIT_SLEEP = 0.15    # ~6-7 req/s -- comfortably under the ~7.5 req/s burst tested with zero failures
+RATE_LIMIT_SLEEP = 0.4     # ~2.5 req/s -- the 0.15s (~6.7 req/s) rate looked safe in a short burst test
+                            # but over a sustained multi-hour run tripped Upstox's real quota heavily
+                            # (many expiries saw 30-60% chunk failure rates); Upstox's rate limit is
+                            # evidently a sustained/rolling quota, not just a burst guard -- back off hard
 LOOKBACK_DAYS = 50         # how far before expiry to start looking for candles (covers monthly contracts
                             # listed weeks in advance; early empty chunks are cheap and expected)
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 NETWORK_RETRIES = 4        # transient connection resets (Cloudflare closing connections under sustained
                             # request volume) are common on long unattended runs -- retry with backoff
                             # before surfacing, separately from the HTTPError/RuntimeError (API error) path
+RATE_LIMIT_RETRIES = 6     # HTTP 429 gets its own, longer retry budget -- a sub-3s backoff (as used for
+                            # generic retryable errors) is nowhere near enough to clear a per-minute quota
 
 
-RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}  # rate-limit / transient server errors -- worth
-                                                    # retrying; anything else (404, 401, ...) is a
-                                                    # permanent response and should surface immediately
+SERVER_ERROR_CODES = {500, 502, 503, 504}  # transient server-side errors -- short backoff is fine
 
 
 def _get(url: str, token: str) -> dict:
     req = Request(url, headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": UA})
     last_exc: Exception | None = None
-    for attempt in range(NETWORK_RETRIES):
+    rate_limit_attempt = 0
+    attempt = 0
+    while attempt < NETWORK_RETRIES and rate_limit_attempt < RATE_LIMIT_RETRIES:
         try:
             with urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            if exc.code in RETRYABLE_HTTP_CODES and attempt < NETWORK_RETRIES - 1:
+            if exc.code == 429:
+                # a per-minute-scale quota, not a burst guard -- honor Retry-After if Upstox sends
+                # one, otherwise back off on a scale of seconds-to-tens-of-seconds, not sub-3s
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else min(3 * (2 ** rate_limit_attempt), 60)
+                rate_limit_attempt += 1
+                if rate_limit_attempt < RATE_LIMIT_RETRIES:
+                    last_exc = exc
+                    time.sleep(wait)
+                    continue
+                raise RuntimeError(f"GET {url} failed: HTTP 429 after {RATE_LIMIT_RETRIES} attempts: {detail}") from exc
+            if exc.code in SERVER_ERROR_CODES and attempt < NETWORK_RETRIES - 1:
                 last_exc = exc
-                time.sleep(0.5 * (attempt + 1))
+                attempt += 1
+                time.sleep(0.5 * attempt)
                 continue
             raise RuntimeError(f"GET {url} failed: HTTP {exc.code}: {detail}") from exc
         except (URLError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout, socket.error) as exc:
             # transient network-level failure (e.g. WinError 10054 connection reset) -- not an
             # API error response, so it's not wrapped as RuntimeError; retry with backoff instead
             last_exc = exc
-            if attempt < NETWORK_RETRIES - 1:
-                time.sleep(0.5 * (attempt + 1))
+            attempt += 1
+            if attempt < NETWORK_RETRIES:
+                time.sleep(0.5 * attempt)
                 continue
             raise RuntimeError(f"GET {url} failed: network error after {NETWORK_RETRIES} attempts: {exc}") from exc
     raise RuntimeError(f"GET {url} failed: unreachable") from last_exc
