@@ -58,6 +58,11 @@ NETWORK_RETRIES = 4        # transient connection resets (Cloudflare closing con
                             # before surfacing, separately from the HTTPError/RuntimeError (API error) path
 
 
+RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}  # rate-limit / transient server errors -- worth
+                                                    # retrying; anything else (404, 401, ...) is a
+                                                    # permanent response and should surface immediately
+
+
 def _get(url: str, token: str) -> dict:
     req = Request(url, headers={"Accept": "application/json", "Authorization": f"Bearer {token}", "User-Agent": UA})
     last_exc: Exception | None = None
@@ -67,6 +72,10 @@ def _get(url: str, token: str) -> dict:
                 return json.loads(resp.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code in RETRYABLE_HTTP_CODES and attempt < NETWORK_RETRIES - 1:
+                last_exc = exc
+                time.sleep(0.5 * (attempt + 1))
+                continue
             raise RuntimeError(f"GET {url} failed: HTTP {exc.code}: {detail}") from exc
         except (URLError, ConnectionResetError, ConnectionAbortedError, TimeoutError, socket.timeout, socket.error) as exc:
             # transient network-level failure (e.g. WinError 10054 connection reset) -- not an
@@ -99,18 +108,31 @@ def _chunks_desc(start: date, end: date, days: int) -> list[tuple[date, date]]:
     return out
 
 
-def fetch_contract_candles(token: str, expired_key: str, expiry: date) -> pd.DataFrame:
-    """1-minute candles for one expired contract's whole plausible life, resampled to 5-min."""
+def fetch_contract_candles(token: str, expired_key: str, expiry: date) -> tuple[pd.DataFrame, int, int]:
+    """1-minute candles for one expired contract's whole plausible life, resampled to 5-min.
+    Returns (bars5, n_chunks_failed, n_chunks_ok). A failed chunk (request error surviving
+    _get's internal retries -- e.g. a sustained rate-limit window) is NOT the same thing as a
+    genuinely empty chunk (successful call, contract just wasn't trading yet) -- conflating the
+    two silently swallows real data loss as "past the data cutoff". Failures are logged and
+    counted so the caller can decide whether the whole contract/expiry is trustworthy, but the
+    backward walk still treats a failure like an empty chunk for the purposes of the
+    stop-after-2-consecutive-empties heuristic (retrying indefinitely here would stall the run --
+    the failure count is what protects data integrity, not this loop)."""
     start = expiry - timedelta(days=LOOKBACK_DAYS)
     frames = []
     empty_run = 0
+    n_failed = 0
+    n_ok = 0
     for d_from, d_to in _chunks_desc(start, expiry, MAX_CHUNK_DAYS):
         key = quote(expired_key, safe="")
         url = f"{V2_BASE}/expired-instruments/historical-candle/{key}/1minute/{d_to.isoformat()}/{d_from.isoformat()}"
         try:
             candles = (_get(url, token).get("data") or {}).get("candles") or []
-        except RuntimeError:
+            n_ok += 1
+        except RuntimeError as exc:
             candles = []
+            n_failed += 1
+            print(f"    chunk fetch error {expired_key} {d_from}..{d_to}: {exc}", flush=True)
         time.sleep(RATE_LIMIT_SLEEP)
         if candles:
             empty_run = 0
@@ -119,14 +141,14 @@ def fetch_contract_candles(token: str, expired_key: str, expiry: date) -> pd.Dat
             frames.append(df)
         else:
             empty_run += 1
-            if empty_run >= 2:   # 2 consecutive empty chunks walking backward = before contract's first trade
+            if empty_run >= 2:   # 2 consecutive empty/failed chunks walking backward = before contract's first trade
                 break
     if not frames:
-        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "oi"]), n_failed, n_ok
     bars = pd.concat(frames, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp").set_index("timestamp")
     agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum", "oi": "last"}
     bars5 = bars.resample("5min", label="left", closed="left").agg(agg).dropna(subset=["open"]).reset_index()
-    return bars5
+    return bars5, n_failed, n_ok
 
 
 def _load_spot() -> pd.DataFrame | None:
@@ -221,21 +243,38 @@ def main() -> None:
             continue
         time.sleep(RATE_LIMIT_SLEEP)
         leg_rows = []
+        expiry_failed_chunks = 0
+        expiry_ok_chunks = 0
         for c in contracts:
-            bars5 = fetch_contract_candles(token, c["instrument_key"], expiry)
+            bars5, n_failed, n_ok = fetch_contract_candles(token, c["instrument_key"], expiry)
             leg_rows.append((c, bars5))
+            expiry_failed_chunks += n_failed
+            expiry_ok_chunks += n_ok
         total_contracts += len(contracts)
         chain_df = _pivot_to_chain(leg_rows, expiry_str, spot)
-        if not chain_df.empty:
+        fail_rate = expiry_failed_chunks / max(1, expiry_failed_chunks + expiry_ok_chunks)
+        # a nonzero-but-small failure rate is normal noise (a handful of chunks may genuinely
+        # exhaust retries); a high rate means a sustained bad window (rate limit, outage) likely
+        # produced a chain that LOOKS complete but is silently missing real data -- refuse to
+        # checkpoint it as done so the next run retries this expiry from scratch instead
+        FAIL_RATE_THRESHOLD = 0.05
+        if fail_rate > FAIL_RATE_THRESHOLD:
+            print(f"  [{ei+1}/{len(expiries)}] {expiry_str}: SKIPPED writing output, {expiry_failed_chunks}/"
+                  f"{expiry_failed_chunks + expiry_ok_chunks} chunk requests failed ({fail_rate:.0%}) -- "
+                  f"likely a sustained bad window, will retry this expiry next run", flush=True)
+        elif not chain_df.empty:
             chain_df.to_parquet(out_path, index=False)
             total_rows += len(chain_df)
             elapsed_min = (time.time() - t0) / 60
             n_strikes = chain_df["strike"].nunique()
+            fail_note = f", {expiry_failed_chunks} chunk failures tolerated" if expiry_failed_chunks else ""
             print(f"  [{ei+1}/{len(expiries)}] {expiry_str}: {len(contracts)} contracts -> {n_strikes} strikes, "
                   f"{len(chain_df):,} chain rows -> {out_path.name}  ({elapsed_min:.1f}min elapsed, "
-                  f"{total_rows:,} rows total)", flush=True)
+                  f"{total_rows:,} rows total{fail_note})", flush=True)
         else:
-            print(f"  [{ei+1}/{len(expiries)}] {expiry_str}: {len(contracts)} contracts, no candle data returned", flush=True)
+            print(f"  [{ei+1}/{len(expiries)}] {expiry_str}: {len(contracts)} contracts, no candle data returned "
+                  f"({expiry_failed_chunks} chunk failures, {expiry_ok_chunks} ok -- likely genuinely before this "
+                  f"expiry's contracts started trading, or entirely past the data cutoff)", flush=True)
 
     print(f"[option_chain_5m] done: {total_contracts:,} contracts scanned, {total_rows:,} chain rows written "
           f"across {len(expiries)} expiries -> {out_dir}", flush=True)
