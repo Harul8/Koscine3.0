@@ -1006,6 +1006,68 @@ def prod2_cash_signal_history(signal_type: str | None = None, symbol: str | None
     return {"rows": _records(df), "summary": summary}
 
 
+NIFTY_INTRADAY_LOCK = LM_LOCK_V2.parent / "prod_nifty_intraday"
+_NIFTY_5M_CACHE: dict = {"mtime": None, "df": None}
+
+
+def _nifty_5m() -> pd.DataFrame:
+    """Cached native 5-min NIFTY 50 index OHLC, mtime-invalidated like _market_ohlc()."""
+    f = PROJECT_ROOT / "data" / "intraday" / "nifty_5m.parquet"
+    if not f.exists():
+        return pd.DataFrame()
+    mt = os.path.getmtime(f)
+    if _NIFTY_5M_CACHE["mtime"] != mt:
+        df = pd.read_parquet(f)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        _NIFTY_5M_CACHE.update(mtime=mt, df=df)
+    return _NIFTY_5M_CACHE["df"]
+
+
+def _nifty_intraday_signals() -> dict:
+    data = _read_json(NIFTY_INTRADAY_LOCK / "signals.json")
+    if not data:
+        return {"as_of": None, "horizon_bars": None, "entry_quantile": None, "p_cutoff": None,
+                 "exit_rule": None, "backtest_summary": None, "trades": []}
+    return data
+
+
+@app.get("/prod2/nifty_intraday_dates")
+def prod2_nifty_intraday_dates() -> dict[str, object]:
+    """Dates with at least one NIFTY intraday breakout trade -- feeds the Indices tab's
+    date picker. Built offline by experiments/nifty_intraday_breakout_v1/gen_indices_signals.py."""
+    data = _nifty_intraday_signals()
+    dates = sorted({t["date"] for t in data.get("trades", [])}, reverse=True)
+    return {"dates": dates}
+
+
+@app.get("/prod2/nifty_intraday_bars")
+def prod2_nifty_intraday_bars(date: str = Query(...)) -> dict[str, object]:
+    """5-min NIFTY OHLC for one trading day (YYYY-MM-DD), read straight from
+    data/intraday/nifty_5m.parquet -- this is intentionally a separate read from
+    nifty_intraday_signals so a future live 5-min poller only has to replace this one
+    function, not the signals/markers path."""
+    df = _nifty_5m()
+    if df.empty:
+        return {"date": date, "bars": []}
+    day = df[df["timestamp"].dt.date.astype(str) == date].sort_values("timestamp")
+    bars = [{"ts": r.timestamp.isoformat(), "open": float(r.open), "high": float(r.high),
+             "low": float(r.low), "close": float(r.close)} for r in day.itertuples()]
+    return {"date": date, "bars": bars}
+
+
+@app.get("/prod2/nifty_intraday_signals")
+def prod2_nifty_intraday_signals(date: str | None = None) -> dict[str, object]:
+    """NIFTY intraday breakout trade marker(s) (entry/exit timestamp+price) for one date, or
+    all dates if omitted, plus the overall backtest_summary (win rate / avg P&L / n). Built
+    offline by experiments/nifty_intraday_breakout_v1/gen_indices_signals.py -- see that
+    script's EXIT_RULE constant for which exit policy is currently live."""
+    data = _nifty_intraday_signals()
+    trades = data.get("trades", [])
+    if date:
+        trades = [t for t in trades if t["date"] == date]
+    return {**data, "trades": trades}
+
+
 @app.get("/prod2/price_history")
 def prod2_price_history(symbol: str, days: int = Query(default=400, ge=20, le=4000)) -> dict[str, object]:
     """Daily price (close/high/low) for a symbol with pick markers + the ATM option premium OHLC per pick."""

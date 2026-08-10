@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, Waves, X } from "lucide-react";
+import { Activity, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, Waves, X } from "lucide-react";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
@@ -53,6 +53,7 @@ function MonthFilter({ months, value, onChange }: { months: string[]; value: str
 const TABS = [
   { id: "sell", label: "Sell Signals", icon: <Coins size={16} /> },
   { id: "cash", label: "Cash Signals", icon: <Waves size={16} /> },
+  { id: "indices", label: "Indices", icon: <Activity size={16} /> },
   { id: "desk", label: "Buy Signals", icon: <Flame size={16} /> },
   { id: "movers", label: "Universe", icon: <Filter size={16} /> },
   { id: "price", label: "Chart", icon: <LineChart size={16} /> },
@@ -103,6 +104,7 @@ export default function App() {
       </nav>
       {tab === "sell" && <SellSignalsTab />}
       {tab === "cash" && <CashSignals />}
+      {tab === "indices" && <IndicesSignals />}
       {tab === "desk" && <SignalDesk {...props} />}
       {tab === "movers" && <DailyMovers {...props} />}
       {tab === "price" && <PriceHistory {...props} initialSymbol={initialSymbol} />}
@@ -2420,6 +2422,249 @@ function CashSignals() {
         </div>
       </section>
       {openSymbol && <ChartModal symbol={openSymbol} onClose={() => setOpenSymbol(null)} />}
+    </>
+  );
+}
+
+// ----------------------------------------------------------------- Indices (NIFTY intraday breakout)
+type IntradayBar = { ts: string; open: number; high: number; low: number; close: number };
+type IntradayTrade = {
+  date: string; entry_ts: string; exit_ts: string;
+  entry_underlying: number; exit_underlying: number | null;
+  straddle_entry: number; straddle_exit: number; pnl_pct: number; exit_reason: string;
+};
+type IntradaySignalsResp = {
+  as_of: string | null; horizon_bars: number | null; entry_quantile: number | null; p_cutoff: number | null; exit_rule: string | null;
+  backtest_summary: { n: number; win_rate: number; avg_pnl_pct: number; median_pnl_pct: number; worst_pnl_pct: number } | null;
+  trades: IntradayTrade[];
+};
+
+// Native 5-min NIFTY candles for ONE trading day, with entry/exit markers for that day's
+// fired trade(s). Forks Candles' SVG/scale/zoom-pan/tooltip skeleton (same hand-rolled-SVG
+// convention, no charting library) rather than overloading Candles with a new timeframe --
+// Candles' resample/srLevels/tick-label logic is date-string/day-granularity-specific and
+// a single trading day (~75 bars) doesn't need that machinery (no weekly S/R, no volume --
+// the raw index has none). Markers are new territory: `picked` elsewhere in this app is only
+// ever a *table* annotation, never drawn on a chart.
+function IntradayCandles({ series, trades }: { series: IntradayBar[]; trades: IntradayTrade[] }) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [win, setWin] = useState<{ s: number; e: number }>({ s: 0, e: series.length });
+  const [sel, setSel] = useState<number | null>(null);
+  useEffect(() => { setWin({ s: 0, e: series.length }); setSel(null); }, [series]);
+
+  const W = 900, H = 340, padX = 40, padTop = 14, padBot = 34;
+  const total = series.length;
+  const s = Math.max(0, Math.min(win.s, Math.max(0, total - 2)));
+  const e = Math.max(s + 2, Math.min(win.e, total));
+  const vis = series.slice(s, e);
+  const n = vis.length;
+  const slot = n > 0 ? (W - 2 * padX) / n : 0;
+  const cw = Math.max(1, Math.min(10, slot * 0.7));
+  const x = (i: number) => padX + slot * (i + 0.5);
+  const idxOf = (ts: string) => series.findIndex((b) => b.ts === ts);
+
+  useEffect(() => {
+    const node = wrapRef.current;
+    if (!node) return;
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      const rect = node.getBoundingClientRect();
+      const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const cursorIdx = s + frac * n;
+      const factor = ev.deltaY < 0 ? 0.82 : 1.22;
+      let width = Math.round(n * factor);
+      width = Math.max(6, Math.min(total, width));
+      let ns = Math.round(cursorIdx - frac * width);
+      ns = Math.max(0, Math.min(total - width, ns));
+      setWin({ s: ns, e: ns + width });
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => node.removeEventListener("wheel", onWheel);
+  }, [s, n, total]);
+
+  if (total < 2) return <span className="hint">No data</span>;
+
+  const rawHi = Math.max(...vis.map((p) => p.high), ...trades.map((t) => Math.max(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
+  const rawLo = Math.min(...vis.map((p) => p.low), ...trades.map((t) => Math.min(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
+  const pad = (rawHi - rawLo) * 0.06 || 1;
+  const hi = rawHi + pad, lo = rawLo - pad;
+  const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
+  const up = "#167c80", down = "#9a2431";
+  const atDefault = s === 0 && e === total;
+  const grid = niceTicks(lo, hi, 8);
+
+  const idxFromClientX = (clientX: number): number => {
+    const rect = wrapRef.current!.getBoundingClientRect();
+    const svgX = ((clientX - rect.left) / rect.width) * W;
+    return Math.max(0, Math.min(n - 1, Math.round((svgX - padX) / slot - 0.5)));
+  };
+
+  const step = Math.max(1, Math.ceil(n / 10));
+  const ticks: number[] = [];
+  for (let i = 0; i < n; i += step) ticks.push(i);
+  if (ticks[ticks.length - 1] !== n - 1) ticks.push(n - 1);
+
+  const hp = sel != null && sel < n ? vis[sel] : null;
+  const prevClose = hp != null ? series[s + sel! - 1]?.close : null;
+  const chgPct = hp != null && prevClose ? ((hp.close - prevClose) / prevClose) * 100 : null;
+  const tipLeftPct = sel != null ? (x(sel) / W) * 100 : 0;
+  const tipRight = tipLeftPct > 62;
+
+  return (
+    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
+         onClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}
+         onDoubleClick={() => { setWin({ s: 0, e: total }); setSel(null); }}>
+      <div className="candles-toolbar">
+        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin({ s: 0, e: total })}>Reset</button>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="spark">
+        {grid.map((g, gi) => (
+          <g key={`grid${gi}`}>
+            <line x1={padX} x2={W - padX} y1={y(g)} y2={y(g)} stroke="#e7ecea" strokeWidth={1} />
+            <text x={padX - 6} y={y(g) + 3} fontSize={10} fill="#8a978f" textAnchor="end">{num(g, 0)}</text>
+          </g>
+        ))}
+        {hp != null ? <line x1={x(sel!)} x2={x(sel!)} y1={padTop} y2={H - padBot} stroke="#b9c6c0" strokeWidth={1} strokeDasharray="3 3" /> : null}
+        {vis.map((p, i) => {
+          const rising = p.close >= p.open;
+          const color = rising ? up : down;
+          const yo = y(p.open), yc = y(p.close);
+          const top = Math.min(yo, yc), bh = Math.max(1, Math.abs(yc - yo));
+          return (
+            <g key={s + i}>
+              <line x1={x(i)} x2={x(i)} y1={y(p.high)} y2={y(p.low)} stroke={color} strokeWidth={1} />
+              <rect x={x(i) - cw / 2} y={top} width={cw} height={bh} fill={color} />
+            </g>
+          );
+        })}
+        {/* entry/exit trade markers: shaded band from entry to exit + ▲/▼ glyphs, colored by outcome */}
+        {trades.map((t, ti) => {
+          const ei = idxOf(t.entry_ts) - s, xi = idxOf(t.exit_ts) - s;
+          if (ei < 0 || ei >= n) return null;
+          const win_ = t.pnl_pct >= 0;
+          const color = win_ ? up : down;
+          const hasExit = xi >= 0 && xi < n;
+          return (
+            <g key={`trade${ti}`}>
+              {hasExit ? <rect x={x(ei)} y={padTop} width={Math.max(0, x(xi) - x(ei))} height={H - padTop - padBot}
+                               fill={color} opacity={0.07} /> : null}
+              <polygon points={`${x(ei)},${y(t.entry_underlying) - 9} ${x(ei) - 5},${y(t.entry_underlying) - 1} ${x(ei) + 5},${y(t.entry_underlying) - 1}`} fill={up} />
+              <text x={x(ei)} y={y(t.entry_underlying) - 12} fontSize={9} fill={up} textAnchor="middle">Entry</text>
+              {hasExit && t.exit_underlying != null ? (
+                <>
+                  <polygon points={`${x(xi)},${y(t.exit_underlying) + 9} ${x(xi) - 5},${y(t.exit_underlying) + 1} ${x(xi) + 5},${y(t.exit_underlying) + 1}`} fill={color} />
+                  <text x={x(xi)} y={y(t.exit_underlying) + 20} fontSize={9} fill={color} textAnchor="middle">
+                    {t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct.toFixed(1)}%
+                  </text>
+                </>
+              ) : null}
+            </g>
+          );
+        })}
+        {ticks.map((i) => (
+          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill="#60706a"
+                textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{vis[i].ts.slice(11, 16)}</text>
+        ))}
+      </svg>
+      {hp ? (
+        <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
+          <strong>{hp.ts.slice(11, 16)}</strong>
+          {chgPct != null ? (
+            <span>Chg <b style={{ color: chgPct >= 0 ? up : down }}>{chgPct >= 0 ? "+" : ""}{num(chgPct, 2)}%</b></span>
+          ) : null}
+          <span>O <b>{num(hp.open, 1)}</b></span>
+          <span>H <b>{num(hp.high, 1)}</b></span>
+          <span>L <b>{num(hp.low, 1)}</b></span>
+          <span>C <b style={{ color: hp.close >= hp.open ? up : down }}>{num(hp.close, 1)}</b></span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function IndicesSignals() {
+  const [dates, setDates] = useState<string[]>([]);
+  const [date, setDate] = useState<string>("");
+  const [bars, setBars] = useState<IntradayBar[]>([]);
+  const [signals, setSignals] = useState<IntradaySignalsResp | null>(null);
+
+  useEffect(() => {
+    getJson<{ dates: string[] }>("/prod2/nifty_intraday_dates").then((d) => {
+      setDates(d.dates);
+      if (d.dates.length) setDate(d.dates[0]);
+    }).catch(() => {});
+  }, []);
+  useEffect(() => {
+    getJson<IntradaySignalsResp>("/prod2/nifty_intraday_signals").then(setSignals).catch(() => setSignals(null));
+  }, []);
+  useEffect(() => {
+    if (!date) return;
+    getJson<{ date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars?date=${date}`)
+      .then((d) => setBars(d.bars)).catch(() => setBars([]));
+  }, [date]);
+
+  const dayTrades = useMemo(() => (signals?.trades ?? []).filter((t) => t.date === date), [signals, date]);
+  const bt = signals?.backtest_summary;
+
+  return (
+    <>
+      <section className="panel cockpit">
+        <div className="panel-title"><h2>Indices — NIFTY intraday breakout (long straddle)</h2>
+          <span>{signals?.exit_rule ? `exit: ${signals.exit_rule}` : "—"} · horizon {signals?.horizon_bars ?? "—"} bars</span></div>
+        <div className="sell-explain">
+          <div className="sell-rule">
+            <strong>Entry</strong> A direction-agnostic breakout model flags when NIFTY looks likely to move
+            more than usual over the next {signals?.horizon_bars ?? "N"} five-minute bars (30min–2hr). Since the
+            model predicts magnitude only, not direction, the trade is a long ATM straddle (buy the CE and PE
+            together) — matching what the model actually says, not an invented directional bet on top of it.
+          </div>
+          <div className="sell-rule"><strong>Exit</strong> {signals?.exit_rule ?? "not finalized yet"} — chosen from a
+            fixed-window exit-rule backtest (see experiments/nifty_intraday_breakout_v1/entry_exit_backtest.py);
+            every rule tested had to beat a plain hold-to-window baseline after costs.</div>
+          {bt ? (
+            <div className="sell-bt">{bt.n} historical trades · win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b> ·
+              mean <b>{bt.avg_pnl_pct >= 0 ? "+" : ""}{bt.avg_pnl_pct}%</b> / median <b>{bt.median_pnl_pct >= 0 ? "+" : ""}{bt.median_pnl_pct}%</b> ·
+              worst <b>{bt.worst_pnl_pct}%</b>
+              <span className="hint"> · net of an assumed 2% round-trip cost — this is research, not a validated live signal yet.</span></div>
+          ) : <div className="sell-bt"><span className="hint">No backtest results yet — run the experiment pipeline (see experiments/nifty_intraday_breakout_v1/README.md).</span></div>}
+        </div>
+        <div className="panel-title-controls" style={{ padding: "0 16px 8px" }}>
+          <label className="chk"><CalendarDays size={15} />
+            <select value={date} onChange={(e) => setDate(e.target.value)} style={{ minWidth: 140 }}>
+              {dates.length ? dates.map((d) => <option key={d} value={d}>{d}</option>) : <option value="">No signal dates yet</option>}
+            </select>
+          </label>
+        </div>
+        {bars.length ? <IntradayCandles series={bars} trades={dayTrades} /> : <p className="hint" style={{ padding: 16 }}>
+          {date ? "No 5-min bars for this date." : "Waiting for signals.json (run gen_indices_signals.py)."}</p>}
+      </section>
+
+      <section className="panel cockpit" style={{ marginTop: 14 }}>
+        <div className="panel-title"><h2>Trades — {date || "—"}</h2></div>
+        <div className="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Entry</th><th>Exit</th><th>Entry NIFTY</th><th>Exit NIFTY</th>
+              <th>Straddle entry</th><th>Straddle exit</th><th>PnL</th><th>Exit reason</th>
+            </tr></thead>
+            <tbody>
+              {dayTrades.map((t, i) => (
+                <tr key={i}>
+                  <td>{t.entry_ts.slice(11, 16)}</td>
+                  <td>{t.exit_ts.slice(11, 16)}</td>
+                  <td>{num(t.entry_underlying, 1)}</td>
+                  <td>{t.exit_underlying != null ? num(t.exit_underlying, 1) : "—"}</td>
+                  <td>{num(t.straddle_entry, 2)}</td>
+                  <td>{num(t.straddle_exit, 2)}</td>
+                  <td className={t.pnl_pct >= 0 ? "move-up" : "move-down"}>{t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct.toFixed(1)}%</td>
+                  <td className="hint">{t.exit_reason}</td>
+                </tr>
+              ))}
+              {!dayTrades.length && <tr><td colSpan={8} className="empty-cell">No trades on this date</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </>
   );
 }
