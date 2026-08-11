@@ -1081,11 +1081,14 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
     return () => node.removeEventListener("wheel", onWheel);
   }, [s, n, total]);
 
-  // keyboard: left/right arrows pan, up/down arrows zoom (ignored while typing in a field)
+  // keyboard: left/right arrows pan, up/down arrows zoom. Attached to the chart's own wrapper
+  // node (not `window`), so arrow keys only move THIS chart once it's been clicked into focus --
+  // not any time an arrow key is pressed anywhere on the page. `tabIndex` on the wrapper (below)
+  // is what makes it focusable.
   useEffect(() => {
+    const node = wrapRef.current;
+    if (!node) return;
     const onKey = (ev: KeyboardEvent) => {
-      const t = ev.target as HTMLElement | null;
-      if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
       if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(ev.key)) return;
       ev.preventDefault();
       if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
@@ -1101,8 +1104,8 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
         setWin({ s: ns, e: ns + w });
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    node.addEventListener("keydown", onKey);
+    return () => node.removeEventListener("keydown", onKey);
   }, [s, e, n, total]);
 
   if (total < 2) return <span className="hint">No data</span>;
@@ -1121,6 +1124,15 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
     const rect = wrapRef.current!.getBoundingClientRect();
     const svgX = ((clientX - rect.left) / rect.width) * W;
     return Math.max(0, Math.min(n - 1, Math.round((svgX - padX) / slot - 0.5)));
+  };
+
+  // toolbar ‹/› buttons: same pan-by-half-window step as the keyboard ArrowLeft/ArrowRight
+  // handler above, just a visible affordance for it.
+  const panBy = (dir: -1 | 1) => {
+    const width = e - s;
+    const panStep = Math.max(1, Math.round(width * 0.5));
+    if (dir < 0) { const ns = Math.max(0, s - panStep); setWin({ s: ns, e: ns + width }); }
+    else { const ne = Math.min(total, e + panStep); setWin({ s: ne - width, e: ne }); }
   };
 
   // x-axis: ~8 evenly spaced date labels across the visible window
@@ -1147,10 +1159,12 @@ function Candles({ series, weeklyFull, showLevels, minDDpct, defaultCandles }: {
   const vBarBottom = VH - vPadBot;
 
   return (
-    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
+    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }} tabIndex={0}
          onClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}
          onDoubleClick={() => { setWin(defWin(total)); setSel(null); }}>
       <div className="candles-toolbar">
+        <button type="button" title="Pan back" disabled={s <= 0} onClick={() => panBy(-1)}>‹</button>
+        <button type="button" title="Pan forward" disabled={e >= total} onClick={() => panBy(1)}>›</button>
         <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
@@ -2516,14 +2530,19 @@ function CashSignals() {
 
 // ----------------------------------------------------------------- Indices (NIFTY intraday breakout)
 type IntradayBar = { ts: string; open: number; high: number; low: number; close: number };
+// Spot-only (predicted vs realized move %), not a straddle-premium P&L trade -- the underlying
+// strategy is the regime-switching sell-spread/naked-buy off the live chain (see
+// production/nifty_live_poller.py); this replay just checks the model+exit-state-machine
+// against history, not a specific option structure's fill.
 type IntradayTrade = {
-  date: string; entry_ts: string; exit_ts: string;
+  date: string; entry_ts: string; exit_ts: string | null;
   entry_underlying: number; exit_underlying: number | null;
-  straddle_entry: number; straddle_exit: number; pnl_pct: number; exit_reason: string;
+  predicted_move_pct: number; realized_move_pct: number | null;
+  direction: "up" | "down" | null; exit_reason: string | null;
 };
 type IntradaySignalsResp = {
-  as_of: string | null; horizon_bars: number | null; entry_quantile: number | null; p_cutoff: number | null; exit_rule: string | null;
-  backtest_summary: { n: number; win_rate: number; avg_pnl_pct: number; median_pnl_pct: number; worst_pnl_pct: number } | null;
+  as_of: string | null; horizon_bars: number | null; move_threshold_pct: number | null; train_cutoff: string | null; exit_rule: string | null;
+  backtest_summary: { n: number; n_resolved: number; hit_rate: number; mean_abs_realized_move_pct: number; exit_reasons: Record<string, number> } | null;
   trades: IntradayTrade[];
 };
 type DailyBar = { date: string; open: number; high: number; low: number; close: number };
@@ -2564,15 +2583,29 @@ function idxTsOnOrAfter(bars: IntradayBar[], ts: string): number {
 // a single trading day (~75 bars) doesn't need that machinery (no weekly S/R, no volume --
 // the raw index has none). Markers are new territory: `picked` elsewhere in this app is only
 // ever a *table* annotation, never drawn on a chart.
-function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
-  series: IntradayBar[]; trades: IntradayTrade[]; tf: NiftyTF; dailyFull: IntradayBar[]; showIntradayZones: boolean;
+function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneSource, moveThresholdPct }: {
+  series: IntradayBar[]; trades: IntradayTrade[]; tf: NiftyTF;
+  dailyFull: IntradayBar[]; weeklyFull: IntradayBar[]; intraZoneSource: IntradayBar[];
+  moveThresholdPct: number;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
-  const [win, setWin] = useState<{ s: number; e: number }>({ s: 0, e: series.length });
+  const DEFAULT_TRAILING = 150;
+  const defWin = (len: number) => ({ s: Math.max(0, len - DEFAULT_TRAILING), e: len });
+  const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
   const [sel, setSel] = useState<number | null>(null);
-  useEffect(() => { setWin({ s: 0, e: series.length }); setSel(null); }, [series]);
+  useEffect(() => { setWin(defWin(series.length)); setSel(null); }, [series]);
   const intraday = tf === "5m" || tf === "15m";
-  const tickLabel = (ts: string) => (intraday ? ts.slice(11, 16) : ts.slice(5, 10));
+  const showIntraZones = intraday;
+  // On a multi-day 5m/15m chart, the session-open (09:15) bar shows its DATE instead of the time
+  // -- otherwise every day boundary just reads "09:15" with no way to tell which day it is.
+  const tickLabel = (ts: string) => {
+    if (!intraday) return ts.slice(5, 10);
+    return ts.slice(11, 16) === "09:15" ? ts.slice(5, 10) : ts.slice(11, 16);
+  };
+  // A tick is a DATE (vs. a time) only on the intraday 5m/15m views, at the 09:15 day-boundary
+  // bar -- colored blue so it visually stands out from the surrounding HH:MM time ticks.
+  const isDateTick = (ts: string) => intraday && ts.slice(11, 16) === "09:15";
+  const dateColor = "#2563b0";
 
   const W = 900, H = 340, padX = 40, padTop = 14, padBot = 34;
   const total = series.length;
@@ -2585,33 +2618,41 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
   const x = (i: number) => padX + slot * (i + 0.5);
   const idxOf = (ts: string) => series.findIndex((b) => b.ts === ts);
 
-  // Daily-based S/R zones (tol defaults to 2%, matching stock charts): computed from NIFTY's own
-  // daily OHLC history, scoped to never look past the last visible bar's date (or bar's day, for
-  // an intraday view) -- same no-lookahead discipline as Candles' weekly zones for stocks.
-  const lastVisibleDate = vis.length ? vis[vis.length - 1].ts.slice(0, 10) : null;
+  // Three S/R zone layers, each scoped to never look past the last visible bar's timestamp (no
+  // lookahead -- same discipline as Candles' weekly zones for stocks). Weekly/daily are solid,
+  // shown on every timeframe; the tight intraday layer (15-min bars, 0.10% cluster tolerance
+  // instead of stocks'/daily's/weekly's 2% -- NIFTY moves far less in absolute % terms within a
+  // session) is dotted and shown only on the 5m/15m views.
+  const lastVisibleTs = vis.length ? vis[vis.length - 1].ts : null;
+  const weeklyLevels = useMemo(() => {
+    if (!lastVisibleTs || weeklyFull.length < 5) return [];
+    const scoped = weeklyFull.filter((b) => b.ts <= lastVisibleTs);
+    if (scoped.length < 5) return [];
+    const pts = scoped.map(barToPricePoint);
+    const dd = computeAutoDD(pts) ?? 0.15;
+    let ath = -Infinity;
+    for (const p of pts) if (p.high > ath) ath = p.high;
+    return srLevels(pts, dd, ath);
+  }, [weeklyFull, lastVisibleTs]);
   const dailyLevels = useMemo(() => {
-    if (!lastVisibleDate || dailyFull.length < 5) return [];
-    const endIdx = dailyFull.findIndex((b) => b.ts.slice(0, 10) > lastVisibleDate);
-    const scoped = endIdx === -1 ? dailyFull : dailyFull.slice(0, endIdx);
+    if (!lastVisibleTs || dailyFull.length < 5) return [];
+    const scoped = dailyFull.filter((b) => b.ts <= lastVisibleTs);
     if (scoped.length < 5) return [];
     const pts = scoped.map(barToPricePoint);
     const dd = computeAutoDD(pts) ?? 0.10;
     let ath = -Infinity;
     for (const p of pts) if (p.high > ath) ath = p.high;
     return srLevels(pts, dd, ath);
-  }, [dailyFull, lastVisibleDate]);
-  // 5-min-based S/R zones: same srLevels() algorithm, but with a 0.10% cluster tolerance instead
-  // of stocks' 2% -- NIFTY moves in far tighter absolute % terms within a session than a stock
-  // does over weeks/months, so the stock-sized band would collapse the whole visible range into
-  // one giant zone. `dd` (genuine-pullback threshold) is scaled down to match (0.5% vs stocks'
-  // ~10-20%) for the same reason.
-  const intradayLevels = useMemo(() => {
-    if (!showIntradayZones || series.length < 5) return [];
-    const pts = series.map(barToPricePoint);
+  }, [dailyFull, lastVisibleTs]);
+  const intraZoneLevels = useMemo(() => {
+    if (!showIntraZones || !lastVisibleTs || intraZoneSource.length < 5) return [];
+    const scoped = intraZoneSource.filter((b) => b.ts <= lastVisibleTs);
+    if (scoped.length < 5) return [];
+    const pts = scoped.map(barToPricePoint);
     let ath = -Infinity;
     for (const p of pts) if (p.high > ath) ath = p.high;
     return srLevels(pts, 0.005, ath, 0.001);
-  }, [series, showIntradayZones]);
+  }, [intraZoneSource, lastVisibleTs, showIntraZones]);
 
   useEffect(() => {
     const node = wrapRef.current;
@@ -2632,15 +2673,59 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
     return () => node.removeEventListener("wheel", onWheel);
   }, [s, n, total]);
 
+  // keyboard: left/right arrows pan (10% of window per press), up/down zoom -- same convention
+  // as Candles (stock charts). Attached to the chart's own wrapper node (not `window`), so arrow
+  // keys only move THIS chart once it's been clicked into focus -- not any time an arrow key is
+  // pressed anywhere on the page. `tabIndex` on the wrapper (below) is what makes it focusable.
+  useEffect(() => {
+    const node = wrapRef.current;
+    if (!node) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(ev.key)) return;
+      ev.preventDefault();
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+        const width = e - s;
+        const step = Math.max(1, Math.round(width * 0.1));
+        if (ev.key === "ArrowLeft") { const ns = Math.max(0, s - step); setWin({ s: ns, e: ns + width }); }
+        else { const ne = Math.min(total, e + step); setWin({ s: ne - width, e: ne }); }
+      } else {
+        const factor = ev.key === "ArrowUp" ? 0.7 : 1.4;
+        const w = Math.max(6, Math.min(total, Math.round(n * factor)));
+        const mid = s + n / 2;
+        const ns = Math.max(0, Math.min(total - w, Math.round(mid - w / 2)));
+        setWin({ s: ns, e: ns + w });
+      }
+    };
+    node.addEventListener("keydown", onKey);
+    return () => node.removeEventListener("keydown", onKey);
+  }, [s, e, n, total]);
+
   if (total < 2) return <span className="hint">No data</span>;
 
-  const rawHi = Math.max(...vis.map((p) => p.high), ...trades.map((t) => Math.max(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
-  const rawLo = Math.min(...vis.map((p) => p.low), ...trades.map((t) => Math.min(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
+  // toolbar ‹/› buttons: pan by half the current window (a bigger "page" step than the arrow
+  // keys' 10%, for quickly moving across days at a glance).
+  const panBy = (dir: -1 | 1) => {
+    const width = e - s;
+    const step = Math.max(1, Math.round(width * 0.5));
+    if (dir < 0) { const ns = Math.max(0, s - step); setWin({ s: ns, e: ns + width }); }
+    else { const ne = Math.min(total, e + step); setWin({ s: ne - width, e: ne }); }
+  };
+
+  // Only trades whose entry OR exit marker actually falls in the visible window [s, e) should
+  // stretch the y-axis -- `trades` can span the whole loaded multi-day range (up to 30 trading
+  // days), and an off-screen trade from a very different price level was blowing the y-range out
+  // to fit a marker nobody can even see (auto-zoom must track what's ON SCREEN, not what's loaded).
+  const visTrades = trades.filter((t) => {
+    const ei = idxOf(t.entry_ts), xi = t.exit_ts ? idxOf(t.exit_ts) : -1;
+    return (ei >= s && ei < e) || (xi >= s && xi < e);
+  });
+  const rawHi = Math.max(...vis.map((p) => p.high), ...visTrades.map((t) => Math.max(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
+  const rawLo = Math.min(...vis.map((p) => p.low), ...visTrades.map((t) => Math.min(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
   const pad = (rawHi - rawLo) * 0.06 || 1;
   const hi = rawHi + pad, lo = rawLo - pad;
   const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
   const up = "#167c80", down = "#9a2431";
-  const atDefault = s === 0 && e === total;
+  const atDefault = s === Math.max(0, total - DEFAULT_TRAILING) && e === total;
   const grid = niceTicks(lo, hi, 8);
 
   const idxFromClientX = (clientX: number): number => {
@@ -2653,6 +2738,13 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
   const ticks: number[] = [];
   for (let i = 0; i < n; i += step) ticks.push(i);
   if (ticks[ticks.length - 1] !== n - 1) ticks.push(n - 1);
+  // explicitly include every day-boundary (09:15) bar as its own tick, so a multi-day 5m/15m
+  // chart always shows which day you're looking at, not just whichever evenly-spaced tick
+  // happens to land near it.
+  if (intraday) {
+    for (let i = 0; i < n; i++) if (vis[i].ts.slice(11, 16) === "09:15" && !ticks.includes(i)) ticks.push(i);
+    ticks.sort((a, b) => a - b);
+  }
 
   const hp = sel != null && sel < n ? vis[sel] : null;
   const prevClose = hp != null ? series[s + sel! - 1]?.close : null;
@@ -2661,11 +2753,13 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
   const tipRight = tipLeftPct > 62;
 
   return (
-    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }}
+    <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }} tabIndex={0}
          onClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}
-         onDoubleClick={() => { setWin({ s: 0, e: total }); setSel(null); }}>
+         onDoubleClick={() => { setWin(defWin(total)); setSel(null); }}>
       <div className="candles-toolbar">
-        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin({ s: 0, e: total })}>Reset</button>
+        <button type="button" title="Pan back" disabled={s <= 0} onClick={() => panBy(-1)}>‹</button>
+        <button type="button" title="Pan forward" disabled={e >= total} onClick={() => panBy(1)}>›</button>
+        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
       </div>
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
         {grid.map((g, gi) => (
@@ -2687,31 +2781,47 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
             </g>
           );
         })}
-        {/* entry/exit trade markers: shaded band from entry to exit + ▲/▼ glyphs, colored by outcome */}
+        {/* entry/exit trade markers: shaded band from entry to exit + ▲/▼ glyphs, colored by
+            whether the realized move hit the predicted-move threshold (not premium P&L --
+            this replay checks the model+exit state machine, not a specific option fill) */}
         {trades.map((t, ti) => {
-          const ei = idxOf(t.entry_ts) - s, xi = idxOf(t.exit_ts) - s;
+          const ei = idxOf(t.entry_ts) - s;
           if (ei < 0 || ei >= n) return null;
-          const win_ = t.pnl_pct >= 0;
-          const color = win_ ? up : down;
-          const hasExit = xi >= 0 && xi < n;
+          const hasExit = t.exit_ts != null && t.exit_underlying != null;
+          const xi = hasExit ? idxOf(t.exit_ts!) - s : -1;
+          const hit = t.realized_move_pct != null && Math.abs(t.realized_move_pct) >= moveThresholdPct;
+          const color = hit ? up : down;
+          const xiVis = xi >= 0 && xi < n;
           return (
             <g key={`trade${ti}`}>
-              {hasExit ? <rect x={x(ei)} y={padTop} width={Math.max(0, x(xi) - x(ei))} height={H - padTop - padBot}
-                               fill={color} opacity={0.07} /> : null}
+              {xiVis ? <rect x={x(ei)} y={padTop} width={Math.max(0, x(xi) - x(ei))} height={H - padTop - padBot}
+                             fill={color} opacity={0.07} /> : null}
               <polygon points={`${x(ei)},${y(t.entry_underlying) - 9} ${x(ei) - 5},${y(t.entry_underlying) - 1} ${x(ei) + 5},${y(t.entry_underlying) - 1}`} fill={up} />
               <text x={x(ei)} y={y(t.entry_underlying) - 12} fontSize={9} fill={up} textAnchor="middle">Entry</text>
-              {hasExit && t.exit_underlying != null ? (
+              {xiVis && t.exit_underlying != null ? (
                 <>
                   <polygon points={`${x(xi)},${y(t.exit_underlying) + 9} ${x(xi) - 5},${y(t.exit_underlying) + 1} ${x(xi) + 5},${y(t.exit_underlying) + 1}`} fill={color} />
                   <text x={x(xi)} y={y(t.exit_underlying) + 20} fontSize={9} fill={color} textAnchor="middle">
-                    {t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct.toFixed(1)}%
+                    {t.realized_move_pct != null ? `${t.realized_move_pct >= 0 ? "+" : ""}${t.realized_move_pct.toFixed(2)}%` : "—"}
                   </text>
                 </>
               ) : null}
             </g>
           );
         })}
-        {/* daily-based S/R zones (only those within the visible price range) */}
+        {/* weekly-based S/R zones (solid) -- always shown, on every timeframe */}
+        {weeklyLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
+          const color = L.kind === "ATH" ? "#2563b0" : "#5c4a9e";
+          const relIdx = idxTsOnOrAfter(series, L.firstDate) - s;
+          const xStart = Math.min(W - padX, Math.max(padX, x(relIdx)));
+          return (
+            <g key={`wlv${li}`}>
+              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
+              <text x={W - padX - 4} y={y(L.price) - 3} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (W)</text>
+            </g>
+          );
+        })}
+        {/* daily-based S/R zones (solid) -- always shown, on every timeframe */}
         {dailyLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
           const color = L.kind === "ATH" ? "#2563b0" : "#33443d";
           const relIdx = idxTsOnOrAfter(series, L.firstDate) - s;
@@ -2719,31 +2829,32 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
           return (
             <g key={`dlv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
-              <text x={W - padX - 4} y={y(L.price) - 3} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches}</text>
+              <text x={W - padX - 4} y={y(L.price) + 10} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (D)</text>
             </g>
           );
         })}
-        {/* 5-min-based S/R zones (0.10% tolerance), dashed + distinct color so they read as a
-            separate, tighter-timeframe layer from the daily zones above */}
-        {intradayLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
+        {/* 15-min-based S/R zones (0.10% tolerance), dotted + distinct color -- only on 5m/15m
+            views, where a tight intraday zone actually means something (see showIntraZones) */}
+        {intraZoneLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
           const color = L.kind === "ATH" ? "#2563b0" : "#a3651f";
           const relIdx = idxTsOnOrAfter(series, L.firstDate) - s;
           const xStart = Math.min(W - padX, Math.max(padX, x(relIdx)));
           return (
             <g key={`ilv${li}`}>
-              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.6} strokeDasharray="4 3" />
-              <text x={W - padX - 4} y={y(L.price) + 10} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (5m)</text>
+              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.6} strokeDasharray="2 3" />
+              <text x={W - padX - 4} y={y(L.price) + 21} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (15m)</text>
             </g>
           );
         })}
         {ticks.map((i) => (
-          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill="#60706a"
+          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill={isDateTick(vis[i].ts) ? dateColor : "#60706a"}
+                fontWeight={isDateTick(vis[i].ts) ? 700 : 400}
                 textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{tickLabel(vis[i].ts)}</text>
         ))}
       </svg>
       {hp ? (
         <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
-          <strong>{tickLabel(hp.ts)}</strong>
+          <strong style={isDateTick(hp.ts) ? { color: dateColor } : undefined}>{tickLabel(hp.ts)}</strong>
           {chgPct != null ? (
             <span>Chg <b style={{ color: chgPct >= 0 ? up : down }}>{chgPct >= 0 ? "+" : ""}{num(chgPct, 2)}%</b></span>
           ) : null}
@@ -2757,74 +2868,102 @@ function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
   );
 }
 
+// "YYYY-MM" -> "August 2026", for the date dropdown's month optgroups.
+function monthLabel(ym: string): string {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, 1)).toLocaleString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+}
+
 function IndicesSignals() {
-  const [dates, setDates] = useState<string[]>([]);
   const [date, setDate] = useState<string>("");
-  const [bars5m, setBars5m] = useState<IntradayBar[]>([]);
+  const [bars5mRange, setBars5mRange] = useState<IntradayBar[]>([]);
   const [dailyBars, setDailyBars] = useState<IntradayBar[]>([]);
   const [signals, setSignals] = useState<IntradaySignalsResp | null>(null);
   const [tf, setTf] = useState<NiftyTF>("5m");
 
   useEffect(() => {
-    getJson<{ dates: string[] }>("/prod2/nifty_intraday_dates").then((d) => {
-      setDates(d.dates);
-      if (d.dates.length) setDate(d.dates[0]);
-    }).catch(() => {});
-  }, []);
-  useEffect(() => {
     getJson<IntradaySignalsResp>("/prod2/nifty_intraday_signals").then(setSignals).catch(() => setSignals(null));
   }, []);
-  useEffect(() => {
-    if (!date) return;
-    getJson<{ date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars?date=${date}`)
-      .then((d) => setBars5m(d.bars)).catch(() => setBars5m([]));
-  }, [date]);
-  // NIFTY's own daily OHLC (years of history) -- feeds the 1D/1W timeframe views and the
-  // daily-based S/R zone layer shown on every timeframe. Fetched once, independent of `date`/`tf`.
+  // NIFTY's own daily OHLC (years of history) -- feeds the 1D/1W timeframe views, the date
+  // dropdown (ALL trading days, not just days a signal fired), and the daily/weekly S/R zone
+  // layers shown on every timeframe. Fetched once, independent of `date`/`tf`.
   useEffect(() => {
     getJson<{ bars: DailyBar[] }>("/prod2/nifty_daily_bars?days=2500")
       .then((d) => setDailyBars(d.bars.map((b) => ({ ts: b.date, open: b.open, high: b.high, low: b.low, close: b.close }))))
       .catch(() => setDailyBars([]));
   }, []);
+  // Default the date picker to the latest available trading day once daily bars load.
+  useEffect(() => { if (dailyBars.length && !date) setDate(dailyBars[dailyBars.length - 1].ts); }, [dailyBars, date]);
+  // 30 trailing trading days of 5-min bars ENDING at the selected date (never past it) -- enough
+  // for a 150-trailing-candle 5m/15m view plus scrollback for the </>/arrow-key panning, without
+  // clipping the chart to a single day the way the old per-date-only fetch did.
+  useEffect(() => {
+    if (!date) return;
+    getJson<{ end_date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars_range?end_date=${date}&trading_days=30`)
+      .then((d) => setBars5mRange(d.bars)).catch(() => setBars5mRange([]));
+  }, [date]);
 
   const weeklyBars = useMemo(() => {
     if (!dailyBars.length) return [];
     const resampled = resample(dailyBars.map(barToPricePoint), "W");
     return resampled.map((p) => ({ ts: p.date, open: p.open, high: p.high, low: p.low, close: p.close }));
   }, [dailyBars]);
+  const bars15mRange = useMemo(() => resampleBars(bars5mRange, 3), [bars5mRange]);
+
+  // Date dropdown: ALL trading days in the trailing 12 months, grouped by month -- regardless of
+  // whether a signal fired that day (previously sourced from signals.json's trade dates only,
+  // which silently hid every day with no fired signal).
+  const dateGroups = useMemo(() => {
+    if (!dailyBars.length) return [] as [string, string[]][];
+    const latest = dailyBars[dailyBars.length - 1].ts;
+    const cutoff = new Date(latest + "T00:00:00Z"); cutoff.setUTCFullYear(cutoff.getUTCFullYear() - 1);
+    const cutoffStr = cutoff.toISOString().slice(0, 10);
+    const groups = new Map<string, string[]>();
+    for (const b of dailyBars) {
+      if (b.ts < cutoffStr) continue;
+      const key = b.ts.slice(0, 7);
+      (groups.get(key) ?? groups.set(key, []).get(key)!).push(b.ts);
+    }
+    return [...groups.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([k, ds]) => [k, ds.slice().reverse()] as [string, string[]]);
+  }, [dailyBars]);
 
   const isIntraday = tf === "5m" || tf === "15m";
   const chartBars = useMemo(() => {
-    if (tf === "5m") return bars5m;
-    if (tf === "15m") return resampleBars(bars5m, 3);
+    if (tf === "5m") return bars5mRange;
+    if (tf === "15m") return bars15mRange;
     if (tf === "1D") return dailyBars;
     return weeklyBars;
-  }, [tf, bars5m, dailyBars, weeklyBars]);
+  }, [tf, bars5mRange, bars15mRange, dailyBars, weeklyBars]);
 
-  const dayTrades = useMemo(() => (tf === "5m" ? (signals?.trades ?? []).filter((t) => t.date === date) : []), [signals, date, tf]);
+  // Signals fired within the loaded intraday range (not just the single selected date) -- the
+  // chart now spans multiple trailing days, so markers/table cover all of them. 5m-only: trade
+  // timestamps are 5-min-precise and won't cleanly align with 15m-resampled bars.
+  const rangeDates = useMemo(() => new Set(bars5mRange.map((b) => b.ts.slice(0, 10))), [bars5mRange]);
+  const rangeTrades = useMemo(() => (tf === "5m" ? (signals?.trades ?? []).filter((t) => rangeDates.has(t.date)) : []), [signals, rangeDates, tf]);
   const bt = signals?.backtest_summary;
 
   return (
     <>
       <section className="panel cockpit">
-        <div className="panel-title"><h2>Indices — NIFTY intraday breakout (long straddle)</h2>
-          <span>{signals?.exit_rule ? `exit: ${signals.exit_rule}` : "—"} · horizon {signals?.horizon_bars ?? "—"} bars</span></div>
+        <div className="panel-title"><h2>Indices — NIFTY intraday regime (magnitude model)</h2>
+          <span>horizon {signals?.horizon_bars ?? "—"} bars · train ≤ {signals?.train_cutoff ?? "—"}</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
-            <strong>Entry</strong> A direction-agnostic breakout model flags when NIFTY looks likely to move
-            more than usual over the next {signals?.horizon_bars ?? "N"} five-minute bars (30min–2hr). Since the
-            model predicts magnitude only, not direction, the trade is a long ATM straddle (buy the CE and PE
-            together) — matching what the model actually says, not an invented directional bet on top of it.
+            <strong>Entry</strong> A direction-agnostic magnitude model flags when NIFTY looks likely to move
+            more than {signals?.move_threshold_pct ?? "N"}% over the next {signals?.horizon_bars ?? "N"} five-minute bars.
+            Live, this drives a regime switch — a defined-risk credit spread when no big move is expected, a naked
+            ATM CE/PE (direction hint, low-confidence) when one is — see the Regime panel above/live poller for the
+            actual recommended trade. This replay checks the model + exit logic against history (predicted vs
+            realized move %), not a specific option structure's premium P&L.
           </div>
-          <div className="sell-rule"><strong>Exit</strong> {signals?.exit_rule ?? "not finalized yet"} — chosen from a
-            fixed-window exit-rule backtest (see experiments/nifty_intraday_breakout_v1/entry_exit_backtest.py);
-            every rule tested had to beat a plain hold-to-window baseline after costs.</div>
+          <div className="sell-rule"><strong>Exit</strong> {signals?.exit_rule ?? "not finalized yet"} — direction-lock once
+            price moves away from entry, erosion (giveback) exit once the move stalls, or an S/R zone/session-close/
+            max-hold backstop. Same state machine production/nifty_live_poller.py runs live.</div>
           {bt ? (
-            <div className="sell-bt">{bt.n} historical trades · win rate <b>{(bt.win_rate * 100).toFixed(0)}%</b> ·
-              mean <b>{bt.avg_pnl_pct >= 0 ? "+" : ""}{bt.avg_pnl_pct}%</b> / median <b>{bt.median_pnl_pct >= 0 ? "+" : ""}{bt.median_pnl_pct}%</b> ·
-              worst <b>{bt.worst_pnl_pct}%</b>
-              <span className="hint"> · net of an assumed 2% round-trip cost — this is research, not a validated live signal yet.</span></div>
-          ) : <div className="sell-bt"><span className="hint">No backtest results yet — run the experiment pipeline (see experiments/nifty_intraday_breakout_v1/README.md).</span></div>}
+            <div className="sell-bt">{bt.n} signals ({bt.n_resolved} resolved) · hit rate (|realized| ≥ {signals?.move_threshold_pct}%)
+              <b> {(bt.hit_rate * 100).toFixed(0)}%</b> · mean |realized move| <b>{bt.mean_abs_realized_move_pct}%</b>
+              <span className="hint"> · out-of-sample from {signals?.train_cutoff} onward — not look-ahead.</span></div>
+          ) : <div className="sell-bt"><span className="hint">No backtest results yet — run experiments/nifty_intraday_breakout_v1/gen_indices_signals.py.</span></div>}
         </div>
         <div className="panel-title-controls" style={{ padding: "0 16px 8px" }}>
           <label className="chk"><LineChart size={15} />
@@ -2835,39 +2974,46 @@ function IndicesSignals() {
           {isIntraday ? (
             <label className="chk"><CalendarDays size={15} />
               <select value={date} onChange={(e) => setDate(e.target.value)} style={{ minWidth: 140 }}>
-                {dates.length ? dates.map((d) => <option key={d} value={d}>{d}</option>) : <option value="">No signal dates yet</option>}
+                {dateGroups.length ? dateGroups.map(([ym, ds]) => (
+                  <optgroup key={ym} label={monthLabel(ym)}>
+                    {ds.map((d) => <option key={d} value={d}>{d}</option>)}
+                  </optgroup>
+                )) : <option value="">No trading days yet</option>}
               </select>
             </label>
           ) : <span className="hint">{chartBars.length} {tf === "1D" ? "days" : "weeks"}</span>}
         </div>
         {chartBars.length ? (
-          <IntradayCandles series={chartBars} trades={dayTrades} tf={tf} dailyFull={dailyBars} showIntradayZones={tf === "5m"} />
+          <IntradayCandles series={chartBars} trades={rangeTrades} tf={tf} dailyFull={dailyBars} weeklyFull={weeklyBars}
+                           intraZoneSource={bars15mRange} moveThresholdPct={signals?.move_threshold_pct ?? 0.25} />
         ) : <p className="hint" style={{ padding: 16 }}>
-          {isIntraday ? (date ? "No 5-min bars for this date." : "Waiting for signals.json (run gen_indices_signals.py).") : "No daily history yet."}</p>}
+          {isIntraday ? (date ? "No 5-min bars ending this date." : "Loading…") : "No daily history yet."}</p>}
       </section>
 
       <section className="panel cockpit" style={{ marginTop: 14 }}>
-        <div className="panel-title"><h2>Trades — {date || "—"}</h2></div>
+        <div className="panel-title"><h2>Signals — trailing 30 days ending {date || "—"}</h2></div>
         <div className="table-wrap">
           <table>
             <thead><tr>
               <th>Entry</th><th>Exit</th><th>Entry NIFTY</th><th>Exit NIFTY</th>
-              <th>Straddle entry</th><th>Straddle exit</th><th>PnL</th><th>Exit reason</th>
+              <th>Predicted move</th><th>Realized move</th><th>Direction</th><th>Exit reason</th>
             </tr></thead>
             <tbody>
-              {dayTrades.map((t, i) => (
+              {rangeTrades.map((t, i) => (
                 <tr key={i}>
-                  <td>{t.entry_ts.slice(11, 16)}</td>
-                  <td>{t.exit_ts.slice(11, 16)}</td>
+                  <td>{t.entry_ts.slice(5, 16).replace("T", " ")}</td>
+                  <td>{t.exit_ts ? t.exit_ts.slice(5, 16).replace("T", " ") : "—"}</td>
                   <td>{num(t.entry_underlying, 1)}</td>
                   <td>{t.exit_underlying != null ? num(t.exit_underlying, 1) : "—"}</td>
-                  <td>{num(t.straddle_entry, 2)}</td>
-                  <td>{num(t.straddle_exit, 2)}</td>
-                  <td className={t.pnl_pct >= 0 ? "move-up" : "move-down"}>{t.pnl_pct >= 0 ? "+" : ""}{t.pnl_pct.toFixed(1)}%</td>
-                  <td className="hint">{t.exit_reason}</td>
+                  <td>{t.predicted_move_pct.toFixed(2)}%</td>
+                  <td className={t.realized_move_pct == null ? "" : t.realized_move_pct >= 0 ? "move-up" : "move-down"}>
+                    {t.realized_move_pct != null ? `${t.realized_move_pct >= 0 ? "+" : ""}${t.realized_move_pct.toFixed(2)}%` : "open"}
+                  </td>
+                  <td className="hint">{t.direction ?? "—"}</td>
+                  <td className="hint">{t.exit_reason ?? "—"}</td>
                 </tr>
               ))}
-              {!dayTrades.length && <tr><td colSpan={8} className="empty-cell">No trades on this date</td></tr>}
+              {!rangeTrades.length && <tr><td colSpan={8} className="empty-cell">No signals in this range</td></tr>}
             </tbody>
           </table>
         </div>

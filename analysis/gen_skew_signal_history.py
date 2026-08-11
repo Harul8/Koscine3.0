@@ -215,11 +215,13 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
                 break
         if not vals:
             continue
-        # complete = outcome is actually known; otherwise the trade is still genuinely open
-        # (win just hasn't reached FWD days yet) -- report it as pending, not a fabricated result.
+        # complete = outcome is actually FINAL; otherwise the trade is still genuinely open (win
+        # just hasn't reached FWD days yet) -- but its PnL is still shown, mark-to-market as of
+        # the latest available day, same as a real broker P&L screen for an open position.
+        # `complete` gates ONLY the `outcome` label (win/loss vs pending), never pnl/ror_pct.
         complete = exited_early or (len(win) == FWD)
         exit_value = vals[-1]
-        pnl = round(credit - exit_value, 2) if complete else None
+        pnl = round(credit - exit_value, 2)
         lot = lot_size(sym, exp)
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
@@ -235,9 +237,9 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "exit_value": round(exit_value, 2),
-            "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if pnl is not None and lot is not None and pd.notna(lot) else None),
-            "ror_pct": (round(pnl / risk * 100, 1) if pnl is not None else None), "max_dd_pct": round(dd / risk * 100, 1),
-            "outcome": ("win" if pnl > 0 else "loss") if pnl is not None else "pending",
+            "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None),
+            "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
+            "outcome": ("win" if pnl > 0 else "loss") if complete else "pending",
         })
     return out
 
@@ -265,8 +267,10 @@ df = pd.DataFrame(all_out).sort_values(["tier", "entry_date"])
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
 df.to_csv(outdir / "skew_signal_history.csv", index=False)
 n_pending = int((df["outcome"] == "pending").sum())
-print(f"wrote {len(df)} signals (all tiers, de-duped, {n_pending} pending) -> {outdir / 'skew_signal_history.csv'}")
-print(df.groupby("tier").agg(n=("pnl", "size"),
-                             win=("outcome", lambda s: (s == "win").sum() / max(1, (s != "pending").sum())),
+print(f"wrote {len(df)} signals (all tiers, de-duped, {n_pending} pending -- pnl/ror_pct still "
+      f"shown, mark-to-market as of the latest available day) -> {outdir / 'skew_signal_history.csv'}")
+completed = df[df["outcome"] != "pending"]
+print(completed.groupby("tier").agg(n=("pnl", "size"),
+                             win=("outcome", lambda s: (s == "win").mean()),
                              ev_ror=("ror_pct", "mean"), median_ror=("ror_pct", "median"),
                              worst_ror=("ror_pct", "min"), worst_dd=("max_dd_pct", "min")).round(1).to_string())

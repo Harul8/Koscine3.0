@@ -1,22 +1,23 @@
-"""Recomputes fire events + simulates the FINALIZED exit rule over the full option-chain
-window, writing locks/prod_nifty_intraday/signals.json -- the file api/main.py's
-/prod2/nifty_intraday_* endpoints serve to the Indices tab. Swapping in a live 5-min poller
-later means replacing what writes this file, not the API/frontend reading it.
+"""Writes locks/prod_nifty_intraday/signals.json -- the file api/main.py's /prod2/nifty_intraday_*
+endpoints serve to the Indices tab's Trades panel, date-picker, and backtest banner.
 
-IMPORTANT -- fire events come from train.py's WALK-FORWARD OUT-OF-SAMPLE PREDICTED
-PROBABILITY (results/v2_option_chain_h{HORIZON}_preds.csv's `p` column), NOT the raw
-ground-truth label -- see entry_exit_backtest.py's docstring for why using the label
-directly is circular (it's computed by looking at bars T+1..T+H, so it can only be known
-in hindsight). This means the trades shown in the tab are HISTORICAL walk-forward-honest
-signals, not a live feed -- there is no single deployed model yet to score new/live bars
-with (train.py retrains a fresh model every walk-forward fold, by design, for evaluation --
-that's a different thing from a persisted production model). Standing up genuinely live
-scoring is a later step, not this one.
+Reuses validate_recent.py's exact fit (train <= 2026-03-31, test from 2026-04-01 to the latest
+available bar) and backtest_signals() (the SAME fire/non-overlap/pattern-exit state machine
+production/nifty_live_poller.py runs live) -- this REPLACES the old straddle-premium classifier
+this file used to be built from. That old approach had two problems this version fixes:
+  (a) it gated fires on data/intraday/nifty_option_chain_5m (the downloaded option-chain
+      snapshots, used to price a straddle entry/exit), which lags spot by however far that slow,
+      rate-limited downloader happens to be behind -- so the Trades tab silently stopped at
+      whatever date the chain data last reached, not the latest actual trading day.
+  (b) it flagged EVERY bar in the top-decile predicted-probability quantile as its own
+      independent trade, with no "don't fire while a signal is open" state machine -- producing
+      stacked, overlapping "trades" a few minutes apart on volatile days.
 
-EDIT EXIT_RULE below to whichever rule won in entry_exit_backtest.py's
-results/FINDINGS_exit.md -- this script does not pick it for you. It ships with the plain
-hold_to_window rule as a defensible, non-overfit default until you've looked at that
-comparison.
+This version reports predicted-vs-realized MOVE %, not straddle premium P&L -- the strategy
+itself changed this session (regime-switching sell-spread / naked-buy off the live option
+chain, see production/nifty_live_poller.py's recommend_sell_spread()/recommend_buy()), and a
+spot-only backtest isn't gated by the option-chain downloader's lag, so the date range always
+reaches the latest available 5-min bar in data/intraday/nifty_5m.parquet.
 
 Usage:
     python experiments/nifty_intraday_breakout_v1/gen_indices_signals.py
@@ -29,92 +30,72 @@ from pathlib import Path
 
 import pandas as pd
 
-ROOT = Path(r"C:\Users\rahul\Koscine 3.0")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(ROOT / "experiments" / "intraday_exit_v1"))
-import option_features  # noqa: E402
-import straddle_path  # noqa: E402
-from simulator import ExitRule, simulate_multiresolution  # noqa: E402
+import validate_recent as vr  # noqa: E402
 
-HORIZON = 12   # EDIT together with PREDS_FILE if you finalized a different horizon
-RESULTS_DIR = Path(__file__).resolve().parent / "results"
-PREDS_FILE = RESULTS_DIR / f"v2_option_chain_h{HORIZON}_preds.csv"
-DATA_DIR = Path(__file__).resolve().parent / "data"
-OPTION_CHAIN_DIR = ROOT / "data" / "intraday" / "nifty_option_chain_5m"
-OUT = ROOT / "locks" / "prod_nifty_intraday" / "signals.json"
-MAX_HOLD_BARS = 24
-ROUND_TRIP_COST_PCT = 0.02
-ENTRY_QUANTILE = 0.90   # matches entry_exit_backtest.py / train.py's precision_at_top10pct
+OUT = Path(r"C:\Users\rahul\Koscine 3.0\locks\prod_nifty_intraday\signals.json")
 
-# From entry_exit_backtest.py's corrected results/FINDINGS_exit.md: every rule tested was
-# net-negative on average (mean_net_return -3.0% to -4.9% across the grid) -- this is the
-# LEAST-BAD rule, not a validated winner. See the tab's own banner/methodology text for the
-# honest caveat; this is populated for visualization of the research finding, not a live signal.
-EXIT_RULE = ExitRule("trail_a10_d15", activation_return=0.10, trailing_drawdown=0.15)
+
+def _direction_label(d: float | None) -> str | None:
+    if d is None or pd.isna(d):
+        return None
+    if d > 0:
+        return "up"
+    if d < 0:
+        return "down"
+    return None
 
 
 def main() -> None:
-    if not PREDS_FILE.exists():
-        raise SystemExit(f"{PREDS_FILE} not found -- run train.py first (it writes this)")
-    preds = pd.read_csv(PREDS_FILE)
-    preds["timestamp"] = pd.to_datetime(preds["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata")
-    cutoff = preds["p"].quantile(ENTRY_QUANTILE)
-    fires = preds.loc[preds["p"] >= cutoff, "timestamp"].sort_values()
-
-    v2_path = DATA_DIR / "v2_option_chain.parquet"
-    if not v2_path.exists():
-        raise SystemExit(f"{v2_path} not found -- run dataset.py first")
-    v2 = pd.read_parquet(v2_path)
-    v2["timestamp"] = pd.to_datetime(v2["timestamp"])
-    underlying_by_ts = v2.set_index("timestamp")["close"]
-
-    chain = option_features.load_chain(OPTION_CHAIN_DIR)
+    preds = vr.fit_and_predict()
+    sig_df = vr.backtest_signals(preds)
 
     trades: list[dict] = []
-    for t in fires:
-        underlying_entry = underlying_by_ts.get(t)
-        if underlying_entry is None:
-            continue
-        path = straddle_path.build_straddle_path(chain, t, MAX_HOLD_BARS)
-        if path is None or len(path) < 2:
-            continue
-        result = simulate_multiresolution(path, path, EXIT_RULE, round_trip_cost_pct=ROUND_TRIP_COST_PCT)
-        exit_underlying = underlying_by_ts.get(result.exit_timestamp)
+    for _, row in sig_df.iterrows():
+        entry_ts = pd.Timestamp(row["entry_ts"])
+        exit_underlying = row.get("exit_underlying")
+        realized = row.get("realized_move_pct")
+        exit_reason = row.get("exit_reason")
         trades.append({
-            "date": t.date().isoformat(),
-            "entry_ts": result.entry_timestamp.isoformat(),
-            "exit_ts": result.exit_timestamp.isoformat(),
-            "entry_underlying": round(float(underlying_entry), 1),
-            "exit_underlying": round(float(exit_underlying), 1) if exit_underlying is not None else None,
-            "straddle_entry": round(result.entry_value, 2),
-            "straddle_exit": round(result.exit_value, 2),
-            "pnl_pct": round(result.net_return * 100, 2),
-            "exit_reason": result.exit_reason,
+            "date": entry_ts.date().isoformat(),
+            "entry_ts": row["entry_ts"],
+            "exit_ts": row.get("exit_ts") if pd.notna(row.get("exit_ts")) else None,
+            "entry_underlying": round(float(row["entry_underlying"]), 1),
+            "exit_underlying": round(float(exit_underlying), 1) if pd.notna(exit_underlying) else None,
+            "predicted_move_pct": round(float(row["predicted_move_pct"]), 3),
+            "realized_move_pct": round(float(realized), 3) if pd.notna(realized) else None,
+            "direction": _direction_label(row.get("direction")),
+            "exit_reason": exit_reason if pd.notna(exit_reason) else None,
         })
 
+    resolved = [t for t in trades if t["realized_move_pct"] is not None]
     summary = None
-    if trades:
-        pnls = [t["pnl_pct"] for t in trades]
+    if resolved:
+        hits = sum(1 for t in resolved if abs(t["realized_move_pct"]) >= vr.MOVE_THRESHOLD_PCT)
+        exit_reasons: dict[str, int] = {}
+        for t in resolved:
+            exit_reasons[t["exit_reason"]] = exit_reasons.get(t["exit_reason"], 0) + 1
         summary = {
-            "n": len(trades),
-            "win_rate": round(sum(1 for p in pnls if p > 0) / len(pnls), 3),
-            "avg_pnl_pct": round(sum(pnls) / len(pnls), 2),
-            "median_pnl_pct": round(sorted(pnls)[len(pnls) // 2], 2),
-            "worst_pnl_pct": round(min(pnls), 2),
+            "n": len(trades), "n_resolved": len(resolved),
+            "hit_rate": round(hits / len(resolved), 3),
+            "mean_abs_realized_move_pct": round(sum(abs(t["realized_move_pct"]) for t in resolved) / len(resolved), 3),
+            "exit_reasons": exit_reasons,
         }
 
     out = {
-        "as_of": pd.Timestamp.now().isoformat(),
-        "horizon_bars": HORIZON, "entry_quantile": ENTRY_QUANTILE, "p_cutoff": round(float(cutoff), 4),
-        "exit_rule": EXIT_RULE.name,
+        "as_of": pd.Timestamp.now(tz="Asia/Kolkata").isoformat(),
+        "horizon_bars": vr.HORIZON, "move_threshold_pct": vr.MOVE_THRESHOLD_PCT,
+        "train_cutoff": vr.TRAIN_CUTOFF.date().isoformat(),
+        "exit_rule": "pattern/zone-based (direction-lock + erosion + S/R zone + session/max-hold)",
         "backtest_summary": summary,
         "trades": trades,
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(out, indent=2), encoding="utf-8")
-    print(f"[gen_indices_signals] wrote {len(trades)} trades -> {OUT}")
+    print(f"[gen_indices_signals] wrote {len(trades)} trades ({len(resolved)} resolved) -> {OUT}")
     if summary:
-        print(f"  win_rate={summary['win_rate']:.1%} avg_pnl={summary['avg_pnl_pct']}% n={summary['n']}")
+        print(f"  hit_rate={summary['hit_rate']:.1%} mean_abs_move={summary['mean_abs_realized_move_pct']}% n={summary['n']}")
+        print(f"  exit_reasons={summary['exit_reasons']}")
 
 
 if __name__ == "__main__":

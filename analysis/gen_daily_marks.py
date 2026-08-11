@@ -241,9 +241,25 @@ def skew_marks(fwd: int = 5, safe_dte: int = 4, dte_min: int = 15, min_vol: int 
     lot_map = _lot_map()
     cbar = _cbar(panel)
 
+    # De-dup against Broken-Wing, mirroring gen_skew_signal_history.py exactly: a skew candidate
+    # is dropped if the same symbol also has a Broken-Wing signal (any tier) on the same
+    # entry_date -- skew is a secondary/complementary signal there, not counted twice. Without
+    # this, skew_marks() overcounts every tier vs. the production skew_signal_history.csv (was
+    # 284 unique trade_id vs. 201 signals -- the exact ~83-trade gap this closes).
+    bw_path = OUT_DIR / "broken_wing_signal_history.csv"
+    bw_pairs = set()
+    if bw_path.exists():
+        bw = pd.read_csv(bw_path, usecols=["symbol", "entry_date"])
+        bw_pairs = set(zip(bw["symbol"], bw["entry_date"]))
+    else:
+        print(f"WARNING: {bw_path} not found -- run gen_broken_wing_signal_history.py first; "
+              f"skipping de-dup (all skew candidates kept)", flush=True)
+
     rows = []
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         if sym in EXCLUDE_SYMBOLS:
+            continue
+        if (sym, pd.Timestamp(e_date).date().isoformat()) in bw_pairs:
             continue
         p = tpos.get(pd.Timestamp(e_date))
         if p is None or p == 0:

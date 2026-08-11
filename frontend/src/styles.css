@@ -150,6 +150,13 @@ button:hover {
 .candles-wrap {
   cursor: crosshair;
   user-select: none;
+  outline: none;
+}
+/* click-to-activate: arrow-key pan/zoom only fires once the chart itself has focus (see the
+   keydown handlers in Candles/IntradayCandles) -- this ring is the visible cue for that state. */
+.candles-wrap:focus-visible {
+  box-shadow: 0 0 0 2px rgba(37, 99, 176, 0.45);
+  border-radius: 4px;
 }
 .candles-toolbar {
   position: absolute;

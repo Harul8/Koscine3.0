@@ -154,14 +154,15 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
             break
     if not vals:
         continue
-    # complete = the trade's outcome is actually known (either it force-exited within the window
+    # complete = the trade's outcome is actually FINAL (either it force-exited within the window
     # that exists, or the window itself was the full FWD days). If win got truncated short of FWD
-    # only because tdays hasn't reached that far yet, the trade is still genuinely open -- report
-    # it (so today's/yesterday's entries aren't silently withheld) but leave pnl/ror/outcome null
-    # rather than fabricate a final result from an incomplete mark.
+    # only because tdays hasn't reached that far yet, the trade is still genuinely open -- but its
+    # PnL is still shown, mark-to-market as of the latest available day (exit_value/vals[-1]),
+    # same as a real broker P&L screen for an open position. `complete` gates ONLY the `outcome`
+    # label (win/loss vs pending), never whether pnl/ror_pct get populated.
     complete = exited_early or (len(win) == FWD)
     exit_value = vals[-1][1]
-    pnl = round(credit - exit_value, 2) if complete else None
+    pnl = round(credit - exit_value, 2)
     lot = lot_size(sym, exp)
     out.append({
         # liquid-universe members outside the static A/B groups have no group label -- tag them
@@ -177,18 +178,21 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
         "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
         "exit_value": round(exit_value, 2),
-        "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if pnl is not None and lot is not None and pd.notna(lot) else None),
-        "ror_pct": (round(pnl / risk * 100, 1) if pnl is not None else None), "max_dd_pct": round(dd / risk * 100, 1),
-        "outcome": ("win" if pnl > 0 else "loss") if pnl is not None else "pending",
+        "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None),
+        "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
+        "outcome": ("win" if pnl > 0 else "loss") if complete else "pending",
     })
 
 df = pd.DataFrame(out).sort_values("entry_date")
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
 df.to_csv(outdir / "signal_history.csv", index=False)
 n_pending = int((df["outcome"] == "pending").sum())
-print(f"wrote {len(df)} signals ({n_pending} pending, forward window not complete yet) -> {outdir / 'signal_history.csv'}")
-# win rate is over COMPLETED trades only -- pending rows have no outcome yet and shouldn't dilute it
-print(df.groupby("group").agg(n=("pnl", "size"),
-                              win=("outcome", lambda s: (s == "win").sum() / max(1, (s != "pending").sum())),
+print(f"wrote {len(df)} signals ({n_pending} pending -- forward window not complete yet, but pnl/ror_pct "
+      f"are still shown, mark-to-market as of the latest available day) -> {outdir / 'signal_history.csv'}")
+# ror_pct/win-rate stats here are over COMPLETED trades only -- a pending row's pnl/ror_pct is a
+# live, not-yet-final mark and shouldn't dilute this aggregate (matches the frontend's own filter)
+completed = df[df["outcome"] != "pending"]
+print(completed.groupby("group").agg(n=("pnl", "size"),
+                              win=("outcome", lambda s: (s == "win").mean()),
                               ev_ror=("ror_pct", "mean"), median_ror=("ror_pct", "median"),
                               worst_ror=("ror_pct", "min"), worst_dd=("max_dd_pct", "min")).round(1).to_string())

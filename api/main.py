@@ -1087,12 +1087,34 @@ def prod2_nifty_intraday_bars(date: str = Query(...)) -> dict[str, object]:
     return {"date": date, "bars": bars}
 
 
+@app.get("/prod2/nifty_intraday_bars_range")
+def prod2_nifty_intraday_bars_range(end_date: str = Query(...), trading_days: int = Query(default=30, ge=1, le=120)) -> dict[str, object]:
+    """5-min NIFTY OHLC for the trailing `trading_days` trading days ending on/before end_date
+    (inclusive) -- feeds the Indices tab's 5m/15m charts so a 150-trailing-candle window (and
+    left/right-arrow panning) can span backward across multiple sessions instead of being
+    clipped to whichever single day is selected. `end_date` is always the LAST date on the
+    resulting chart -- nothing after it is included."""
+    df = _nifty_5m()
+    if df.empty:
+        return {"end_date": end_date, "bars": []}
+    end = pd.Timestamp(end_date).date()
+    scoped = df[df["timestamp"].dt.date <= end]
+    if scoped.empty:
+        return {"end_date": end_date, "bars": []}
+    uniq_dates = sorted(scoped["timestamp"].dt.date.unique())[-trading_days:]
+    windowed = scoped[scoped["timestamp"].dt.date >= uniq_dates[0]].sort_values("timestamp")
+    bars = [{"ts": r.timestamp.isoformat(), "open": float(r.open), "high": float(r.high),
+             "low": float(r.low), "close": float(r.close)} for r in windowed.itertuples()]
+    return {"end_date": end_date, "bars": bars}
+
+
 @app.get("/prod2/nifty_intraday_signals")
 def prod2_nifty_intraday_signals(date: str | None = None) -> dict[str, object]:
-    """NIFTY intraday breakout trade marker(s) (entry/exit timestamp+price) for one date, or
-    all dates if omitted, plus the overall backtest_summary (win rate / avg P&L / n). Built
-    offline by experiments/nifty_intraday_breakout_v1/gen_indices_signals.py -- see that
-    script's EXIT_RULE constant for which exit policy is currently live."""
+    """NIFTY intraday breakout trade marker(s) (entry/exit timestamp+predicted/realized move %)
+    for one date, or all dates if omitted, plus the overall backtest_summary (hit_rate / n /
+    exit_reasons). Built offline by experiments/nifty_intraday_breakout_v1/gen_indices_signals.py,
+    which replays the SAME non-overlap pattern-exit state machine production/nifty_live_poller.py
+    runs live, over an out-of-sample window (train <= 2026-03-31, tested from 2026-04-01 on)."""
     data = _nifty_intraday_signals()
     trades = data.get("trades", [])
     if date:
