@@ -104,6 +104,11 @@ def implied_vol(price, S, K, T, r, is_call):
         return None
 
 
+# Optional partial-range regen: `python gen_skew_signal_history.py bw_panel.parquet 2026-07-01
+# 2026-08-31` only recomputes entries in [ENTRY_DATE_MIN, ENTRY_DATE_MAX] and merges the result
+# into the existing CSV (rows outside that range are preserved untouched).
+ENTRY_DATE_MIN = sys.argv[2] if len(sys.argv) > 2 else None
+ENTRY_DATE_MAX = sys.argv[3] if len(sys.argv) > 3 else None
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -142,6 +147,9 @@ def legseq(sym, ot, exp, strike, win):
 def run_tier(tier_id: str, wing: float) -> list[dict]:
     out = []
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
+        e_date_str = pd.Timestamp(e_date).date().isoformat()
+        if (ENTRY_DATE_MIN and e_date_str < ENTRY_DATE_MIN) or (ENTRY_DATE_MAX and e_date_str > ENTRY_DATE_MAX):
+            continue
         if sym in EXCLUDE_SYMBOLS:
             continue
         if sym not in BACKTEST_UNIVERSE:
@@ -198,8 +206,8 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         if risk < MIN_RISK_FRAC * width:
             continue
         entry_ror = credit / risk * 100
-        if entry_ror <= MIN_ENTRY_ROR:
-            continue
+        # No early `continue` on the primary gate here -- every structurally-valid candidate is
+        # carried through to the cross-tier fallback pass below (FALLBACK_MIN_ROR).
 
         vals, dd, exited_early = [], 0.0, False
         for i in range(len(win)):
@@ -232,7 +240,7 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
             "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-            "entry_ror_pct": round(entry_ror, 1),
+            "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > MIN_ENTRY_ROR,
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -244,28 +252,49 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
     return out
 
 
-# de-dup against Broken-Wing: a skew candidate is dropped if the same symbol also has a
-# Broken-Wing signal (any tier) on the same entry_date.
-bw_path = ROOT / "locks" / "prod_sell_strategies" / "broken_wing_signal_history.csv"
-bw_pairs = set()
-if bw_path.exists():
-    bw = pd.read_csv(bw_path, usecols=["symbol", "entry_date"])
-    bw_pairs = set(zip(bw["symbol"], bw["entry_date"]))
-else:
-    print(f"WARNING: {bw_path} not found -- run gen_broken_wing_signal_history.py first; "
-          f"skipping de-dup (all skew candidates kept)", flush=True)
+# NOTE: the old BW-vs-skew de-dup ("drop skew if BW has the same symbol/day") used to live here,
+# but is now handled by gen_signal_dedup_and_fallback.py -- profitability-based (whichever of
+# BW/skew is actually more profitable that symbol/day wins), not "BW always wins" -- since it
+# needs both strategies' candidate pools at once. Run that script AFTER this one.
 
 all_out = []
 for tier_id, wing in TIERS:
     rows = run_tier(tier_id, wing)
-    n_before = len(rows)
-    rows = [r for r in rows if (r["symbol"], r["entry_date"]) not in bw_pairs]
-    print(f"{tier_id} (wing={wing}): {n_before} signals, {len(rows)} after de-dup vs broken-wing", flush=True)
+    n_passing = sum(1 for r in rows if r["clears_primary_bar"])
+    print(f"{tier_id} (wing={wing}): {len(rows)} candidates, {n_passing} clear the primary bar", flush=True)
     all_out.extend(rows)
 
-df = pd.DataFrame(all_out).sort_values(["tier", "entry_date"])
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
-df.to_csv(outdir / "skew_signal_history.csv", index=False)
+
+
+def _merge_partial(new_rows: list[dict], out_path, sort_cols):
+    """Partial-range run: merge into the existing file instead of overwriting it -- keep every
+    existing row OUTSIDE [ENTRY_DATE_MIN, ENTRY_DATE_MAX] untouched, replace only rows inside it.
+    Shared by both the real-signal CSV and the raw-candidates cache below."""
+    new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(new_rows)
+    if not (ENTRY_DATE_MIN or ENTRY_DATE_MAX) or not out_path.exists():
+        return new_df
+    old = pd.read_parquet(out_path) if out_path.suffix == ".parquet" else pd.read_csv(out_path)
+    keep_old = old[(old["entry_date"] < (ENTRY_DATE_MIN or "0000-00-00")) | (old["entry_date"] > (ENTRY_DATE_MAX or "9999-99-99"))]
+    return pd.concat([keep_old, new_df], ignore_index=True).sort_values(sort_cols)
+
+
+# Raw-candidates cache: EVERY structurally-valid candidate across all 3 tiers, BEFORE the
+# Broken-Wing de-dup too (gen_signal_dedup_and_fallback.py needs the undeduped pool to make its
+# own profitability-based dedup + cross-strategy fallback decisions).
+cand_path = outdir / "skew_candidates_raw.parquet"
+cand_df = _merge_partial(all_out, cand_path, ["tier", "entry_date"])
+cand_df.to_parquet(cand_path, index=False)
+
+# The real signal-history CSV only ever contains candidates that clear their tier's primary bar
+# -- BW de-dup and the fallback "NS" row are both added later, by gen_signal_dedup_and_fallback.py.
+all_out = [r for r in all_out if r["clears_primary_bar"]]
+for r in all_out:
+    del r["clears_primary_bar"]
+
+out_path = outdir / "skew_signal_history.csv"
+df = _merge_partial(all_out, out_path, ["tier", "entry_date"])
+df.to_csv(out_path, index=False)
 n_pending = int((df["outcome"] == "pending").sum())
 print(f"wrote {len(df)} signals (all tiers, de-duped, {n_pending} pending -- pnl/ror_pct still "
       f"shown, mark-to-market as of the latest available day) -> {outdir / 'skew_signal_history.csv'}")

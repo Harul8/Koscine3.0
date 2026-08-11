@@ -56,6 +56,12 @@ DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 260.0, 50   # MIN_ENTRY_ROR raised from 150
 # _calibrate_k, not a guessed round number.
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # entry_ror ratio becomes numerically degenerate (blows toward infinity)
+# Optional partial-range regen: `python gen_sell_signal_history.py panel.parquet 2026-07-01
+# 2026-08-31` only recomputes entries in [ENTRY_DATE_MIN, ENTRY_DATE_MAX] and merges the result
+# into the existing CSV (rows outside that range are preserved untouched) -- for re-running a
+# fast recent window (e.g. after a logic change) without redoing the full multi-year history.
+ENTRY_DATE_MIN = sys.argv[2] if len(sys.argv) > 2 else None
+ENTRY_DATE_MAX = sys.argv[3] if len(sys.argv) > 3 else None
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -87,6 +93,9 @@ def legseq(sym, ot, exp, strike, win):
 
 out = []
 for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
+    e_date_str = pd.Timestamp(e_date).date().isoformat()
+    if (ENTRY_DATE_MIN and e_date_str < ENTRY_DATE_MIN) or (ENTRY_DATE_MAX and e_date_str > ENTRY_DATE_MAX):
+        continue
     p = tpos.get(pd.Timestamp(e_date))
     if p is None or p == 0:
         continue
@@ -133,8 +142,10 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     if risk < MIN_RISK_FRAC * width:                 # exclude numerically degenerate near-zero-risk
         continue                                      # spreads (credit~=width -> ROR blows toward infinity)
     entry_ror = credit / risk * 100
-    if entry_ror <= MIN_ENTRY_ROR:                  # THE gating criterion: entry-time credit/max_risk
-        continue
+    # THE gating criterion is entry-time credit/max_risk > MIN_ENTRY_ROR -- but no longer an early
+    # `continue`: every structurally-valid candidate is carried through to the fallback pass below
+    # (FALLBACK_MIN_ROR), which needs the full candidate pool for a day, not just the ones that
+    # already cleared the primary bar.
     # daily mark-to-close: cost to close the condor each day; unrealized pnl = credit - value.
     # Any day where a leg's volume is too thin is skipped (not marked at a stale/illiquid print);
     # forced exit once DTE drops to <=SAFE_DTE (ahead of the E-4 delivery-margin ramp).
@@ -167,13 +178,14 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     out.append({
         # liquid-universe members outside the static A/B groups have no group label -- tag them
         # C_liquid rather than KeyError (same fallback the broken-wing script already uses)
-        "symbol": sym, "group": g2.get(sym, "C_liquid"), "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
+        "symbol": sym, "group": g2.get(sym, "C_liquid"), "tier": "condor",
+        "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
         "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
         "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
         "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]), "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
         "sell_premium": round(seqs["sc"][0] + seqs["sp"][0], 2), "buy_premium": round(seqs["lc"][0] + seqs["lp"][0], 2),
         "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-        "entry_ror_pct": round(entry_ror, 1),
+        "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > MIN_ENTRY_ROR,
         "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
         "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
         "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -183,9 +195,39 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "outcome": ("win" if pnl > 0 else "loss") if complete else "pending",
     })
 
-df = pd.DataFrame(out).sort_values("entry_date")
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
-df.to_csv(outdir / "signal_history.csv", index=False)
+
+
+def _merge_partial(new_rows: list[dict], out_path, sort_cols):
+    """Partial-range run: merge into the existing file instead of overwriting it -- keep every
+    existing row OUTSIDE [ENTRY_DATE_MIN, ENTRY_DATE_MAX] untouched, replace only rows inside it.
+    Shared by both the real-signal CSV and the raw-candidates cache below."""
+    new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(new_rows)
+    if not (ENTRY_DATE_MIN or ENTRY_DATE_MAX) or not out_path.exists():
+        return new_df
+    old = pd.read_parquet(out_path) if out_path.suffix == ".parquet" else pd.read_csv(out_path)
+    keep_old = old[(old["entry_date"] < (ENTRY_DATE_MIN or "0000-00-00")) | (old["entry_date"] > (ENTRY_DATE_MAX or "9999-99-99"))]
+    return pd.concat([keep_old, new_df], ignore_index=True).sort_values(sort_cols)
+
+
+# Raw-candidates cache: EVERY structurally-valid candidate (not just ones clearing the primary
+# ROR bar), for gen_no_signal_fallback.py to pool across all 3 strategies and pick a single
+# cross-strategy best pick on a day where none of them produced a real signal. Must run BEFORE
+# gen_no_signal_fallback.py, which reads this file.
+cand_path = outdir / "condor_candidates_raw.parquet"
+cand_df = _merge_partial(out, cand_path, "entry_date")
+cand_df.to_parquet(cand_path, index=False)
+
+# The real signal-history CSV only ever contains candidates that clear MIN_ENTRY_ROR -- the
+# fallback "NS" row for a no-signal day is added later, by gen_no_signal_fallback.py, once it can
+# see ALL 3 strategies' candidate pools at once (not just this one).
+out = [r for r in out if r["clears_primary_bar"]]
+for r in out:
+    del r["clears_primary_bar"]
+
+out_path = outdir / "signal_history.csv"
+df = _merge_partial(out, out_path, "entry_date")
+df.to_csv(out_path, index=False)
 n_pending = int((df["outcome"] == "pending").sum())
 print(f"wrote {len(df)} signals ({n_pending} pending -- forward window not complete yet, but pnl/ror_pct "
       f"are still shown, mark-to-market as of the latest available day) -> {outdir / 'signal_history.csv'}")

@@ -79,6 +79,11 @@ TIERS = [
     ("t3_2x10", 0.02, 0.10),
 ]
 
+# Optional partial-range regen: `python gen_broken_wing_signal_history.py bw_panel.parquet
+# 2026-07-01 2026-08-31` only recomputes entries in [ENTRY_DATE_MIN, ENTRY_DATE_MAX] and merges
+# the result into the existing CSV (rows outside that range are preserved untouched).
+ENTRY_DATE_MIN = sys.argv[2] if len(sys.argv) > 2 else None
+ENTRY_DATE_MAX = sys.argv[3] if len(sys.argv) > 3 else None
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -117,6 +122,9 @@ def legseq(sym, ot, exp, strike, win):
 def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
     out = []
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
+        e_date_str = pd.Timestamp(e_date).date().isoformat()
+        if (ENTRY_DATE_MIN and e_date_str < ENTRY_DATE_MIN) or (ENTRY_DATE_MAX and e_date_str > ENTRY_DATE_MAX):
+            continue
         if sym in EXCLUDE_SYMBOLS:
             continue
         if sym not in BACKTEST_UNIVERSE:
@@ -164,8 +172,8 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
             continue
         entry_ror = credit / risk * 100
         min_ror_here = MCAP_MIN_ROR if sym in A_MCAP else OTHER_MIN_ROR
-        if entry_ror <= min_ror_here:
-            continue
+        # No early `continue` on the primary gate here -- every structurally-valid candidate is
+        # carried through to the cross-tier fallback pass below (FALLBACK_MIN_ROR).
         vals, dd, exited_early = [], 0.0, False
         for i in range(len(win)):
             legbars = [seqs[k][1][i] for k in ("sc", "lc", "sp", "lp")]
@@ -197,7 +205,7 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
             "call_width_pct": round(call_width / u * 100, 1), "put_width_pct": round(put_width / u * 100, 1),
             "sell_premium": round(seqs["sc"][0] + seqs["sp"][0], 2), "buy_premium": round(seqs["lc"][0] + seqs["lp"][0], 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-            "entry_ror_pct": round(entry_ror, 1),
+            "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > min_ror_here,
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -212,12 +220,43 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
 all_out = []
 for tier_id, wing_ce, wing_pe in TIERS:
     rows = run_tier(tier_id, wing_ce, wing_pe)
-    print(f"{tier_id} (ce={wing_ce} pe={wing_pe}): {len(rows)} signals", flush=True)
+    n_passing = sum(1 for r in rows if r["clears_primary_bar"])
+    print(f"{tier_id} (ce={wing_ce} pe={wing_pe}): {len(rows)} candidates, {n_passing} clear the primary bar", flush=True)
     all_out.extend(rows)
 
-df = pd.DataFrame(all_out).sort_values(["tier", "entry_date"])
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
-df.to_csv(outdir / "broken_wing_signal_history.csv", index=False)
+
+
+def _merge_partial(new_rows: list[dict], out_path, sort_cols):
+    """Partial-range run: merge into the existing file instead of overwriting it -- keep every
+    existing row OUTSIDE [ENTRY_DATE_MIN, ENTRY_DATE_MAX] untouched, replace only rows inside it.
+    Shared by both the real-signal CSV and the raw-candidates cache below."""
+    new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(new_rows)
+    if not (ENTRY_DATE_MIN or ENTRY_DATE_MAX) or not out_path.exists():
+        return new_df
+    old = pd.read_parquet(out_path) if out_path.suffix == ".parquet" else pd.read_csv(out_path)
+    keep_old = old[(old["entry_date"] < (ENTRY_DATE_MIN or "0000-00-00")) | (old["entry_date"] > (ENTRY_DATE_MAX or "9999-99-99"))]
+    return pd.concat([keep_old, new_df], ignore_index=True).sort_values(sort_cols)
+
+
+# Raw-candidates cache: EVERY structurally-valid candidate across all 3 tiers (not just ones
+# clearing their tier's primary ROR bar), for gen_no_signal_fallback.py to pool across all 3
+# STRATEGIES and pick a single cross-strategy best pick on a day where none of them produced a
+# real signal. Must run BEFORE gen_no_signal_fallback.py, which reads this file.
+cand_path = outdir / "broken_wing_candidates_raw.parquet"
+cand_df = _merge_partial(all_out, cand_path, ["tier", "entry_date"])
+cand_df.to_parquet(cand_path, index=False)
+
+# The real signal-history CSV only ever contains candidates that clear their tier's primary bar
+# -- the fallback "NS" row for a no-signal day is added later, by gen_no_signal_fallback.py, once
+# it can see ALL 3 strategies' candidate pools at once (not just this one).
+all_out = [r for r in all_out if r["clears_primary_bar"]]
+for r in all_out:
+    del r["clears_primary_bar"]
+
+out_path = outdir / "broken_wing_signal_history.csv"
+df = _merge_partial(all_out, out_path, ["tier", "entry_date"])
+df.to_csv(out_path, index=False)
 n_pending = int((df["outcome"] == "pending").sum())
 print(f"wrote {len(df)} signals (all tiers, {n_pending} pending -- pnl/ror_pct still shown, "
       f"mark-to-market as of the latest available day) -> {outdir / 'broken_wing_signal_history.csv'}")
