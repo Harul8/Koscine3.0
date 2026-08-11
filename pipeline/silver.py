@@ -677,6 +677,20 @@ def build_eod_deriv_contracts() -> pd.DataFrame:
     Written partitioned by year."""
     from . import universe as _u
     allow = set(_u.load())
+    # UNION in the sell-strategy liquid universe (koscine/liquid_universe.py's Nifty50 + rolling
+    # daily-tail allowlist). active_universe.txt is sized/refreshed for the ML PREDICTION
+    # pipeline (~100 names) and going through it alone left the live Sell Signals endpoints
+    # unable to see stocks the backtest was firing on -- the per-strike rows simply weren't on
+    # disk. The allowlist is a rolling-window union, not just today's 65, because the daily tail
+    # rotates and the live tab must not go blind when it does.
+    try:
+        from koscine import liquid_universe as _lu
+        liquid = set(_lu.load_allowlist()) or _lu.live_universe_today()
+        if liquid:
+            print(f"[contracts] +{len(liquid - allow)} symbols from the liquid universe")
+            allow |= liquid
+    except Exception as e:   # noqa: BLE001 -- keep the silver build working if this is missing
+        print(f"[contracts] liquid universe unavailable ({e}); using active_universe.txt only")
     if not allow:
         print("[contracts] no active_universe.txt — run `python -m pipeline.universe` first")
         return pd.DataFrame()

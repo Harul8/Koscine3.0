@@ -440,8 +440,9 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
     lots = _lot_sizes()
     last = contracts["date"].max()
+    universe = _liquid_universe_today() or set(g2)
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
-                    & contracts["symbol"].isin(g2) & contracts["strike"].notna()
+                    & contracts["symbol"].isin(universe) & contracts["strike"].notna()
                     & (contracts["underlying_price"] > 0)].copy()
     ivlast = iv[iv["date"] == last].set_index("symbol")["iv_ratio"].to_dict()
 
@@ -484,7 +485,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             return round(float(v) / float(lot))
 
         out.append({
-            "symbol": sym, "group": g2[sym], "expiry": exp.date().isoformat(), "dte": dte,
+            "symbol": sym, "group": g2.get(sym, "C_liquid"), "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]),
             "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
@@ -619,7 +620,7 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
     lots = _lot_sizes()
     last = contracts["date"].max()
-    universe = set(g2) | _top50_oi_today()
+    universe = _liquid_universe_today() or set(g2)
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
                     & contracts["symbol"].isin(universe) & contracts["strike"].notna()
                     & (contracts["underlying_price"] > 0)].copy()
@@ -665,6 +666,22 @@ BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate: mega
     # defined-risk seller) so they rarely clear a uniform 150% bar; relaxing it specifically for
     # them lifted mega-cap share from ~13% to 13-28%/tier without a win-rate cost in backtest.
 _BW_TOP50_CACHE: dict = {"mtime": None, "by_date": None}
+
+
+def _liquid_universe_today() -> set:
+    """Today's tradable universe for every LIVE sell-strategy endpoint: the fixed Nifty50 +
+    today's top-15 most liquid non-Nifty50 names by futures OI-in-lots. Delegates to
+    koscine/liquid_universe.py. Note this is WIDER than the backtest universe
+    (analysis/gen_*_signal_history.py uses Nifty50 only, no daily tail -- see that module's
+    docstring) by design: the daily tail gives live picks some rotation without the backtest
+    tracking point-in-time index membership it can't verify. Returns an empty set on failure;
+    callers fall back to the static A/B groups."""
+    try:
+        from koscine import liquid_universe
+        return liquid_universe.live_universe_today()
+    except Exception as e:   # noqa: BLE001 -- a universe hiccup must not 500 the whole tab
+        print(f"[api] liquid_universe unavailable ({e}); falling back to static groups")
+        return set()
 
 
 def _top50_oi_today() -> set:
@@ -807,7 +824,7 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         return {"as_of": None, "tiers": []}
     g2 = {s: g for g, syms in _read_json(LM_LOCK_V2 / "universe_groups.json").items() for s in syms}
     a_mcap = set(_read_json(LM_LOCK_V2 / "universe_groups.json").get("A_mcap30", []))
-    universe = set(g2) | _top50_oi_today()
+    universe = _liquid_universe_today() or set(g2)
     lots = _lot_sizes()
     last = contracts["date"].max()
     day = contracts[(contracts["date"] == last) & contracts["opt_type"].isin(["CE", "PE"])
@@ -854,9 +871,14 @@ def prod2_broken_wing_signal_history(symbol: str | None = None, tier: str | None
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
+        n_completed = int((df["outcome"] != "pending").sum())
         summary = {
             "n": int(len(df)),
-            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "n_pending": int(len(df)) - n_completed,
+            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
+            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
+            # and siblings for why some rows can now be pending: forward window not complete).
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
@@ -919,9 +941,14 @@ def prod2_skew_signal_history(symbol: str | None = None, tier: str | None = None
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
+        n_completed = int((df["outcome"] != "pending").sum())
         summary = {
             "n": int(len(df)),
-            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "n_pending": int(len(df)) - n_completed,
+            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
+            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
+            # and siblings for why some rows can now be pending: forward window not complete).
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
@@ -945,9 +972,14 @@ def prod2_sell_signal_history(symbol: str | None = None) -> dict[str, object]:
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
+        n_completed = int((df["outcome"] != "pending").sum())
         summary = {
             "n": int(len(df)),
-            "win_rate": round(float((df["outcome"].eq("win")).mean()), 3),
+            "n_pending": int(len(df)) - n_completed,
+            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
+            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
+            # and siblings for why some rows can now be pending: forward window not complete).
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
@@ -1066,6 +1098,42 @@ def prod2_nifty_intraday_signals(date: str | None = None) -> dict[str, object]:
     if date:
         trades = [t for t in trades if t["date"] == date]
     return {**data, "trades": trades}
+
+
+_NIFTY_DAILY_CACHE: dict = {"mtime": None, "df": None}
+
+
+@app.get("/prod2/nifty_daily_bars")
+def prod2_nifty_daily_bars(days: int = Query(default=760, ge=30, le=4000)) -> dict[str, object]:
+    """NIFTY 50's own daily OHLC (silver/indices.parquet, 2015-present) -- feeds the Indices
+    tab's 1D/1W timeframe views and the client-side S/R zone computation for them (the same
+    srLevels() function stock charts use, at the stock-sized 2% cluster tolerance -- the 5-min/
+    15-min views use a much tighter 0.10% tolerance instead, since NIFTY moves far less in
+    absolute % terms within a single session). Cached on indices.parquet's mtime."""
+    from koscine.config import SILVER_DATA_ROOT
+    f = SILVER_DATA_ROOT / "indices.parquet"
+    if not f.exists():
+        return {"bars": []}
+    mt = os.path.getmtime(f)
+    if _NIFTY_DAILY_CACHE["mtime"] != mt:
+        df = pd.read_parquet(f, columns=["date", "index_name", "open", "high", "low", "close"])
+        df = df[df["index_name"] == "Nifty 50"].copy()
+        df["date"] = pd.to_datetime(df["date"])
+        _NIFTY_DAILY_CACHE.update(mtime=mt, df=df.sort_values("date").reset_index(drop=True))
+    df = _NIFTY_DAILY_CACHE["df"].tail(days)
+    bars = [{"date": r.date.strftime("%Y-%m-%d"), "open": float(r.open), "high": float(r.high),
+             "low": float(r.low), "close": float(r.close)} for r in df.itertuples()]
+    return {"bars": bars}
+
+
+@app.get("/prod2/nifty_regime")
+def prod2_nifty_regime() -> dict[str, object]:
+    """Live regime read from production/nifty_live_poller.py: 'consolidation' (defined-risk
+    premium selling suggested) or 'big_move_expected' (naked-option buy suggested, with a
+    low-confidence direction hint), plus a concrete recommended_trade (strikes/premium off the
+    live chain) when the poller has one. Empty dict if the poller hasn't run/written yet --
+    this is read-only, the API never runs the poller itself."""
+    return _read_json(NIFTY_INTRADAY_LOCK / "regime_live.json") or {}
 
 
 @app.get("/prod2/price_history")

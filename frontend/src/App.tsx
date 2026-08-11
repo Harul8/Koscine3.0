@@ -914,11 +914,15 @@ type Zone = { price: number; touches: number; firstDate: string };
 // few bars later. Only zones with >= 2 touches qualify. Returns the 2 nearest resistance zones
 // above the latest close and the 2 nearest support zones below (<= 4 lines), plus the all-time-
 // high zone (blue) when `ath` coincides with one of the qualifying swing highs.
-function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
+function srLevels(vis: PricePoint[], dd: number, ath: number, tol = 0.02): Level[] {
   // N=2: needs to beat only its 2 nearest neighbors each side. N=3 was too wide — two genuinely
   // separate nearby peaks (e.g. 3 weeks apart on a weekly chart) could sit within each other's
   // pivot window and invalidate one another even though a real pullback separated them.
-  const N = 2, tol = 0.02, athTol = 0.02, G = 8;
+  // tol: cluster tolerance -- defaults to 2% (stocks, weekly candles). NIFTY's 5-min intraday
+  // chart passes 0.001 (0.10%) instead: NIFTY moves in far tighter absolute % terms within a
+  // single session than a stock does over weeks/months, so the stock-sized 2% band would
+  // cluster the ENTIRE visible price range into one giant "zone".
+  const N = 2, athTol = 0.02, G = 8;
   const n = vis.length;
   if (n < 2 * N + 1) return [];
   const isPivotHigh = (i: number) => { for (let j = i - N; j <= i + N; j++) if (j !== i && vis[j].high >= vis[i].high) return false; return true; };
@@ -969,9 +973,11 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
   const resZones = clusterRaw(highs).map((m) => resolveZone(m, true)).filter((z): z is Zone => z !== null);
   const supZones = clusterRaw(lows).map((m) => resolveZone(m, false)).filter((z): z is Zone => z !== null);
   const refClose = vis[n - 1].close;   // vis is always the full history, so this is the latest close
-  // Collapse same-side zones within 5% of each other into one, keeping whichever is nearer to
-  // the current price: the LOWER price for resistance, the UPPER price for support — so the
-  // final displayed lines are never two near-duplicates <5% apart.
+  // Collapse same-side zones within dedupTol of each other into one, keeping whichever is nearer
+  // to the current price: the LOWER price for resistance, the UPPER price for support. Scaled
+  // off tol (2.5x it, same ratio stocks' 5%/2% already had) rather than a fixed 5% -- at NIFTY's
+  // 5-min tol=0.001 a flat 5% would be 50x the cluster width and over-merge distinct zones.
+  const dedupTol = tol * 2.5;
   const dedupBySide = (zones: Zone[], keepHighest: boolean): Zone[] => {
     const sorted = zones.slice().sort((a, b) => a.price - b.price);
     const out: Zone[] = [];
@@ -980,7 +986,7 @@ function srLevels(vis: PricePoint[], dd: number, ath: number): Level[] {
       if (cl.length) out.push(keepHighest ? cl.reduce((m, z) => (z.price > m.price ? z : m)) : cl.reduce((m, z) => (z.price < m.price ? z : m)));
       cl = [];
     };
-    for (const z of sorted) { if (cl.length && Math.abs(z.price - cl[cl.length - 1].price) / z.price > 0.05) flush(); cl.push(z); }
+    for (const z of sorted) { if (cl.length && Math.abs(z.price - cl[cl.length - 1].price) / z.price > dedupTol) flush(); cl.push(z); }
     flush();
     return out;
   };
@@ -1247,60 +1253,93 @@ type SellHistRow = {
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
-  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+  entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
+  exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
 type SellHist = {
   rows: SellHistRow[];
-  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+  summary: { n: number; n_pending?: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 
 function SellSignalsTab() {
   return <MergedSellSignals />;
 }
 
-// ----------------------------------------------------------------- Merged Sell Signals (Broken-Wing + IV Skew)
+// ----------------------------------------------------------------- Merged Sell Signals (Condor + Broken-Wing + IV Skew)
 // Skew is filtered server-side to exclude any symbol already firing a Broken-Wing signal that
-// day (see /prod2/skew_strategy's `excluded_by_broken_wing`) -- Broken-Wing is the default/
-// primary structure, Skew is a secondary source of additional, non-duplicate signals.
+// day (see /prod2/skew_strategy's `excluded_by_broken_wing`) -- but Condor is NOT server-side
+// de-duped against either (independent script/endpoint, no cross-exclusion), so the same symbol
+// can legitimately show up from more than one strategy/tier on the same day. Per-symbol (daily)
+// / per-(symbol,date) (history) dedup below collapses those down to the single most profitable
+// signal, rather than showing every strategy's take on the same stock.
 type MergedRow = {
-  strategy: "BW" | "SIV"; tierId: string; tierLabel: string; rank: number;
+  strategy: "BW" | "SIV" | "CONDOR"; tierId: string; tierLabel: string; rank: number;
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   sideDesc: string; positionDesc: string;
   credit: number; max_profit: number; max_risk: number; lot_size: number | null;
   max_profit_per_lot: number | null; max_risk_per_lot: number | null; ror_pct: number;
 };
 type MergedHistRow = {
-  strategy: "BW" | "SIV"; tierId: string; symbol: string; group: string; signal_date: string;
+  strategy: "BW" | "SIV" | "CONDOR"; tierId: string; symbol: string; group: string; signal_date: string;
   expiry: string; dte: number; iv_ratio: number | null; positionDesc: string;
   credit: number; max_profit: number; max_risk: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
-  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+  entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
+  exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
 const MERGED_TIER_LABEL: Record<string, string> = {
+  condor: "Condor · 2%/5%",
   t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%",
   t1_skew35: "Skew T1 · 3.5%", t2_skew6: "Skew T2 · 6%", t3_skew8: "Skew T3 · 8%",
 };
+// "most profitable" for dedup, both daily AND history: absolute max profit per lot (real rupees
+// the trade pays out at max profit) rather than ror_pct (% return on risk) -- ror_pct can favor a
+// tiny, barely-funded spread over a much bigger absolute payout. Falls back to raw max_profit
+// (points, not rupees) only when lot_size/max_profit_per_lot isn't known for that symbol. Used
+// even for history rows (not realized pnl_per_lot) so a still-"pending" trade sorts the same way
+// a same-day daily candidate would have -- the THEORETICAL max profit at entry, not an outcome
+// that isn't known yet.
+function maxProfitScore(r: { max_profit_per_lot: number | null; max_profit: number }): number {
+  return r.max_profit_per_lot ?? r.max_profit;
+}
+// Collapse multiple signals firing on the same stock (same day) down to the single most
+// profitable one -- across strategies (Condor/Broken-Wing/Skew aren't all mutually de-duped
+// server-side) and across tiers within one strategy alike.
+function dedupMostProfitable<T extends { symbol: string }>(rows: T[], keyOf: (r: T) => string,
+                                                             score: (r: T) => number): T[] {
+  const best = new Map<string, T>();
+  for (const r of rows) {
+    const key = keyOf(r);
+    const cur = best.get(key);
+    if (!cur || score(r) > score(cur)) best.set(key, r);
+  }
+  return Array.from(best.values());
+}
 
 function MergedSellSignals() {
   const [bwData, setBwData] = useState<BWResp | null>(null);
   const [skewData, setSkewData] = useState<SkewTieredResp | null>(null);
+  const [sellData, setSellData] = useState<SellResp | null>(null);
   const [symbols, setSymbols] = useState<{ symbol: string; group: string }[]>([]);
   const [symStats, setSymStats] = useState<BWSymbolStats | null>(null);
   const [filterSym, setFilterSym] = useState("");
-  const [filterStrategy, setFilterStrategy] = useState<"" | "BW" | "SIV">("");
+  const [filterStrategy, setFilterStrategy] = useState<"" | "BW" | "SIV" | "CONDOR">("");
   const [filterMonth, setFilterMonth] = useState("");
   const [bwHist, setBwHist] = useState<BWHist | null>(null);
   const [skewHist, setSkewHist] = useState<SkewTieredHist | null>(null);
+  const [sellHist, setSellHist] = useState<SellHist | null>(null);
   const [openSymbol, setOpenSymbol] = useState<string | null>(null);
 
   useEffect(() => { getJson<BWResp>("/prod2/broken_wing_strategy").then(setBwData).catch(() => setBwData(null)); }, []);
   useEffect(() => { getJson<SkewTieredResp>("/prod2/skew_strategy").then(setSkewData).catch(() => setSkewData(null)); }, []);
+  useEffect(() => { getJson<SellResp>("/prod2/sell_strategies").then(setSellData).catch(() => setSellData(null)); }, []);
   useEffect(() => { getJson<{ symbol: string; group: string }[]>("/prod2/symbols").then(setSymbols).catch(() => {}); }, []);
   useEffect(() => { getJson<BWSymbolStats>("/prod2/broken_wing_symbol_stats").then(setSymStats).catch(() => setSymStats(null)); }, []);
   useEffect(() => {
     const q = filterSym ? `?symbol=${filterSym}` : "";
     getJson<BWHist>(`/prod2/broken_wing_signal_history${q}`).then(setBwHist).catch(() => setBwHist(null));
     getJson<SkewTieredHist>(`/prod2/skew_signal_history${q}`).then(setSkewHist).catch(() => setSkewHist(null));
+    getJson<SellHist>(`/prod2/sell_signal_history${q}`).then(setSellHist).catch(() => setSellHist(null));
   }, [filterSym]);
   useEffect(() => setFilterMonth(""), [filterSym, filterStrategy]);
 
@@ -1324,8 +1363,20 @@ function MergedSellSignals() {
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
     })));
-    return [...bwRows, ...skewRows];
-  }, [bwTiers, skewTiers]);
+    const condorRows: MergedRow[] = (sellData?.top_picks ?? []).map((r, i) => ({
+      strategy: "CONDOR" as const, tierId: "condor", tierLabel: "Condor", rank: i + 1,
+      symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
+      sideDesc: `${r.richer_side === "CE" ? "Call" : "Put"} richer`,
+      positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
+    }));
+    let all = [...bwRows, ...skewRows, ...condorRows];
+    if (filterStrategy) all = all.filter((r) => r.strategy === filterStrategy);
+    // one stock, multiple strategies/tiers firing today -> keep only the most profitable (by
+    // absolute max profit/lot, not ror_pct -- see maxProfitScore
+    return dedupMostProfitable(all, (r) => r.symbol, maxProfitScore);
+  }, [bwTiers, skewTiers, sellData, filterStrategy]);
 
   const histFlat: MergedHistRow[] = useMemo(() => {
     const bwRows: MergedHistRow[] = (bwHist?.rows ?? []).map((r) => ({
@@ -1333,7 +1384,7 @@ function MergedSellSignals() {
       expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
       positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
-      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot,
+      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
       exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
     }));
     const skewRows: MergedHistRow[] = (skewHist?.rows ?? []).map((r) => ({
@@ -1341,24 +1392,44 @@ function MergedSellSignals() {
       expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
       positionDesc: `${num(r.short_strike, 0)}/${num(r.long_strike, 0)} (${r.side})`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
-      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot,
+      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
       exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
     }));
-    let all = [...bwRows, ...skewRows];
+    const condorRows: MergedHistRow[] = (sellHist?.rows ?? []).map((r) => ({
+      strategy: "CONDOR" as const, tierId: "condor", symbol: r.symbol, group: r.group, signal_date: r.signal_date,
+      expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
+      positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
+      max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
+      exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
+    }));
+    let all = [...bwRows, ...skewRows, ...condorRows];
     if (filterStrategy) all = all.filter((r) => r.strategy === filterStrategy);
-    return all;
-  }, [bwHist, skewHist, filterStrategy]);
+    // one stock, multiple strategies/tiers firing the same day -> keep only the most profitable
+    // (by max profit/lot, same metric as the daily dedup -- see maxProfitScore)
+    return dedupMostProfitable(all, (r) => `${r.symbol}|${r.signal_date}`, maxProfitScore);
+  }, [bwHist, skewHist, sellHist, filterStrategy]);
 
   const allSyms = filterSym === "";
   const months = useMemo(() => monthsOf(histFlat, (r) => r.signal_date), [histFlat]);
   const histRowsAll = useMemo(() => (filterMonth ? histFlat.filter((r) => r.signal_date.startsWith(filterMonth)) : histFlat), [histFlat, filterMonth]);
-  const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
+  // histFlat is 3 strategies concatenated (each individually date-sorted by its own API call,
+  // but the CONCATENATION isn't globally sorted) -- slicing it as-is for the "all months" cap
+  // took an arbitrary bw-then-skew-then-condor prefix rather than the most recent rows, which
+  // silently hid every recent Condor entry once bw+skew alone exceeded the cap. Sort by date
+  // first so the cap actually keeps the most recent signals across all three strategies.
+  const histRows = filterMonth ? histRowsAll
+    : [...histRowsAll].sort((a, b) => b.signal_date.localeCompare(a.signal_date)).slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = useMemo(() => {
     if (!histRows.length) return null;
+    // exclude "pending" rows (forward window not complete yet, see gen_sell_signal_history.py)
+    // from every ror_pct-derived stat -- their ror_pct is null, not zero
+    const completed = histRows.filter((r) => r.outcome !== "pending");
+    const rors = completed.map((r) => r.ror_pct as number);
     return {
-      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
-      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
-      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      n: histRows.length, win_rate: completed.length ? completed.filter((r) => r.outcome === "win").length / completed.length : 0,
+      median_ror_pct: rors.length ? Math.round(median(rors) * 10) / 10 : 0,
+      worst_ror_pct: rors.length ? Math.round(Math.min(...rors) * 10) / 10 : 0,
       worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
     };
   }, [histRows]);
@@ -1373,20 +1444,27 @@ function MergedSellSignals() {
   return (
     <>
       <section className="panel cockpit">
-        <div className="panel-title"><h2>Sell Signals — Broken-Wing Condor + IV Skew (merged)</h2>
-          <span>as of {bwData?.as_of ?? skewData?.as_of ?? "—"}</span></div>
+        <div className="panel-title"><h2>Sell Signals — Condor + Broken-Wing + IV Skew (merged)</h2>
+          <span>as of {bwData?.as_of ?? skewData?.as_of ?? sellData?.as_of ?? "—"}</span></div>
         <div className="sell-explain">
           <div className="sell-rule">
-            <strong>Broken-Wing Condor (primary)</strong> Sell the ~2% OTM call &amp; put, buy the wings ASYMMETRICALLY
+            <strong>Condor</strong> Sell the ~2% OTM call &amp; put, buy SYMMETRIC ~5% wings (loss always capped).
+          </div>
+          <div className="sell-rule">
+            <strong>Broken-Wing Condor</strong> Sell the ~2% OTM call &amp; put, buy the wings ASYMMETRICALLY
             (narrow call wing / wide put wing) at 3 increasing asymmetry tiers. Max loss always capped at (wider wing − credit).
           </div>
           <div className="sell-rule">
-            <strong>IV Skew (secondary)</strong> Sell only the richer-IV side (CE or PE), buy a wing on that same side, at 3
-            increasing wing-width tiers. <b>Only shown when the symbol doesn't already have a live Broken-Wing signal that
-            day</b> — Skew adds coverage, it never duplicates a Broken-Wing pick.
+            <strong>IV Skew</strong> Sell only the richer-IV side (CE or PE), buy a wing on that same side, at 3
+            increasing wing-width tiers. <b>Server-side excluded when the symbol already has a live Broken-Wing signal
+            that day</b> (Condor is not cross-excluded against either).
+          </div>
+          <div className="sell-rule">
+            <strong>One signal per stock</strong> When more than one strategy/tier fires on the same stock the same day,
+            only the single most profitable signal is kept here — the rest are hidden, not duplicated.
           </div>
           <div className="sell-rule"><strong>Exit</strong> Close at <b>~50% of max profit</b> or by expiry (whichever first). Same DTE-floor /
-            entry-ror safety rules as before (9 days for Broken-Wing, 15 for Skew).</div>
+            entry-ror safety rules as before (9 days for Condor/Broken-Wing, 15 for Skew).</div>
         </div>
         <div className="bw-tier-status">
           {allTierChips.map((t) => (
@@ -1409,8 +1487,6 @@ function MergedSellSignals() {
               <SortTh label="IV rich" sortKey="iv_ratio" sort={dailySort.sort} onSort={dailySort.onSort} />
               <th>Side</th><th>Position</th>
               <SortTh label="Credit" sortKey="credit" sort={dailySort.sort} onSort={dailySort.onSort} />
-              <SortTh label="Max profit" sortKey="max_profit" sort={dailySort.sort} onSort={dailySort.onSort} />
-              <SortTh label="Max risk" sortKey="max_risk" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Lot size" sortKey="lot_size" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
@@ -1428,15 +1504,13 @@ function MergedSellSignals() {
                   <td className="hint">{r.sideDesc}</td>
                   <td className="hint">{r.positionDesc}</td>
                   <td>{num(r.credit, 1)}</td>
-                  <td className="move-up">{num(r.max_profit, 1)}</td>
-                  <td>{num(r.max_risk, 1)}</td>
                   <td>{r.lot_size ?? "—"}</td>
                   <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!dailyFlat.length && <tr><td colSpan={14} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
+              {!dailyFlat.length && <tr><td colSpan={12} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1447,8 +1521,9 @@ function MergedSellSignals() {
           <h2>Signal history — returns per fired signal</h2>
           <div className="panel-title-controls">
             <label className="chk"><Coins size={15} />
-              <select value={filterStrategy} onChange={(e) => setFilterStrategy(e.target.value as "" | "BW" | "SIV")} style={{ minWidth: 130 }}>
-                <option value="">Both strategies</option>
+              <select value={filterStrategy} onChange={(e) => setFilterStrategy(e.target.value as "" | "BW" | "SIV" | "CONDOR")} style={{ minWidth: 130 }}>
+                <option value="">All strategies</option>
+                <option value="CONDOR">Condor</option>
                 <option value="BW">Broken-Wing</option>
                 <option value="SIV">IV Skew</option>
               </select>
@@ -1479,9 +1554,8 @@ function MergedSellSignals() {
               <SortTh label="IV" sortKey="iv_ratio" sort={histSort.sort} onSort={histSort.onSort} />
               <th>Position</th>
               <SortTh label="Credit" sortKey="credit" sort={histSort.sort} onSort={histSort.onSort} />
-              <SortTh label="Max profit" sortKey="max_profit" sort={histSort.sort} onSort={histSort.onSort} />
-              <SortTh label="Max risk" sortKey="max_risk" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="Lot size" sortKey="lot_size" sort={histSort.sort} onSort={histSort.onSort} />
+              <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="Max risk/lot" sortKey="max_risk_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="Exit value" sortKey="exit_value" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="PnL/lot" sortKey="pnl_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
@@ -1500,23 +1574,22 @@ function MergedSellSignals() {
                   <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
                   <td className="hint">{r.positionDesc}</td>
                   <td>{num(r.credit, 1)}</td>
-                  <td className="move-up">{num(r.max_profit, 1)}</td>
-                  <td>{num(r.max_risk, 1)}</td>
                   <td>{r.lot_size ?? "—"}</td>
+                  <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                  <td className={r.pnl == null ? "hint" : r.pnl >= 0 ? "move-up" : "move-down"}>
                     {r.pnl_per_lot != null
                       ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
-                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
-                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                          <span className="hint"> ({r.pnl != null && r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : r.pnl == null ? "…" : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
                   </td>
-                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className={r.ror_pct == null ? "hint" : r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct == null ? "…" : <>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</>}</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
-                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                  <td>{r.outcome === "win" ? "✓" : r.outcome === "pending" ? <span className="hint" title="forward window not complete yet">…</span> : "✕"}</td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 16 : 15} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1551,13 +1624,17 @@ function SellStrategies() {
   const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = useMemo(() => {
     if (!histRows.length) return null;
+    // exclude "pending" rows (forward window not complete yet, see gen_sell_signal_history.py)
+    // from every ror_pct/pnl-derived stat -- their ror_pct/pnl is null, not zero
+    const completed = histRows.filter((r) => r.outcome !== "pending");
+    const rors = completed.map((r) => r.ror_pct as number);
     return {
-      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
-      ev_ror_pct: Math.round((histRows.reduce((s, r) => s + r.ror_pct, 0) / histRows.length) * 10) / 10,
-      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
-      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      n: histRows.length, win_rate: completed.length ? completed.filter((r) => r.outcome === "win").length / completed.length : 0,
+      ev_ror_pct: rors.length ? Math.round((rors.reduce((s, v) => s + v, 0) / rors.length) * 10) / 10 : 0,
+      median_ror_pct: rors.length ? Math.round(median(rors) * 10) / 10 : 0,
+      worst_ror_pct: rors.length ? Math.round(Math.min(...rors) * 10) / 10 : 0,
       worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
-      total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
+      total_pnl: Math.round(completed.reduce((s, r) => s + (r.pnl as number), 0) * 10) / 10,
     };
   }, [histRows]);
 
@@ -1665,15 +1742,15 @@ function SellStrategies() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                  <td className={r.pnl == null ? "hint" : r.pnl >= 0 ? "move-up" : "move-down"}>
                     {r.pnl_per_lot != null
                       ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
-                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
-                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                          <span className="hint"> ({r.pnl != null && r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : r.pnl == null ? "…" : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
                   </td>
-                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className={r.ror_pct == null ? "hint" : r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct == null ? "…" : <>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</>}</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
-                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                  <td>{r.outcome === "win" ? "✓" : r.outcome === "pending" ? <span className="hint" title="forward window not complete yet">…</span> : "✕"}</td>
                 </tr>
               ))}
               {!histRows.length && <tr><td colSpan={allSyms ? 16 : 15} className="empty-cell">No signals</td></tr>}
@@ -1712,11 +1789,12 @@ type BWHistRow = {
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
-  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+  entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
+  exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
 type BWHist = {
   rows: BWHistRow[];
-  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+  summary: { n: number; n_pending?: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 const BW_TIER_LABEL: Record<string, string> = { t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%" };
 type BWSymbolStatEntry = { n: number; median_pnl_per_lot: number; mean_pnl_per_lot: number; win_rate: number;
@@ -1769,13 +1847,17 @@ function BrokenWingStrategy() {
   const histSort = useSortedRows(histRows, "signal_date" as never, "desc");
   const hs = useMemo(() => {
     if (!histRows.length) return null;
+    // exclude "pending" rows (forward window not complete yet, see gen_sell_signal_history.py)
+    // from every ror_pct/pnl-derived stat -- their ror_pct/pnl is null, not zero
+    const completed = histRows.filter((r) => r.outcome !== "pending");
+    const rors = completed.map((r) => r.ror_pct as number);
     return {
-      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
-      ev_ror_pct: Math.round((histRows.reduce((s, r) => s + r.ror_pct, 0) / histRows.length) * 10) / 10,
-      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
-      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      n: histRows.length, win_rate: completed.length ? completed.filter((r) => r.outcome === "win").length / completed.length : 0,
+      ev_ror_pct: rors.length ? Math.round((rors.reduce((s, v) => s + v, 0) / rors.length) * 10) / 10 : 0,
+      median_ror_pct: rors.length ? Math.round(median(rors) * 10) / 10 : 0,
+      worst_ror_pct: rors.length ? Math.round(Math.min(...rors) * 10) / 10 : 0,
       worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
-      total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
+      total_pnl: Math.round(completed.reduce((s, r) => s + (r.pnl as number), 0) * 10) / 10,
     };
   }, [histRows]);
 
@@ -1926,15 +2008,15 @@ function BrokenWingStrategy() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                  <td className={r.pnl == null ? "hint" : r.pnl >= 0 ? "move-up" : "move-down"}>
                     {r.pnl_per_lot != null
                       ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
-                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
-                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                          <span className="hint"> ({r.pnl != null && r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : r.pnl == null ? "…" : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
                   </td>
-                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className={r.ror_pct == null ? "hint" : r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct == null ? "…" : <>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</>}</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
-                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                  <td>{r.outcome === "win" ? "✓" : r.outcome === "pending" ? <span className="hint" title="forward window not complete yet">…</span> : "✕"}</td>
                 </tr>
               ))}
               {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
@@ -1965,11 +2047,12 @@ type SkewTieredHistRow = {
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
-  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+  entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
+  exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
 type SkewTieredHist = {
   rows: SkewTieredHistRow[];
-  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+  summary: { n: number; n_pending?: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 
 // ----------------------------------------------------------------- Skew Strategy (directional leg) -- LEGACY, unused (merged into MergedSellSignals above)
@@ -1992,11 +2075,12 @@ type SkewHistRow = {
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
-  exit_value: number; pnl: number; pnl_per_lot: number | null; ror_pct: number; max_dd_pct: number; outcome: string;
+  entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
+  exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
 type SkewHist = {
   rows: SkewHistRow[];
-  summary: { n: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
+  summary: { n: number; n_pending?: number; win_rate: number; ev_ror_pct: number; median_ror_pct: number; worst_ror_pct: number; worst_dd_pct: number; total_pnl: number } | null;
 };
 
 function SkewStrategy() {
@@ -2024,13 +2108,17 @@ function SkewStrategy() {
   const histRows = filterMonth ? histRowsAll : histRowsAll.slice(0, MAX_UNFILTERED_HIST_ROWS);
   const hs = useMemo(() => {
     if (!histRows.length) return null;
+    // exclude "pending" rows (forward window not complete yet, see gen_sell_signal_history.py)
+    // from every ror_pct/pnl-derived stat -- their ror_pct/pnl is null, not zero
+    const completed = histRows.filter((r) => r.outcome !== "pending");
+    const rors = completed.map((r) => r.ror_pct as number);
     return {
-      n: histRows.length, win_rate: histRows.filter((r) => r.outcome === "win").length / histRows.length,
-      ev_ror_pct: Math.round((histRows.reduce((s, r) => s + r.ror_pct, 0) / histRows.length) * 10) / 10,
-      median_ror_pct: Math.round(median(histRows.map((r) => r.ror_pct)) * 10) / 10,
-      worst_ror_pct: Math.round(Math.min(...histRows.map((r) => r.ror_pct)) * 10) / 10,
+      n: histRows.length, win_rate: completed.length ? completed.filter((r) => r.outcome === "win").length / completed.length : 0,
+      ev_ror_pct: rors.length ? Math.round((rors.reduce((s, v) => s + v, 0) / rors.length) * 10) / 10 : 0,
+      median_ror_pct: rors.length ? Math.round(median(rors) * 10) / 10 : 0,
+      worst_ror_pct: rors.length ? Math.round(Math.min(...rors) * 10) / 10 : 0,
       worst_dd_pct: Math.round(Math.min(...histRows.map((r) => r.max_dd_pct)) * 10) / 10,
-      total_pnl: Math.round(histRows.reduce((s, r) => s + r.pnl, 0) * 10) / 10,
+      total_pnl: Math.round(completed.reduce((s, r) => s + (r.pnl as number), 0) * 10) / 10,
     };
   }, [histRows]);
   const dailySort = useSortedRows(daily, "ror_pct" as never, "desc");
@@ -2159,15 +2247,15 @@ function SkewStrategy() {
                   <td>{r.lot_size ?? "—"}</td>
                   <td>{r.max_risk_per_lot != null ? `₹${Math.round(r.max_risk_per_lot).toLocaleString("en-IN")}` : "—"}</td>
                   <td>{num(r.exit_value, 1)}</td>
-                  <td className={r.pnl >= 0 ? "move-up" : "move-down"}>
+                  <td className={r.pnl == null ? "hint" : r.pnl >= 0 ? "move-up" : "move-down"}>
                     {r.pnl_per_lot != null
                       ? <>{r.pnl_per_lot >= 0 ? "+" : ""}₹{Math.round(r.pnl_per_lot).toLocaleString("en-IN")}
-                          <span className="hint"> ({r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
-                      : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
+                          <span className="hint"> ({r.pnl != null && r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}/share)</span></>
+                      : r.pnl == null ? "…" : <>{r.pnl >= 0 ? "+" : ""}{num(r.pnl, 1)}</>}
                   </td>
-                  <td className={r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</td>
+                  <td className={r.ror_pct == null ? "hint" : r.ror_pct >= 0 ? "move-up" : "move-down"}>{r.ror_pct == null ? "…" : <>{r.ror_pct >= 0 ? "+" : ""}{r.ror_pct.toFixed(0)}%</>}</td>
                   <td className="move-down">{r.max_dd_pct.toFixed(0)}%</td>
-                  <td>{r.outcome === "win" ? "✓" : "✕"}</td>
+                  <td>{r.outcome === "win" ? "✓" : r.outcome === "pending" ? <span className="hint" title="forward window not complete yet">…</span> : "✕"}</td>
                 </tr>
               ))}
               {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
@@ -2438,6 +2526,36 @@ type IntradaySignalsResp = {
   backtest_summary: { n: number; win_rate: number; avg_pnl_pct: number; median_pnl_pct: number; worst_pnl_pct: number } | null;
   trades: IntradayTrade[];
 };
+type DailyBar = { date: string; open: number; high: number; low: number; close: number };
+type NiftyTF = "5m" | "15m" | "1D" | "1W";
+const NIFTY_TF_LABEL: Record<NiftyTF, string> = { "5m": "5 min", "15m": "15 min", "1D": "1 day", "1W": "1 week" };
+
+// Groups consecutive intraday bars into `n`-bar buckets (e.g. 5m -> 15m is n=3). Session bars
+// start at 9:15 on a 5-min grid, so grouping-by-3 lands on clean 9:15/9:30/... 15-min boundaries
+// with no explicit alignment needed.
+function resampleBars(bars: IntradayBar[], n: number): IntradayBar[] {
+  if (n <= 1) return bars;
+  const out: IntradayBar[] = [];
+  for (let i = 0; i < bars.length; i += n) {
+    const chunk = bars.slice(i, i + n);
+    out.push({
+      ts: chunk[0].ts, open: chunk[0].open, close: chunk[chunk.length - 1].close,
+      high: Math.max(...chunk.map((b) => b.high)), low: Math.min(...chunk.map((b) => b.low)),
+    });
+  }
+  return out;
+}
+// IntradayBar (ts/OHLC) -> PricePoint shape so the stock chart's srLevels()/computeAutoDD() can
+// be reused as-is; volume/delivQty/picked are unused by those two functions.
+function barToPricePoint(b: IntradayBar): PricePoint {
+  return { date: b.ts, open: b.open, high: b.high, low: b.low, close: b.close, volume: 0, delivQty: 0, picked: false };
+}
+// Binary search: smallest index i with bars[i].ts >= ts (bars sorted ascending); bars.length if none.
+function idxTsOnOrAfter(bars: IntradayBar[], ts: string): number {
+  let lo = 0, hi = bars.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (bars[mid].ts < ts) lo = mid + 1; else hi = mid; }
+  return lo;
+}
 
 // Native 5-min NIFTY candles for ONE trading day, with entry/exit markers for that day's
 // fired trade(s). Forks Candles' SVG/scale/zoom-pan/tooltip skeleton (same hand-rolled-SVG
@@ -2446,11 +2564,15 @@ type IntradaySignalsResp = {
 // a single trading day (~75 bars) doesn't need that machinery (no weekly S/R, no volume --
 // the raw index has none). Markers are new territory: `picked` elsewhere in this app is only
 // ever a *table* annotation, never drawn on a chart.
-function IntradayCandles({ series, trades }: { series: IntradayBar[]; trades: IntradayTrade[] }) {
+function IntradayCandles({ series, trades, tf, dailyFull, showIntradayZones }: {
+  series: IntradayBar[]; trades: IntradayTrade[]; tf: NiftyTF; dailyFull: IntradayBar[]; showIntradayZones: boolean;
+}) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [win, setWin] = useState<{ s: number; e: number }>({ s: 0, e: series.length });
   const [sel, setSel] = useState<number | null>(null);
   useEffect(() => { setWin({ s: 0, e: series.length }); setSel(null); }, [series]);
+  const intraday = tf === "5m" || tf === "15m";
+  const tickLabel = (ts: string) => (intraday ? ts.slice(11, 16) : ts.slice(5, 10));
 
   const W = 900, H = 340, padX = 40, padTop = 14, padBot = 34;
   const total = series.length;
@@ -2462,6 +2584,34 @@ function IntradayCandles({ series, trades }: { series: IntradayBar[]; trades: In
   const cw = Math.max(1, Math.min(10, slot * 0.7));
   const x = (i: number) => padX + slot * (i + 0.5);
   const idxOf = (ts: string) => series.findIndex((b) => b.ts === ts);
+
+  // Daily-based S/R zones (tol defaults to 2%, matching stock charts): computed from NIFTY's own
+  // daily OHLC history, scoped to never look past the last visible bar's date (or bar's day, for
+  // an intraday view) -- same no-lookahead discipline as Candles' weekly zones for stocks.
+  const lastVisibleDate = vis.length ? vis[vis.length - 1].ts.slice(0, 10) : null;
+  const dailyLevels = useMemo(() => {
+    if (!lastVisibleDate || dailyFull.length < 5) return [];
+    const endIdx = dailyFull.findIndex((b) => b.ts.slice(0, 10) > lastVisibleDate);
+    const scoped = endIdx === -1 ? dailyFull : dailyFull.slice(0, endIdx);
+    if (scoped.length < 5) return [];
+    const pts = scoped.map(barToPricePoint);
+    const dd = computeAutoDD(pts) ?? 0.10;
+    let ath = -Infinity;
+    for (const p of pts) if (p.high > ath) ath = p.high;
+    return srLevels(pts, dd, ath);
+  }, [dailyFull, lastVisibleDate]);
+  // 5-min-based S/R zones: same srLevels() algorithm, but with a 0.10% cluster tolerance instead
+  // of stocks' 2% -- NIFTY moves in far tighter absolute % terms within a session than a stock
+  // does over weeks/months, so the stock-sized band would collapse the whole visible range into
+  // one giant zone. `dd` (genuine-pullback threshold) is scaled down to match (0.5% vs stocks'
+  // ~10-20%) for the same reason.
+  const intradayLevels = useMemo(() => {
+    if (!showIntradayZones || series.length < 5) return [];
+    const pts = series.map(barToPricePoint);
+    let ath = -Infinity;
+    for (const p of pts) if (p.high > ath) ath = p.high;
+    return srLevels(pts, 0.005, ath, 0.001);
+  }, [series, showIntradayZones]);
 
   useEffect(() => {
     const node = wrapRef.current;
@@ -2561,14 +2711,39 @@ function IntradayCandles({ series, trades }: { series: IntradayBar[]; trades: In
             </g>
           );
         })}
+        {/* daily-based S/R zones (only those within the visible price range) */}
+        {dailyLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
+          const color = L.kind === "ATH" ? "#2563b0" : "#33443d";
+          const relIdx = idxTsOnOrAfter(series, L.firstDate) - s;
+          const xStart = Math.min(W - padX, Math.max(padX, x(relIdx)));
+          return (
+            <g key={`dlv${li}`}>
+              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
+              <text x={W - padX - 4} y={y(L.price) - 3} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches}</text>
+            </g>
+          );
+        })}
+        {/* 5-min-based S/R zones (0.10% tolerance), dashed + distinct color so they read as a
+            separate, tighter-timeframe layer from the daily zones above */}
+        {intradayLevels.filter((L) => L.price >= lo && L.price <= hi).map((L, li) => {
+          const color = L.kind === "ATH" ? "#2563b0" : "#a3651f";
+          const relIdx = idxTsOnOrAfter(series, L.firstDate) - s;
+          const xStart = Math.min(W - padX, Math.max(padX, x(relIdx)));
+          return (
+            <g key={`ilv${li}`}>
+              <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.6} strokeDasharray="4 3" />
+              <text x={W - padX - 4} y={y(L.price) + 10} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (5m)</text>
+            </g>
+          );
+        })}
         {ticks.map((i) => (
           <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill="#60706a"
-                textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{vis[i].ts.slice(11, 16)}</text>
+                textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{tickLabel(vis[i].ts)}</text>
         ))}
       </svg>
       {hp ? (
         <div className="candle-tip" style={{ [tipRight ? "right" : "left"]: `calc(${tipRight ? 100 - tipLeftPct : tipLeftPct}% + 10px)`, top: 8 }}>
-          <strong>{hp.ts.slice(11, 16)}</strong>
+          <strong>{tickLabel(hp.ts)}</strong>
           {chgPct != null ? (
             <span>Chg <b style={{ color: chgPct >= 0 ? up : down }}>{chgPct >= 0 ? "+" : ""}{num(chgPct, 2)}%</b></span>
           ) : null}
@@ -2585,8 +2760,10 @@ function IntradayCandles({ series, trades }: { series: IntradayBar[]; trades: In
 function IndicesSignals() {
   const [dates, setDates] = useState<string[]>([]);
   const [date, setDate] = useState<string>("");
-  const [bars, setBars] = useState<IntradayBar[]>([]);
+  const [bars5m, setBars5m] = useState<IntradayBar[]>([]);
+  const [dailyBars, setDailyBars] = useState<IntradayBar[]>([]);
   const [signals, setSignals] = useState<IntradaySignalsResp | null>(null);
+  const [tf, setTf] = useState<NiftyTF>("5m");
 
   useEffect(() => {
     getJson<{ dates: string[] }>("/prod2/nifty_intraday_dates").then((d) => {
@@ -2600,10 +2777,31 @@ function IndicesSignals() {
   useEffect(() => {
     if (!date) return;
     getJson<{ date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars?date=${date}`)
-      .then((d) => setBars(d.bars)).catch(() => setBars([]));
+      .then((d) => setBars5m(d.bars)).catch(() => setBars5m([]));
   }, [date]);
+  // NIFTY's own daily OHLC (years of history) -- feeds the 1D/1W timeframe views and the
+  // daily-based S/R zone layer shown on every timeframe. Fetched once, independent of `date`/`tf`.
+  useEffect(() => {
+    getJson<{ bars: DailyBar[] }>("/prod2/nifty_daily_bars?days=2500")
+      .then((d) => setDailyBars(d.bars.map((b) => ({ ts: b.date, open: b.open, high: b.high, low: b.low, close: b.close }))))
+      .catch(() => setDailyBars([]));
+  }, []);
 
-  const dayTrades = useMemo(() => (signals?.trades ?? []).filter((t) => t.date === date), [signals, date]);
+  const weeklyBars = useMemo(() => {
+    if (!dailyBars.length) return [];
+    const resampled = resample(dailyBars.map(barToPricePoint), "W");
+    return resampled.map((p) => ({ ts: p.date, open: p.open, high: p.high, low: p.low, close: p.close }));
+  }, [dailyBars]);
+
+  const isIntraday = tf === "5m" || tf === "15m";
+  const chartBars = useMemo(() => {
+    if (tf === "5m") return bars5m;
+    if (tf === "15m") return resampleBars(bars5m, 3);
+    if (tf === "1D") return dailyBars;
+    return weeklyBars;
+  }, [tf, bars5m, dailyBars, weeklyBars]);
+
+  const dayTrades = useMemo(() => (tf === "5m" ? (signals?.trades ?? []).filter((t) => t.date === date) : []), [signals, date, tf]);
   const bt = signals?.backtest_summary;
 
   return (
@@ -2629,14 +2827,23 @@ function IndicesSignals() {
           ) : <div className="sell-bt"><span className="hint">No backtest results yet — run the experiment pipeline (see experiments/nifty_intraday_breakout_v1/README.md).</span></div>}
         </div>
         <div className="panel-title-controls" style={{ padding: "0 16px 8px" }}>
-          <label className="chk"><CalendarDays size={15} />
-            <select value={date} onChange={(e) => setDate(e.target.value)} style={{ minWidth: 140 }}>
-              {dates.length ? dates.map((d) => <option key={d} value={d}>{d}</option>) : <option value="">No signal dates yet</option>}
+          <label className="chk"><LineChart size={15} />
+            <select value={tf} onChange={(e) => setTf(e.target.value as NiftyTF)} style={{ minWidth: 90 }}>
+              {(["5m", "15m", "1D", "1W"] as NiftyTF[]).map((t) => <option key={t} value={t}>{NIFTY_TF_LABEL[t]}</option>)}
             </select>
           </label>
+          {isIntraday ? (
+            <label className="chk"><CalendarDays size={15} />
+              <select value={date} onChange={(e) => setDate(e.target.value)} style={{ minWidth: 140 }}>
+                {dates.length ? dates.map((d) => <option key={d} value={d}>{d}</option>) : <option value="">No signal dates yet</option>}
+              </select>
+            </label>
+          ) : <span className="hint">{chartBars.length} {tf === "1D" ? "days" : "weeks"}</span>}
         </div>
-        {bars.length ? <IntradayCandles series={bars} trades={dayTrades} /> : <p className="hint" style={{ padding: 16 }}>
-          {date ? "No 5-min bars for this date." : "Waiting for signals.json (run gen_indices_signals.py)."}</p>}
+        {chartBars.length ? (
+          <IntradayCandles series={chartBars} trades={dayTrades} tf={tf} dailyFull={dailyBars} showIntradayZones={tf === "5m"} />
+        ) : <p className="hint" style={{ padding: 16 }}>
+          {isIntraday ? (date ? "No 5-min bars for this date." : "Waiting for signals.json (run gen_indices_signals.py).") : "No daily history yet."}</p>}
       </section>
 
       <section className="panel cockpit" style={{ marginTop: 14 }}>

@@ -409,6 +409,7 @@ table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right: 1px solid #d8
 }
 .strategy-tag.BW { background: #eef6f3; color: #167c80; }
 .strategy-tag.SIV { background: #fdf3e3; color: #b8791a; }
+.strategy-tag.CONDOR { background: #eef1fd; color: #3d4fc4; }
 
 .cash-signal-tag {
   display: inline-block;
@@ -715,6 +716,7 @@ tr.sell-secondary td {
   .cash-signal-tag.consolidation { background: #1f2a26; color: #9fb0aa; }
   .strategy-tag.BW { background: #17281f; color: #4fd1c5; }
   .strategy-tag.SIV { background: #2c2417; color: #e0a848; }
+  .strategy-tag.CONDOR { background: #1a1c30; color: #8b9cf0; }
 }
 
 .symbol-link {

@@ -54,10 +54,22 @@ sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "src"))
 from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from koscine.config import SILVER_DATA_ROOT  # noqa: E402
+from koscine import liquid_universe  # noqa: E402
+
+# Backtest universe = fixed Nifty50 (see koscine/liquid_universe.py's module docstring for why
+# it's fixed rather than the live 50+15-daily-tail the API endpoints use).
+BACKTEST_UNIVERSE = liquid_universe.backtest_universe()
 
 SHORT_OTM, FWD, SAFE_DTE = 0.02, 5, 4
 DTE_MIN, MIN_VOL = 9, 50
-MCAP_MIN_ROR, OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate -- see module docstring
+MCAP_MIN_ROR, OTHER_MIN_ROR = 108.0, 138.0   # stratified entry gate -- see module docstring.
+# Lowered from 120/150 -> 108/138 (tuned UP in frequency toward ~80-100/yr; was firing ~65/yr at
+# 120/150) so Broken-Wing, Skew, and Condor land at comparable ~80-100/yr each (~240-300/yr
+# combined) in the merged Sell Signals view, rather than Condor's much higher natural firing
+# rate drowning the other two out whenever they weren't also firing that same day. Calibrated
+# empirically against the 2024-08..2026-08 panel (entry-ROR distribution of every structurally-
+# valid candidate per tier, with the candidate->final shrinkage ratio measured from the real
+# 120/150 run) -- same data-driven-threshold approach as pipeline/labels.py's _calibrate_k.
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of the (wider) wing; below that, credit~=width
                         # and the entry_ror ratio becomes numerically degenerate
 
@@ -107,8 +119,10 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         if sym in EXCLUDE_SYMBOLS:
             continue
+        if sym not in BACKTEST_UNIVERSE:
+            continue                  # outside the backtest's fixed Nifty50 universe
         p = tpos.get(pd.Timestamp(e_date))
-        if p is None or p == 0 or p + FWD - 1 >= len(tdays):
+        if p is None or p == 0:
             continue
         t = pd.Timestamp(tdays[p - 1])
         ivr = IV.get((sym, t))
@@ -119,7 +133,11 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
             continue
         chain = day[day["expiry"] == exp]
         dte = int((exp - pd.Timestamp(e_date)).days)
+        # win may be shorter than FWD near the end of available history -- the trade is still
+        # shown, marked "pending" below, rather than withheld until the full window exists.
         win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
+        if not win:
+            continue   # entry is the very last day in history -- no forward data at all yet
         def pick(ot, tgt):
             c = chain[chain["opt_type"] == ot]
             if c.empty:
@@ -148,8 +166,8 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
         min_ror_here = MCAP_MIN_ROR if sym in A_MCAP else OTHER_MIN_ROR
         if entry_ror <= min_ror_here:
             continue
-        vals, dd = [], 0.0
-        for i in range(FWD):
+        vals, dd, exited_early = [], 0.0, False
+        for i in range(len(win)):
             legbars = [seqs[k][1][i] for k in ("sc", "lc", "sp", "lp")]
             if not any(b is None or b[2] < MIN_VOL for b in legbars):
                 value = (legbars[0][1] - legbars[1][1]) + (legbars[2][1] - legbars[3][1])
@@ -158,10 +176,15 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
                 vals.append((upnl, value))
                 dd = min(dd, upnl)
             if (exp - win[i]).days <= SAFE_DTE:
+                exited_early = True
                 break
         if not vals:
             continue
-        exit_value = vals[-1][1]; pnl = credit - exit_value
+        # complete = outcome is actually known; otherwise the trade is still genuinely open
+        # (win just hasn't reached FWD days yet) -- report it as pending, not a fabricated result.
+        complete = exited_early or (len(win) == FWD)
+        exit_value = vals[-1][1]
+        pnl = round(credit - exit_value, 2) if complete else None
         lot = lot_size(sym, exp)
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
@@ -177,9 +200,9 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "exit_value": round(exit_value, 2),
-            "pnl": round(pnl, 2), "pnl_per_lot": round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None,
-            "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
-            "outcome": "win" if pnl > 0 else "loss",
+            "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if pnl is not None and lot is not None and pd.notna(lot) else None),
+            "ror_pct": (round(pnl / risk * 100, 1) if pnl is not None else None), "max_dd_pct": round(dd / risk * 100, 1),
+            "outcome": ("win" if pnl > 0 else "loss") if pnl is not None else "pending",
         })
     return out
 
@@ -193,7 +216,9 @@ for tier_id, wing_ce, wing_pe in TIERS:
 df = pd.DataFrame(all_out).sort_values(["tier", "entry_date"])
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
 df.to_csv(outdir / "broken_wing_signal_history.csv", index=False)
-print(f"wrote {len(df)} signals (all tiers) -> {outdir / 'broken_wing_signal_history.csv'}")
-print(df.groupby("tier").agg(n=("pnl", "size"), win=("outcome", lambda s: (s == "win").mean()),
+n_pending = int((df["outcome"] == "pending").sum())
+print(f"wrote {len(df)} signals (all tiers, {n_pending} pending) -> {outdir / 'broken_wing_signal_history.csv'}")
+print(df.groupby("tier").agg(n=("pnl", "size"),
+                             win=("outcome", lambda s: (s == "win").sum() / max(1, (s != "pending").sum())),
                              ev_ror=("ror_pct", "mean"), median_ror=("ror_pct", "median"),
                              worst_ror=("ror_pct", "min"), worst_dd=("max_dd_pct", "min")).round(1).to_string())

@@ -169,8 +169,22 @@ def fetch_contract_candles(token: str, expired_key: str, expiry: date) -> tuple[
     return bars5, n_failed, n_ok
 
 
-def _load_spot() -> pd.DataFrame | None:
-    f = ROOT / "data" / "intraday" / "nifty_5m.parquet"
+SYMBOL_SLUGS = {  # instrument_key -> filename slug, matching this project's existing naming
+                  # convention (see download_nifty_5m.py's own --instrument example)
+    "NSE_INDEX|Nifty 50": "nifty",
+    "NSE_INDEX|Nifty Bank": "banknifty",
+}
+
+
+def _symbol_slug(instrument_key: str) -> str:
+    if instrument_key in SYMBOL_SLUGS:
+        return SYMBOL_SLUGS[instrument_key]
+    name = instrument_key.split("|", 1)[-1]
+    return "".join(ch.lower() for ch in name if ch.isalnum())
+
+
+def _load_spot(instrument_key: str) -> pd.DataFrame | None:
+    f = ROOT / "data" / "intraday" / f"{_symbol_slug(instrument_key)}_5m.parquet"
     if not f.exists():
         return None
     spot = pd.read_parquet(f, columns=["timestamp", "close"]).rename(columns={"close": "underlying_close"})
@@ -228,17 +242,24 @@ def _pivot_to_chain(rows: list[tuple[dict, pd.DataFrame]], expiry_str: str, spot
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--instrument", default=DEFAULT_INSTRUMENT)
-    ap.add_argument("--out-dir", default=str(ROOT / "data" / "intraday" / "nifty_option_chain_5m"))
+    ap.add_argument("--out-dir", default=None, help="default: data/intraday/{symbol}_option_chain_5m, "
+                                                       "derived from --instrument")
     args = ap.parse_args()
 
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not token:
         raise SystemExit("UPSTOX_ACCESS_TOKEN is not set")
 
-    out_dir = Path(args.out_dir)
+    slug = _symbol_slug(args.instrument)
+    out_dir = Path(args.out_dir) if args.out_dir else ROOT / "data" / "intraday" / f"{slug}_option_chain_5m"
     out_dir.mkdir(parents=True, exist_ok=True)
-    spot = _load_spot()
-    print(f"[option_chain_5m] underlying spot join: {'available' if spot is not None else 'NOT FOUND (run download_nifty_5m.py first for underlying_close)'}", flush=True)
+    spot = _load_spot(args.instrument)
+    spot_file = ROOT / "data" / "intraday" / f"{slug}_5m.parquet"
+    if spot is not None:
+        spot_msg = "available"
+    else:
+        spot_msg = f"NOT FOUND -- run download_nifty_5m.py --instrument '{args.instrument}' --out {spot_file} first"
+    print(f"[option_chain_5m] underlying spot join: {spot_msg}", flush=True)
 
     expiries = list_expiries(token, args.instrument)
     expiries = sorted(expiries, reverse=True)  # latest expiry first, walk backward in time

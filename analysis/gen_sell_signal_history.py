@@ -36,10 +36,24 @@ ROOT = Path(r"C:\Users\rahul\Koscine 3.0")
 sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "src"))
 from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
+from koscine import liquid_universe  # noqa: E402
+
+# Backtest universe = fixed Nifty50 (see koscine/liquid_universe.py's module docstring for why
+# it's fixed rather than the live 50+15-daily-tail the API endpoints use).
+BACKTEST_UNIVERSE = liquid_universe.backtest_universe()
 
 SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.05, 5, 4   # wing widened 3%->5%: same win rate ballpark,
                                                       # meaningfully higher absolute rupee profit per lot
-DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 150.0, 50
+DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 260.0, 50   # MIN_ENTRY_ROR raised from 150 -> 260:
+# tuned to hit ~80-100/yr (was firing ~755/yr at 150, drowning out Broken-Wing (~65/yr) and Skew
+# (~63/yr) in the merged Sell Signals view whenever they weren't also firing that same day --
+# Condor was never actually beating them head-to-head, it just fired on ~10x more days). The
+# 3 strategies are being tuned toward a comparable ~80-100/yr each (~240-300/yr combined), rather
+# than one strategy dominating by raw firing frequency. Calibrated empirically against the
+# 2024-08..2026-08 panel (entry-ROR distribution of every structurally-valid candidate, with the
+# candidate->final shrinkage ratio measured from a real run at threshold=280 and applied to
+# extrapolate this value) -- same data-driven-threshold approach as pipeline/labels.py's
+# _calibrate_k, not a guessed round number.
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # entry_ror ratio becomes numerically degenerate (blows toward infinity)
 panel = pd.read_parquet(sys.argv[1])
@@ -74,8 +88,10 @@ def legseq(sym, ot, exp, strike, win):
 out = []
 for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     p = tpos.get(pd.Timestamp(e_date))
-    if p is None or p == 0 or p + FWD - 1 >= len(tdays):
+    if p is None or p == 0:
         continue
+    if sym not in BACKTEST_UNIVERSE:
+        continue                      # outside the backtest's fixed Nifty50 universe
     t = pd.Timestamp(tdays[p - 1])
     ivr = IV.get((sym, t))                          # recorded for context, no longer a hard gate
     u = day["underlying"].iloc[0]
@@ -87,7 +103,13 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         continue
     chain = day[day["expiry"] == exp]
     dte = int((exp - pd.Timestamp(e_date)).days)
+    # win may come back shorter than FWD near the end of available history -- that's fine, the
+    # trade is shown "pending" (see below) rather than withheld until the full window exists.
+    # Only the very last day in tdays has NO forward day at all; that one genuinely can't be
+    # marked and is skipped below via `if not win`.
     win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
+    if not win:
+        continue
     def pick(ot, tgt):
         c = chain[chain["opt_type"] == ot]
         if c.empty:
@@ -116,8 +138,8 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     # daily mark-to-close: cost to close the condor each day; unrealized pnl = credit - value.
     # Any day where a leg's volume is too thin is skipped (not marked at a stale/illiquid print);
     # forced exit once DTE drops to <=SAFE_DTE (ahead of the E-4 delivery-margin ramp).
-    vals, dd = [], 0.0
-    for i in range(FWD):
+    vals, dd, exited_early = [], 0.0, False
+    for i in range(len(win)):
         legbars = [seqs[k][1][i] for k in ("sc", "lc", "sp", "lp")]
         if not any(b is None or b[2] < MIN_VOL for b in legbars):
             value = (legbars[0][1] - legbars[1][1]) + (legbars[2][1] - legbars[3][1])
@@ -128,13 +150,23 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
             vals.append((upnl, value))
             dd = min(dd, upnl)
         if (exp - win[i]).days <= SAFE_DTE:   # forced exit before the E-4 delivery-margin ramp
+            exited_early = True
             break
     if not vals:
         continue
-    exit_value = vals[-1][1]; pnl = credit - exit_value
+    # complete = the trade's outcome is actually known (either it force-exited within the window
+    # that exists, or the window itself was the full FWD days). If win got truncated short of FWD
+    # only because tdays hasn't reached that far yet, the trade is still genuinely open -- report
+    # it (so today's/yesterday's entries aren't silently withheld) but leave pnl/ror/outcome null
+    # rather than fabricate a final result from an incomplete mark.
+    complete = exited_early or (len(win) == FWD)
+    exit_value = vals[-1][1]
+    pnl = round(credit - exit_value, 2) if complete else None
     lot = lot_size(sym, exp)
     out.append({
-        "symbol": sym, "group": g2[sym], "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
+        # liquid-universe members outside the static A/B groups have no group label -- tag them
+        # C_liquid rather than KeyError (same fallback the broken-wing script already uses)
+        "symbol": sym, "group": g2.get(sym, "C_liquid"), "signal_date": t.date().isoformat(), "entry_date": pd.Timestamp(e_date).date().isoformat(),
         "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
         "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
         "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]), "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
@@ -145,15 +177,18 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
         "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
         "exit_value": round(exit_value, 2),
-        "pnl": round(pnl, 2), "pnl_per_lot": round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None,
-        "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
-        "outcome": "win" if pnl > 0 else "loss",
+        "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if pnl is not None and lot is not None and pd.notna(lot) else None),
+        "ror_pct": (round(pnl / risk * 100, 1) if pnl is not None else None), "max_dd_pct": round(dd / risk * 100, 1),
+        "outcome": ("win" if pnl > 0 else "loss") if pnl is not None else "pending",
     })
 
 df = pd.DataFrame(out).sort_values("entry_date")
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
 df.to_csv(outdir / "signal_history.csv", index=False)
-print(f"wrote {len(df)} signals -> {outdir / 'signal_history.csv'}")
-print(df.groupby("group").agg(n=("pnl", "size"), win=("outcome", lambda s: (s == "win").mean()),
+n_pending = int((df["outcome"] == "pending").sum())
+print(f"wrote {len(df)} signals ({n_pending} pending, forward window not complete yet) -> {outdir / 'signal_history.csv'}")
+# win rate is over COMPLETED trades only -- pending rows have no outcome yet and shouldn't dilute it
+print(df.groupby("group").agg(n=("pnl", "size"),
+                              win=("outcome", lambda s: (s == "win").sum() / max(1, (s != "pending").sum())),
                               ev_ror=("ror_pct", "mean"), median_ror=("ror_pct", "median"),
                               worst_ror=("ror_pct", "min"), worst_dd=("max_dd_pct", "min")).round(1).to_string())
