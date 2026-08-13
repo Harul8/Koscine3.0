@@ -141,7 +141,7 @@ function useSortedRows<T>(rows: T[], defaultKey: keyof T, defaultDir: GenericSor
       let cmp: number;
       if (typeof av === "string" && typeof bv === "string") cmp = av.localeCompare(bv);
       else if (typeof av === "boolean" && typeof bv === "boolean") cmp = av === bv ? 0 : av ? 1 : -1;
-      else cmp = av < (bv as never) ? -1 : av > (bv as never) ? 1 : 0;
+      else cmp = (av as number) < (bv as number) ? -1 : (av as number) > (bv as number) ? 1 : 0;
       return sort.direction === "asc" ? cmp : -cmp;
     });
     return copy;
@@ -1264,6 +1264,7 @@ type SellResp = {
 type SellHistRow = {
   symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
+  oi_short_ce: number | null; oi_long_ce: number | null; oi_short_pe: number | null; oi_long_pe: number | null;
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
@@ -1289,18 +1290,24 @@ function SellSignalsTab() {
 type MergedRow = {
   strategy: "BW" | "SIV" | "CONDOR"; tierId: string; tierLabel: string; rank: number;
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
-  sideDesc: string; positionDesc: string;
+  sideDesc: string; positionDesc: string; oiDesc: string;
   credit: number; max_profit: number; max_risk: number; lot_size: number | null;
   max_profit_per_lot: number | null; max_risk_per_lot: number | null; ror_pct: number;
 };
 type MergedHistRow = {
   strategy: "BW" | "SIV" | "CONDOR"; tierId: string; symbol: string; group: string; signal_date: string;
-  expiry: string; dte: number; iv_ratio: number | null; positionDesc: string;
+  expiry: string; dte: number; iv_ratio: number | null; positionDesc: string; oiDesc: string;
   credit: number; max_profit: number; max_risk: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
   entry_ror_pct: number;   // theoretical ROR knowable at entry -- used to rank/dedup still-"pending" rows, which have no realized ror_pct yet
   exit_value: number; pnl: number | null; pnl_per_lot: number | null; ror_pct: number | null; max_dd_pct: number; outcome: string;   // outcome may be "pending" -- forward window not complete yet, see gen_sell_signal_history.py
 };
+// OI (lots) for the strikes actually in play, formatted to match positionDesc's short/long
+// pairing -- "1094/789" style (short leg / long leg). BW & Condor show both CE and PE pairs
+// (mirroring positionDesc's "C x/y . P x/y"); Skew shows a single pair for whichever side sold.
+function oiPair(short: number | null, long: number | null): string {
+  return `${short ?? "—"}/${long ?? "—"}`;
+}
 const MERGED_TIER_LABEL: Record<string, string> = {
   condor: "Condor · 2%/5%",
   t1_2x6: "Tier 1 · 2%/6%", t2_3x8: "Tier 2 · 3%/8%", t3_2x10: "Tier 3 · 2%/10%",
@@ -1366,6 +1373,7 @@ function MergedSellSignals() {
       symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
       sideDesc: `${r.richer_side === "CE" ? "Call" : "Put"} richer`,
       positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      oiDesc: `C ${oiPair(r.oi_short_ce, r.oi_long_ce)} · P ${oiPair(r.oi_short_pe, r.oi_long_pe)}`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
     })));
@@ -1374,6 +1382,7 @@ function MergedSellSignals() {
       symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
       sideDesc: `Sell ${r.side === "CE" ? "Call" : "Put"}`,
       positionDesc: `${num(r.short_strike, 0)}/${num(r.long_strike, 0)} BE ${num(r.breakeven, 0)}`,
+      oiDesc: oiPair(r.oi_short, r.oi_long),
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
     })));
@@ -1382,6 +1391,7 @@ function MergedSellSignals() {
       symbol: r.symbol, group: r.group, expiry: r.expiry, dte: r.dte, underlying: r.underlying, iv_ratio: r.iv_ratio,
       sideDesc: `${r.richer_side === "CE" ? "Call" : "Put"} richer`,
       positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      oiDesc: `C ${oiPair(r.oi_short_ce, r.oi_long_ce)} · P ${oiPair(r.oi_short_pe, r.oi_long_pe)}`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_profit_per_lot: r.max_profit_per_lot, max_risk_per_lot: r.max_risk_per_lot, ror_pct: r.ror_pct,
     }));
@@ -1397,6 +1407,7 @@ function MergedSellSignals() {
       strategy: "BW" as const, tierId: r.tier, symbol: r.symbol, group: r.group, signal_date: r.signal_date,
       expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
       positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      oiDesc: `C ${oiPair(r.oi_short_ce, r.oi_long_ce)} · P ${oiPair(r.oi_short_pe, r.oi_long_pe)}`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
       exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
@@ -1405,6 +1416,7 @@ function MergedSellSignals() {
       strategy: "SIV" as const, tierId: r.tier, symbol: r.symbol, group: r.group, signal_date: r.signal_date,
       expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
       positionDesc: `${num(r.short_strike, 0)}/${num(r.long_strike, 0)} (${r.side})`,
+      oiDesc: oiPair(r.oi_short, r.oi_long),
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
       exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
@@ -1413,6 +1425,7 @@ function MergedSellSignals() {
       strategy: "CONDOR" as const, tierId: "condor", symbol: r.symbol, group: r.group, signal_date: r.signal_date,
       expiry: r.expiry, dte: r.dte, iv_ratio: r.iv_ratio,
       positionDesc: `C ${num(r.short_ce, 0)}/${num(r.long_ce, 0)} · P ${num(r.short_pe, 0)}/${num(r.long_pe, 0)}`,
+      oiDesc: `C ${oiPair(r.oi_short_ce, r.oi_long_ce)} · P ${oiPair(r.oi_short_pe, r.oi_long_pe)}`,
       credit: r.credit, max_profit: r.max_profit, max_risk: r.max_risk, lot_size: r.lot_size,
       max_risk_per_lot: r.max_risk_per_lot, max_profit_per_lot: r.max_profit_per_lot, entry_ror_pct: r.entry_ror_pct,
       exit_value: r.exit_value, pnl: r.pnl, pnl_per_lot: r.pnl_per_lot, ror_pct: r.ror_pct, max_dd_pct: r.max_dd_pct, outcome: r.outcome,
@@ -1499,7 +1512,7 @@ function MergedSellSignals() {
               <SortTh label="Exp / DTE" sortKey="dte" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Spot" sortKey="underlying" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="IV rich" sortKey="iv_ratio" sort={dailySort.sort} onSort={dailySort.onSort} />
-              <th>Side</th><th>Position</th>
+              <th>Side</th><th>Position</th><th>OI (lots)</th>
               <SortTh label="Credit" sortKey="credit" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Lot size" sortKey="lot_size" sort={dailySort.sort} onSort={dailySort.onSort} />
               <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={dailySort.sort} onSort={dailySort.onSort} />
@@ -1517,6 +1530,7 @@ function MergedSellSignals() {
                   <td>{r.iv_ratio != null ? <span className={r.iv_ratio >= 1.1 ? "move-up" : "hint"}>{r.iv_ratio.toFixed(2)}×</span> : "—"}</td>
                   <td className="hint">{r.sideDesc}</td>
                   <td className="hint">{r.positionDesc}</td>
+                  <td className="hint">{r.oiDesc}</td>
                   <td>{num(r.credit, 1)}</td>
                   <td>{r.lot_size ?? "—"}</td>
                   <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
@@ -1524,7 +1538,7 @@ function MergedSellSignals() {
                   <td><strong>{r.ror_pct.toFixed(0)}%</strong></td>
                 </tr>
               ))}
-              {!dailyFlat.length && <tr><td colSpan={12} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
+              {!dailyFlat.length && <tr><td colSpan={13} className="empty-cell">No candidate clears the ret/risk bar in any tier today</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1567,6 +1581,7 @@ function MergedSellSignals() {
               <SortTh label="Exp / DTE" sortKey="dte" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="IV" sortKey="iv_ratio" sort={histSort.sort} onSort={histSort.onSort} />
               <th>Position</th>
+              <th>OI (lots)</th>
               <SortTh label="Credit" sortKey="credit" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="Lot size" sortKey="lot_size" sort={histSort.sort} onSort={histSort.onSort} />
               <SortTh label="Max profit/lot" sortKey="max_profit_per_lot" sort={histSort.sort} onSort={histSort.onSort} />
@@ -1587,6 +1602,7 @@ function MergedSellSignals() {
                   <td>{r.expiry.slice(5)} · {r.dte}d</td>
                   <td>{r.iv_ratio != null ? `${r.iv_ratio.toFixed(2)}×` : "—"}</td>
                   <td className="hint">{r.positionDesc}</td>
+                  <td className="hint">{r.oiDesc}</td>
                   <td>{num(r.credit, 1)}</td>
                   <td>{r.lot_size ?? "—"}</td>
                   <td className="move-up">{r.max_profit_per_lot != null ? `₹${Math.round(r.max_profit_per_lot).toLocaleString("en-IN")}` : "—"}</td>
@@ -1603,7 +1619,7 @@ function MergedSellSignals() {
                   <td>{r.outcome === "win" ? "✓" : r.outcome === "pending" ? <span className="hint" title="forward window not complete yet">…</span> : "✕"}</td>
                 </tr>
               ))}
-              {!histRows.length && <tr><td colSpan={allSyms ? 16 : 15} className="empty-cell">No signals</td></tr>}
+              {!histRows.length && <tr><td colSpan={allSyms ? 17 : 16} className="empty-cell">No signals</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1800,6 +1816,7 @@ type BWHistRow = {
   tier: string; symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   short_ce: number; long_ce: number; short_pe: number; long_pe: number;
   call_width_pct: number; put_width_pct: number;
+  oi_short_ce: number | null; oi_long_ce: number | null; oi_short_pe: number | null; oi_long_pe: number | null;
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
@@ -2047,7 +2064,9 @@ function BrokenWingStrategy() {
 type SkewTierRow = {
   symbol: string; group: string; expiry: string; dte: number; underlying: number; iv_ratio: number | null;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number;
-  short_strike: number; long_strike: number; sell_premium: number; buy_premium: number;
+  short_strike: number; long_strike: number;
+  oi_short: number | null; oi_long: number | null;
+  sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; lot_size: number | null; max_risk_per_lot: number | null;
   max_profit: number; max_profit_per_lot: number | null;
   ror_pct: number; breakeven: number; in_window: boolean;
@@ -2058,6 +2077,7 @@ type SkewTieredResp = { as_of: string | null; params: Record<string, number>; ex
 type SkewTieredHistRow = {
   tier: string; symbol: string; group: string; signal_date: string; expiry: string; dte: number; iv_ratio: number | null;
   side: "CE" | "PE"; ce_iv: number; pe_iv: number; skew: number; short_strike: number; long_strike: number;
+  oi_short: number | null; oi_long: number | null;
   sell_premium: number; buy_premium: number;
   credit: number; max_risk: number; max_profit: number;
   lot_size: number | null; max_risk_per_lot: number | null; max_profit_per_lot: number | null;
@@ -2892,15 +2912,28 @@ function IndicesSignals() {
       .then((d) => setDailyBars(d.bars.map((b) => ({ ts: b.date, open: b.open, high: b.high, low: b.low, close: b.close }))))
       .catch(() => setDailyBars([]));
   }, []);
-  // Default the date picker to the latest available trading day once daily bars load.
-  useEffect(() => { if (dailyBars.length && !date) setDate(dailyBars[dailyBars.length - 1].ts); }, [dailyBars, date]);
+  // Default the date picker to TODAY's actual calendar date, not the latest daily bar -- the
+  // daily-bars table only gets today's row after an EOD downloader run, so defaulting to its
+  // last entry showed yesterday's chart even mid-session. /prod2/nifty_intraday_bars_range
+  // gracefully falls back to the most recent trading day if today has no data yet (weekend,
+  // holiday, or before the live poller's first poll), so defaulting to today is always safe.
+  useEffect(() => { if (!date) setDate(new Date().toLocaleDateString("en-CA")); }, [date]);
   // 30 trailing trading days of 5-min bars ENDING at the selected date (never past it) -- enough
   // for a 150-trailing-candle 5m/15m view plus scrollback for the </>/arrow-key panning, without
-  // clipping the chart to a single day the way the old per-date-only fetch did.
+  // clipping the chart to a single day the way the old per-date-only fetch did. When `date` is
+  // today, the API splices in production/nifty_live_poller.py's live bars (09:15 onward,
+  // refreshed every 5 min) -- poll every 60s here so the chart keeps moving forward on its own
+  // instead of needing a manual refresh.
   useEffect(() => {
     if (!date) return;
-    getJson<{ end_date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars_range?end_date=${date}&trading_days=30`)
-      .then((d) => setBars5mRange(d.bars)).catch(() => setBars5mRange([]));
+    const fetchRange = () => {
+      getJson<{ end_date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars_range?end_date=${date}&trading_days=30`)
+        .then((d) => setBars5mRange(d.bars)).catch(() => setBars5mRange([]));
+    };
+    fetchRange();
+    if (date !== new Date().toLocaleDateString("en-CA")) return;
+    const id = setInterval(fetchRange, 60000);
+    return () => clearInterval(id);
   }, [date]);
 
   const weeklyBars = useMemo(() => {

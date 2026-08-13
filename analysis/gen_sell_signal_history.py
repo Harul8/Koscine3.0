@@ -3,6 +3,18 @@ fired (entry-time credit/max_risk > MIN_ENTRY_ROR, DTE >= DTE_MIN), with entry /
 max-drawdown per trade. Writes locks/prod_sell_strategies/signal_history.csv for the API
 (/prod2/sell_signal_history) to serve.
 
+UNIFIED with the live /prod2/sell_strategies endpoint (2026-08, explicit user decision):
+universe, ROR gate, and structure now match exactly (koscine.liquid_universe.live_universe_for_date
+== NIFTY50 + that day's top-15 liquid non-Nifty50 tail, same as the live panel's
+live_universe_today(); MIN_ENTRY_ROR == CONDOR_MIN_ROR == 150%). Only the SINGLE best (highest
+entry_ror_pct) candidate per day is kept as a real signal -- matching the live panel's
+"top_picks[0] is THE 1-pick/day rule" -- not every candidate that happened to clear the bar that
+day. Selection is entry-time-only (deterministic, never revisited); see
+analysis/append_daily_sell_signals.py for the separate, ongoing "mark still-open trades to
+market" concern this script does NOT handle day to day anymore (see that script's docstring).
+Reads from bw_panel.parquet (NOT panel.parquet) -- its universe/moneyness band is a strict
+superset of what a live_universe_for_date() lookup can ever need.
+
 The gating criterion is MIN_ENTRY_ROR: the entry-time credit/max_risk ratio (the theoretical
 max-profit/max-risk of the SETUP, knowable before the trade, unlike the realized ror_pct column
 which is the ex-post outcome and can't be gated on in advance). IV-richness is recorded for
@@ -22,9 +34,9 @@ stale/illiquid EOD print -- this is what a KAYNES trade (Jul 2026) exposed: an i
 settlement (a capped condor can never owe more than its width) and was traced to a thin-volume
 print, not a real loss. A [0, width] clamp on the daily mark backstops this.
 
-Pipeline:
-  1. python analysis/build_sell_panel.py 2024-08-01 2026-08-05 panel.parquet   # cache the A/B option panel
-  2. python analysis/gen_sell_signal_history.py panel.parquet                   # -> locks/prod_sell_strategies/signal_history.csv
+Pipeline (one-time / full-history rebuild only -- NOT part of the daily refresh anymore):
+  1. python analysis/build_broken_wing_panel.py 2024-08-01 2026-08-05 bw_panel.parquet
+  2. python analysis/gen_sell_signal_history.py bw_panel.parquet   # -> locks/prod_sell_strategies/signal_history.csv
 """
 from __future__ import annotations
 import sys, json
@@ -38,24 +50,36 @@ from koscine3.data.sources import load_market_data  # noqa: E402
 from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from koscine import liquid_universe  # noqa: E402
 
-# Backtest universe = fixed Nifty50 (see koscine/liquid_universe.py's module docstring for why
-# it's fixed rather than the live 50+15-daily-tail the API endpoints use).
-BACKTEST_UNIVERSE = liquid_universe.backtest_universe()
-
 SHORT_OTM, WING, FWD, SAFE_DTE = 0.02, 0.05, 5, 4   # wing widened 3%->5%: same win rate ballpark,
                                                       # meaningfully higher absolute rupee profit per lot
-DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 260.0, 50   # MIN_ENTRY_ROR raised from 150 -> 260:
-# tuned to hit ~80-100/yr (was firing ~755/yr at 150, drowning out Broken-Wing (~65/yr) and Skew
-# (~63/yr) in the merged Sell Signals view whenever they weren't also firing that same day --
-# Condor was never actually beating them head-to-head, it just fired on ~10x more days). The
-# 3 strategies are being tuned toward a comparable ~80-100/yr each (~240-300/yr combined), rather
-# than one strategy dominating by raw firing frequency. Calibrated empirically against the
-# 2024-08..2026-08 panel (entry-ROR distribution of every structurally-valid candidate, with the
-# candidate->final shrinkage ratio measured from a real run at threshold=280 and applied to
-# extrapolate this value) -- same data-driven-threshold approach as pipeline/labels.py's
-# _calibrate_k, not a guessed round number.
+DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 9, 10_000_000.0, 50   # MIN_ENTRY_ROR == CONDOR_MIN_ROR
+# (api/main.py) -- unified with the live panel's gate (2026-08). Raised 150 -> 350 -> 300 -> 500
+# -> effectively infinite = KILLED (2026-08, explicit user decision, each step data-verified):
+# Condor's realized performance consistently lagged both Broken-Wing and Skew across every
+# threshold tested -- direct comparison of the marginal candidates confirmed reallocating its
+# volume toward Skew/Broken-Wing is a real profit improvement, not just a stylistic preference
+# (Skew's 130-145% ROR band alone averaged ~2x Condor's 300-350% band on realized pnl/lot:
+# Rs8,059 vs Rs3,954). Rather than delete the strategy's code (kept for reference / possible
+# future revival), the gate is set unreachable so it structurally can never fire -- everything
+# else about this script (candidate generation, mark-to-market, the raw-candidates cache) still
+# runs normally, it just never produces a real signal.
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # entry_ror ratio becomes numerically degenerate (blows toward infinity)
+MIN_PROFIT_PER_LOT = 10_000.0   # 2026-08, explicit user decision: a candidate must clear BOTH
+# the ROR bar AND this absolute-rupee floor -- a rich ROR% on a thin-notional structure is still
+# not worth a signal slot when the target is 200-250 genuinely worthwhile trades/yr, not just
+# high ratios.
+_universe_cache: dict = {}
+
+
+def _universe_for(e_date) -> set:
+    """live_universe_for_date(), memoized per distinct date -- the per-day loop below calls this
+    once per (symbol, date) row, so without caching the SAME date's ranking gets recomputed for
+    every symbol on it (redundant for a full-history rebuild iterating ~100k rows)."""
+    key = pd.Timestamp(e_date)
+    if key not in _universe_cache:
+        _universe_cache[key] = liquid_universe.live_universe_for_date(key)
+    return _universe_cache[key]
 # Optional partial-range regen: `python gen_sell_signal_history.py panel.parquet 2026-07-01
 # 2026-08-31` only recomputes entries in [ENTRY_DATE_MIN, ENTRY_DATE_MAX] and merges the result
 # into the existing CSV (rows outside that range are preserved untouched) -- for re-running a
@@ -99,8 +123,8 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     p = tpos.get(pd.Timestamp(e_date))
     if p is None or p == 0:
         continue
-    if sym not in BACKTEST_UNIVERSE:
-        continue                      # outside the backtest's fixed Nifty50 universe
+    if sym not in _universe_for(e_date):
+        continue                      # same universe rule the live panel uses for this date
     t = pd.Timestamp(tdays[p - 1])
     ivr = IV.get((sym, t))                          # recorded for context, no longer a hard gate
     u = day["underlying"].iloc[0]
@@ -175,6 +199,14 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
     exit_value = vals[-1][1]
     pnl = round(credit - exit_value, 2)
     lot = lot_size(sym, exp)
+    max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
+
+    def oi_lots(row):
+        v = row.get("oi")
+        if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+            return None
+        return round(float(v) / float(lot))
+
     out.append({
         # liquid-universe members outside the static A/B groups have no group label -- tag them
         # C_liquid rather than KeyError (same fallback the broken-wing script already uses)
@@ -183,9 +215,11 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
         "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
         "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]), "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+        "oi_short_ce": oi_lots(sce), "oi_long_ce": oi_lots(lce), "oi_short_pe": oi_lots(spe), "oi_long_pe": oi_lots(lpe),
         "sell_premium": round(seqs["sc"][0] + seqs["sp"][0], 2), "buy_premium": round(seqs["lc"][0] + seqs["lp"][0], 2),
         "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-        "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > MIN_ENTRY_ROR,
+        "entry_ror_pct": round(entry_ror, 1),
+        "clears_primary_bar": entry_ror > MIN_ENTRY_ROR and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
         "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
         "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
         "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -197,12 +231,22 @@ for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
 
 outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exist_ok=True)
 
+# Full schema, keyed off the row dict built above -- used to give an EMPTY result (e.g. Condor's
+# gate is now unreachable, so `out`/the raw pool's passing-filter can legitimately be []) a
+# properly-columned DataFrame instead of pd.DataFrame([])'s zero-column one, which crashes the
+# very next df["outcome"] lookup below and would also write a headerless, unreadable CSV.
+_SCHEMA_COLUMNS = ["symbol", "group", "tier", "signal_date", "entry_date", "expiry", "dte", "underlying",
+                   "iv_ratio", "short_ce", "long_ce", "short_pe", "long_pe",
+                   "oi_short_ce", "oi_long_ce", "oi_short_pe", "oi_long_pe", "sell_premium", "buy_premium",
+                   "credit", "max_risk", "max_profit", "entry_ror_pct", "lot_size", "max_risk_per_lot",
+                   "max_profit_per_lot", "exit_value", "pnl", "pnl_per_lot", "ror_pct", "max_dd_pct", "outcome"]
+
 
 def _merge_partial(new_rows: list[dict], out_path, sort_cols):
     """Partial-range run: merge into the existing file instead of overwriting it -- keep every
     existing row OUTSIDE [ENTRY_DATE_MIN, ENTRY_DATE_MAX] untouched, replace only rows inside it.
     Shared by both the real-signal CSV and the raw-candidates cache below."""
-    new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(new_rows)
+    new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(columns=_SCHEMA_COLUMNS)
     if not (ENTRY_DATE_MIN or ENTRY_DATE_MAX) or not out_path.exists():
         return new_df
     old = pd.read_parquet(out_path) if out_path.suffix == ".parquet" else pd.read_csv(out_path)
@@ -218,10 +262,19 @@ cand_path = outdir / "condor_candidates_raw.parquet"
 cand_df = _merge_partial(out, cand_path, "entry_date")
 cand_df.to_parquet(cand_path, index=False)
 
-# The real signal-history CSV only ever contains candidates that clear MIN_ENTRY_ROR -- the
-# fallback "NS" row for a no-signal day is added later, by gen_no_signal_fallback.py, once it can
-# see ALL 3 strategies' candidate pools at once (not just this one).
-out = [r for r in out if r["clears_primary_bar"]]
+# The real signal-history CSV contains at most ONE row per day -- the single highest-entry_ror_pct
+# candidate that clears MIN_ENTRY_ROR, matching the live panel's "top_picks[0] is THE 1-pick/day
+# rule" (not every candidate that happened to clear the bar that day). The cross-strategy
+# fallback "NS" row for a day nothing anywhere clears is added later, by
+# gen_signal_dedup_and_fallback.py, once it can see all 3 strategies' candidate pools at once.
+by_date: dict[str, list[dict]] = {}
+for r in out:
+    by_date.setdefault(r["entry_date"], []).append(r)
+out = []
+for day_rows in by_date.values():
+    passing = [r for r in day_rows if r["clears_primary_bar"]]
+    if passing:
+        out.append(max(passing, key=lambda r: r["entry_ror_pct"]))
 for r in out:
     del r["clears_primary_bar"]
 

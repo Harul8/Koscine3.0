@@ -18,12 +18,19 @@ at every asymmetry level tested.
 Three tiers, all live in production simultaneously -- more asymmetry = better quality but
 fewer signals (clean, monotonic trade-off, confirmed at both moderate and extreme levels).
 
-Universe: UNION of the static A/B universe_groups.json (65 symbols) and each day's dynamic
-top-50-by-OI-in-lots stocks (see build_broken_wing_panel.py for why -- top-50-only actually
-REDUCED both frequency and mega-cap share vs the static universe).
+UNIFIED with the live /prod2/broken_wing_strategy endpoint (2026-08, explicit user decision):
+universe and ROR gate now match exactly (koscine.liquid_universe.live_universe_for_date ==
+NIFTY50 + that day's top-15 liquid non-Nifty50 tail, replacing the old static-A/B-UNION-top-50
+panel universe; MCAP_MIN_ROR/OTHER_MIN_ROR == BW_MCAP_MIN_ROR/BW_OTHER_MIN_ROR in api/main.py ==
+120%/150%). Only the SINGLE best (highest entry_ror_pct) candidate PER TIER PER DAY is kept as a
+real signal -- matching the live panel's per-tier "top_picks[0] is THE 1-pick/day rule" -- not
+every candidate that happened to clear that tier's bar that day. Selection is entry-time-only
+(deterministic, never revisited); see analysis/append_daily_sell_signals.py for the separate,
+ongoing "mark still-open trades to market" concern this script does NOT handle day to day
+anymore.
 
 Entry gate is STRATIFIED, not a single threshold: mega-caps (A_mcap30) need entry_ror >
-MCAP_MIN_ROR (120%), everyone else needs > OTHER_MIN_ROR (150%, unchanged). Why: mega-caps are
+MCAP_MIN_ROR (120%), everyone else needs > OTHER_MIN_ROR (150%). Why: mega-caps are
 structurally lower-IV (steadier, less wing-breach risk -- itself a quality trait for a defined-
 risk seller) so they rarely clear a uniform 150% bar; relaxing it specifically for them lifted
 mega-cap share from ~13% to 13-28%/tier and pushed unique-symbol diversity from ~28-40 to
@@ -56,22 +63,44 @@ from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from koscine.config import SILVER_DATA_ROOT  # noqa: E402
 from koscine import liquid_universe  # noqa: E402
 
-# Backtest universe = fixed Nifty50 (see koscine/liquid_universe.py's module docstring for why
-# it's fixed rather than the live 50+15-daily-tail the API endpoints use).
-BACKTEST_UNIVERSE = liquid_universe.backtest_universe()
-
 SHORT_OTM, FWD, SAFE_DTE = 0.02, 5, 4
-DTE_MIN, MIN_VOL = 9, 50
-MCAP_MIN_ROR, OTHER_MIN_ROR = 108.0, 138.0   # stratified entry gate -- see module docstring.
-# Lowered from 120/150 -> 108/138 (tuned UP in frequency toward ~80-100/yr; was firing ~65/yr at
-# 120/150) so Broken-Wing, Skew, and Condor land at comparable ~80-100/yr each (~240-300/yr
-# combined) in the merged Sell Signals view, rather than Condor's much higher natural firing
-# rate drowning the other two out whenever they weren't also firing that same day. Calibrated
-# empirically against the 2024-08..2026-08 panel (entry-ROR distribution of every structurally-
-# valid candidate per tier, with the candidate->final shrinkage ratio measured from the real
-# 120/150 run) -- same data-driven-threshold approach as pipeline/labels.py's _calibrate_k.
+DTE_MIN, MIN_VOL = 7, 50   # DTE_MIN lowered 9 -> 7 (2026-08, explicit user decision): rolling
+# forward to the NEXT expiry any time the current one drops below the floor pushes DTE (and, for
+# Skew, all the way to the following month) further out than needed -- 7 still clears E-4 forced
+# exit (SAFE_DTE=4) with a 3-day margin, same safety logic as before, just less conservative.
+MCAP_MIN_ROR, OTHER_MIN_ROR = 150.0, 155.0   # == BW_MCAP_MIN_ROR/BW_OTHER_MIN_ROR (api/main.py)
+# -- unified with the live panel's gate (2026-08). History: 150/155 -> 145/150 -> 120/125 ->
+# 190/195 -> 150/155 (2026-08, explicit user decision). The 190/195 step (data-verified against
+# broken_wing_candidates_raw.parquet) fixed the DTE=7/OI-filter volume blowup but only got mean
+# realized pnl/lot to ~Rs.6,270 -- ROR% alone doesn't select for absolute rupee payout (it's a
+# ratio, agnostic to trade size). Backed the ROR bar off again and did the actual quality lifting
+# via MIN_PROFIT_PER_LOT below instead (swept against the raw pool: at this ROR level, a
+# Rs.19k theoretical-profit floor is the highest floor that still clears a Rs.8k realized mean
+# while keeping ~70/yr volume -- tighter floors trade volume for mean pnl faster than this ROR
+# level can absorb; loosening the ROR bar further past 150/155 costs more mean pnl than it's
+# worth in added volume, per the same sweep).
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of the (wider) wing; below that, credit~=width
                         # and the entry_ror ratio becomes numerically degenerate
+MIN_OI_LOTS = 100   # 2026-08, explicit user decision: a strike with <=100 lots of open interest
+# is too thin to actually fill/exit at a sane price (wide bid/ask, real slippage not visible in
+# an EOD close print) -- excluded from strike selection entirely (not just flagged), same logic
+# as the existing MIN_VOL day-of-hold liquidity guard but applied at ENTRY strike-picking time.
+MIN_PROFIT_PER_LOT = 19_000.0   # BW-specific floor (Condor/Skew use Rs.10,000, see
+# gen_sell_signal_history.py's identical constant). Raised 10k -> 19k (2026-08, explicit user
+# decision, data-verified against broken_wing_candidates_raw.parquet): this is the ACTUAL quality
+# lever for BW's mean realized pnl/lot target (see MCAP_MIN_ROR/OTHER_MIN_ROR above for why ROR%
+# alone couldn't get there) -- 19k is the highest floor that still clears a Rs.8k mean while
+# keeping ~70/yr volume at the 150/155 ROR gate.
+_universe_cache: dict = {}
+
+
+def _universe_for(e_date) -> set:
+    """live_universe_for_date(), memoized per distinct date -- see gen_sell_signal_history.py's
+    identical helper for why (redundant per-symbol recomputation for a full-history rebuild)."""
+    key = pd.Timestamp(e_date)
+    if key not in _universe_cache:
+        _universe_cache[key] = liquid_universe.live_universe_for_date(key)
+    return _universe_cache[key]
 
 TIERS = [
     ("t1_2x6", 0.02, 0.06),
@@ -127,8 +156,8 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
             continue
         if sym in EXCLUDE_SYMBOLS:
             continue
-        if sym not in BACKTEST_UNIVERSE:
-            continue                  # outside the backtest's fixed Nifty50 universe
+        if sym not in _universe_for(e_date):
+            continue                  # same universe rule the live panel uses for this date
         p = tpos.get(pd.Timestamp(e_date))
         if p is None or p == 0:
             continue
@@ -146,8 +175,13 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
         win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
         if not win:
             continue   # entry is the very last day in history -- no forward data at all yet
+        lot = lot_size(sym, exp)   # needed up-front now: the OI-lots liquidity filter below
+                                    # divides raw share-OI by lot size before comparing to MIN_OI_LOTS
         def pick(ot, tgt):
             c = chain[chain["opt_type"] == ot]
+            if lot is not None and pd.notna(lot) and lot > 0:
+                c = c[c["oi"] / lot >= MIN_OI_LOTS]   # exclude thin strikes from consideration
+                                                       # entirely, not just flag them
             if c.empty:
                 return None
             return c.iloc[(c["strike"] - tgt).abs().argmin()]
@@ -195,17 +229,26 @@ def run_tier(tier_id: str, wing_ce: float, wing_pe: float) -> list[dict]:
         complete = exited_early or (len(win) == FWD)
         exit_value = vals[-1][1]
         pnl = round(credit - exit_value, 2)
-        lot = lot_size(sym, exp)
+        max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
+
+        def oi_lots(row):
+            v = row.get("oi")
+            if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+                return None
+            return round(float(v) / float(lot))
+
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
             "entry_date": pd.Timestamp(e_date).date().isoformat(),
             "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
             "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "short_ce": float(sce["strike"]), "long_ce": float(lce["strike"]), "short_pe": float(spe["strike"]), "long_pe": float(lpe["strike"]),
+            "oi_short_ce": oi_lots(sce), "oi_long_ce": oi_lots(lce), "oi_short_pe": oi_lots(spe), "oi_long_pe": oi_lots(lpe),
             "call_width_pct": round(call_width / u * 100, 1), "put_width_pct": round(put_width / u * 100, 1),
             "sell_premium": round(seqs["sc"][0] + seqs["sp"][0], 2), "buy_premium": round(seqs["lc"][0] + seqs["lp"][0], 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-            "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > min_ror_here,
+            "entry_ror_pct": round(entry_ror, 1),
+            "clears_primary_bar": entry_ror > min_ror_here and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -247,10 +290,19 @@ cand_path = outdir / "broken_wing_candidates_raw.parquet"
 cand_df = _merge_partial(all_out, cand_path, ["tier", "entry_date"])
 cand_df.to_parquet(cand_path, index=False)
 
-# The real signal-history CSV only ever contains candidates that clear their tier's primary bar
-# -- the fallback "NS" row for a no-signal day is added later, by gen_no_signal_fallback.py, once
-# it can see ALL 3 strategies' candidate pools at once (not just this one).
-all_out = [r for r in all_out if r["clears_primary_bar"]]
+# The real signal-history CSV contains at most ONE row per (tier, day) -- the single highest-
+# entry_ror_pct candidate that clears that tier's primary bar, matching the live panel's per-tier
+# "top_picks[0] is THE 1-pick/day rule" (not every candidate that happened to clear the bar that
+# day). The cross-strategy fallback "NS" row for a day nothing anywhere clears is added later, by
+# gen_signal_dedup_and_fallback.py, once it can see all 3 strategies' candidate pools at once.
+by_tier_date: dict[tuple, list[dict]] = {}
+for r in all_out:
+    by_tier_date.setdefault((r["tier"], r["entry_date"]), []).append(r)
+all_out = []
+for rows in by_tier_date.values():
+    passing = [r for r in rows if r["clears_primary_bar"]]
+    if passing:
+        all_out.append(max(passing, key=lambda r: r["entry_ror_pct"]))
 for r in all_out:
     del r["clears_primary_bar"]
 

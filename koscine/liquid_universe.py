@@ -118,6 +118,35 @@ def live_universe_today() -> set:
         return set(NIFTY50)
 
 
+def live_daily_tail_for_date(date, core_n_placeholder: int = DAILY_N) -> set:
+    """Same top-N-by-OI-in-lots ranking as live_daily_tail(), but for a specific historical date
+    instead of always the latest available session. Ranks on the latest OI data available ON OR
+    BEFORE `date` (no look-ahead, same as live_daily_tail() ranking on "the prior available
+    session"). Lets the offline signal-history generators use the EXACT SAME universe-selection
+    rule the live endpoints use, date-by-date, instead of a separately-fixed backtest_universe()
+    -- unified by explicit user decision (2026-08), superseding the split documented in this
+    module's header."""
+    m = _oi_lots_matrix()
+    if m.empty:
+        return set()
+    d = pd.Timestamp(date).normalize()
+    avail = m.index[m.index <= d]
+    if len(avail) == 0:
+        return set()
+    row = m.loc[avail.max()].dropna().sort_values(ascending=False)
+    return set(row.head(core_n_placeholder).index)
+
+
+def live_universe_for_date(date) -> set:
+    """live_universe_today(), but for a specific historical date -- NIFTY50 (fixed 50) + that
+    date's top-15 most liquid non-Nifty50 names. Used by the offline signal-history generators
+    so history is built from the exact same universe rule as the live picks panel."""
+    try:
+        return set(NIFTY50) | live_daily_tail_for_date(date)
+    except Exception:
+        return set(NIFTY50)
+
+
 ALLOWLIST_FILE = SILVER_DATA_ROOT / "liquid_universe.txt"
 
 

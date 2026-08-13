@@ -444,6 +444,26 @@ def score_latest(bars: pd.DataFrame, booster, feature_cols: list[str]) -> tuple[
     return last_row["timestamp"].iloc[0], pred
 
 
+def _beep_alert(pattern: list[tuple[int, int]]) -> None:
+    """Audible system alert -- winsound.Beep plays through the system's default audio output
+    regardless of which window has focus (this repo always runs on Windows; a terminal bell
+    character wouldn't reliably sound if the console isn't focused). `pattern` is a list of
+    (frequency_hz, duration_ms) tuples played in sequence. Never let a beep failure (e.g. no
+    audio device) crash the poll loop -- an alert is a nice-to-have, not the poller's job."""
+    try:
+        import winsound
+        for freq, dur in pattern:
+            winsound.Beep(freq, dur)
+    except Exception as e:  # noqa: BLE001
+        print(f"[poll] beep alert failed: {e}")
+
+
+# Entry (new signal fired): higher-pitched, 3 beeps -- the actionable moment, most attention-
+# grabbing. Exit (signal resolved): lower-pitched, single beep -- informational, less urgent.
+_BEEP_ENTRY = [(1200, 250), (1200, 250), (1200, 250)]
+_BEEP_EXIT = [(700, 300)]
+
+
 def poll_once() -> None:
     import os
     import lightgbm as lgb
@@ -506,6 +526,7 @@ def poll_once() -> None:
             state["open_signal"] = None
             print(f"[poll] resolved signal from {open_sig['entry_ts']}: "
                   f"realized {exit_info['realized_move_pct']:.3f}% ({exit_info['exit_reason']})")
+            _beep_alert(_BEEP_EXIT)
         else:
             state["open_signal"] = open_sig   # persist updated direction/peak_price tracking
 
@@ -519,6 +540,7 @@ def poll_once() -> None:
         signals.append(new_sig)
         state["open_signal"] = new_sig
         print(f"[poll] FIRED: predicted {pred_move_pct:.3f}% >= {MOVE_THRESHOLD_PCT}% threshold")
+        _beep_alert(_BEEP_ENTRY)
 
     _save_signals(signals)   # always, even unchanged -- gives a live "as_of" heartbeat every
                               # poll rather than only writing the file on a firing/resolving day

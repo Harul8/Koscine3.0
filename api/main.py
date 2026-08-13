@@ -416,7 +416,20 @@ def _lot_sizes() -> dict:
     return _LOT_SIZE_CACHE["latest"]
 
 
-CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 150.0   # safety floor (delivery-margin) + THE quality gate
+MIN_PROFIT_PER_LOT = 10_000.0   # 2026-08, explicit user decision: shared across all 3 live
+# sell-strategy endpoints (and the offline generators -- see analysis/gen_sell_signal_history.py's
+# identical constant) -- a candidate must clear BOTH its ROR bar AND this absolute-rupee floor. A
+# rich ROR% on a thin-notional structure still isn't worth a signal slot.
+MIN_OI_LOTS = 100   # 2026-08, explicit user decision: shared across all 3 live sell-strategy
+# endpoints (and the offline generators -- see gen_broken_wing_signal_history.py's identical
+# constant) -- a strike with <=100 lots of open interest is excluded from strike selection
+# entirely (too thin to fill/exit at a sane price), not just flagged for display.
+
+CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 10_000_000.0   # safety floor (delivery-margin) + THE quality
+# gate -- raised 150 -> 350 -> 300 -> 500 -> effectively infinite = KILLED (2026-08, explicit
+# user decision, each step data-verified) -- see analysis/gen_sell_signal_history.py's identical
+# constant for the full rationale. Condor is intentionally left wired up (not deleted) with an
+# unreachable gate rather than removed, so it can be revived by changing one number if needed.
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # ror_pct ratio becomes numerically degenerate (blows toward infinity)
 
@@ -460,11 +473,20 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
         if ce.empty or pe.empty:
             continue
+        lot = lots.get(sym)
         def nearest(df, target):
+            if lot is not None and pd.notna(lot) and lot > 0:
+                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                if not liquid.empty:
+                    df = liquid
+                else:
+                    return None
             r = df.iloc[(df["strike"] - target).abs().argmin()]
             return r
         sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
         spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        if any(x is None for x in (sce, lce, spe, lpe)):
+            continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
         if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
             continue
@@ -474,7 +496,6 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
             continue
         ivr = ivlast.get(sym)
-        lot = lots.get(sym)
         ce_credit, pe_credit = psce - plce, pspe - plpe   # per-side contribution to total credit
         richer_side = "CE" if ce_credit >= pe_credit else "PE"
 
@@ -484,6 +505,7 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                 return None
             return round(float(v) / float(lot))
 
+        max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
         out.append({
             "symbol": sym, "group": g2.get(sym, "C_liquid"), "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
@@ -495,11 +517,12 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
-            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(max_profit_per_lot, 1) if max_profit_per_lot is not None else None,
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
             "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
-            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror
+                              and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT),
         })
     out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
     in_window = [c for c in out if c["in_window"]]
@@ -521,7 +544,12 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     }
 
 
-SKEW_DTE_MIN, SKEW_MIN_ROR = 15, 150.0   # safety floor (delivery-margin) + THE quality gate
+SKEW_DTE_MIN, SKEW_MIN_ROR = 7, 115.0   # DTE_MIN lowered 15 -> 7 (2026-08, explicit user
+# decision) -- see analysis/gen_skew_signal_history.py's identical constant for the full
+# rationale (15 forced a roll past the WHOLE current expiry, not just its last few days).
+# MIN_ROR: safety floor (delivery-margin) + THE quality gate --
+# lowered 150 -> 145 -> 130 -> 115 (2026-08, explicit user decision, data-verified) -- see
+# analysis/gen_skew_signal_history.py's identical constant for the full rationale.
 # Three tiers mirroring Broken-Wing's design: wider wing -> more credit banked, fewer signals.
 # t1 is the everyday base tier (>=~Rs.7k median PnL/lot floor), t2/t3 progressively rarer.
 # 10% wing tested and found to plateau exactly at 8%'s payout with fewer signals -- not used.
@@ -559,10 +587,19 @@ def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: 
         ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
         if ce.empty or pe.empty:
             continue
+        lot = lots.get(sym)
         def nearest(df, target):
+            if lot is not None and pd.notna(lot) and lot > 0:
+                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                if not liquid.empty:
+                    df = liquid
+                else:
+                    return None
             return df.iloc[(df["strike"] - target).abs().argmin()]
         sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
         spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        if any(x is None for x in (sce, lce, spe, lpe)):
+            continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
         if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
             continue
@@ -583,10 +620,18 @@ def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: 
         if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
             continue
         ivr = ivlast.get(sym)
-        lot = lots.get(sym)
         breakeven = float(short_leg["strike"]) + credit if side == "CE" else float(short_leg["strike"]) - credit
+        max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
+
+        def oi_lots(row):
+            v = row.get("open_int")
+            if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+                return None
+            return round(float(v) / float(lot))
+
         out.append({
             "symbol": sym, "group": g2.get(sym, "C_top50oi"), "expiry": exp.date().isoformat(), "dte": dte,
+            "oi_short": oi_lots(short_leg), "oi_long": oi_lots(long_leg),
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_leg["strike"]), "long_strike": float(long_leg["strike"]),
@@ -594,9 +639,10 @@ def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: 
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
-            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(max_profit_per_lot, 1) if max_profit_per_lot is not None else None,
             "ror_pct": round(credit / risk * 100, 1), "breakeven": round(breakeven, 1),
-            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror
+                              and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT),
         })
     return out
 
@@ -660,11 +706,20 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 # signals -- 4.6x below the next-weakest name (TMPV, Rs.2,820) -- not a fluke of a small sample.
 EXCLUDE_SYMBOLS = {"ANGELONE"}
 
-BW_DTE_MIN = 9   # same safety floor as the symmetric condor
-BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 120.0, 150.0   # stratified entry gate: mega-caps are
+BW_DTE_MIN = 7   # lowered 9 -> 7 (2026-08, explicit user decision) -- see
+# gen_broken_wing_signal_history.py's identical constant for rationale
+BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 150.0, 155.0   # stratified entry gate: mega-caps are
     # structurally lower-IV (steadier, less wing-breach risk -- itself a quality trait for a
-    # defined-risk seller) so they rarely clear a uniform 150% bar; relaxing it specifically for
-    # them lifted mega-cap share from ~13% to 13-28%/tier without a win-rate cost in backtest.
+    # defined-risk seller) so they rarely clear a uniform bar; relaxing it specifically for them
+    # lifted mega-cap share from ~13% to 13-28%/tier without a win-rate cost in backtest.
+    # History: 150/155 -> 145/150 -> 120/125 -> 190/195 -> 150/155 (2026-08, explicit user
+    # decision) -- see analysis/gen_broken_wing_signal_history.py's identical constant for the
+    # full rationale (ROR% alone couldn't hit the Rs.8k mean-pnl/lot target; backed off again and
+    # did the actual lifting via BW_MIN_PROFIT_PER_LOT below).
+BW_MIN_PROFIT_PER_LOT = 19_000.0   # BW-specific override of the shared MIN_PROFIT_PER_LOT
+    # (Rs.10,000, used by Condor/Skew) -- see gen_broken_wing_signal_history.py's identical
+    # constant for the full rationale (the lever that actually got BW's mean realized pnl/lot
+    # over Rs.8k, unified with the offline history generator's identical gate).
 _BW_TOP50_CACHE: dict = {"mtime": None, "by_date": None}
 
 
@@ -749,10 +804,19 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
         ce = chain[chain["opt_type"] == "CE"]; pe = chain[chain["opt_type"] == "PE"]
         if ce.empty or pe.empty:
             continue
+        lot = lots.get(sym)
         def nearest(df, target):
+            if lot is not None and pd.notna(lot) and lot > 0:
+                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                if not liquid.empty:
+                    df = liquid
+                else:
+                    return None
             return df.iloc[(df["strike"] - target).abs().argmin()]
         sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing_ce))
         spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing_pe))
+        if any(x is None for x in (sce, lce, spe, lpe)):
+            continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
         if any(np.isnan(x) for x in (psce, plce, pspe, plpe)):
             continue
@@ -763,7 +827,6 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
         if credit <= 0 or risk <= 0 or risk < MIN_RISK_FRAC * width:
             continue
         ivr = ivlast.get(sym)
-        lot = lots.get(sym)
         ce_credit, pe_credit = psce - plce, pspe - plpe
         richer_side = "CE" if ce_credit >= pe_credit else "PE"
 
@@ -774,6 +837,7 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
             return round(float(v) / float(lot))
 
         min_ror_here = mcap_min_ror if sym in a_mcap else other_min_ror
+        max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
         out.append({
             "symbol": sym, "group": g2.get(sym, "C_top50oi"), "expiry": exp.date().isoformat(), "dte": dte,
             "underlying": round(u, 1), "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
@@ -786,12 +850,13 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
-            "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "max_profit_per_lot": round(max_profit_per_lot, 1) if max_profit_per_lot is not None else None,
             "ror_pct": round(credit / risk * 100, 1),
             "be_low": round(float(spe["strike"]) - credit, 1), "be_high": round(float(sce["strike"]) + credit, 1),
             "richer_side": richer_side, "ce_credit": round(ce_credit, 2), "pe_credit": round(pe_credit, 2),
             "min_ror_applied": min_ror_here,
-            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror_here),
+            "in_window": bool(dte >= dte_min and credit / risk * 100 > min_ror_here
+                              and max_profit_per_lot is not None and max_profit_per_lot >= BW_MIN_PROFIT_PER_LOT),
         })
     return out
 
@@ -1055,6 +1120,20 @@ def _nifty_5m() -> pd.DataFrame:
     return _NIFTY_5M_CACHE["df"]
 
 
+def _nifty_5m_live() -> pd.DataFrame:
+    """Today's live 5-min bars from production/nifty_live_poller.py -- re-read fresh on every
+    call (no mtime cache): the file is tiny (one session's worth of bars) and the poller rewrites
+    it every 5 minutes, so a stale in-memory cache would defeat the entire point of "live". The
+    offline nifty_5m.parquet above is typically built by a downloader that only runs after close,
+    so it never has TODAY's bars while the market is open -- this is what fills that gap."""
+    f = PROJECT_ROOT / "data" / "intraday" / "nifty_5m_live.parquet"
+    if not f.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(f)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+
 def _nifty_intraday_signals() -> dict:
     data = _read_json(NIFTY_INTRADAY_LOCK / "signals.json")
     if not data:
@@ -1072,16 +1151,33 @@ def prod2_nifty_intraday_dates() -> dict[str, object]:
     return {"dates": dates}
 
 
+def _splice_in_live_day(day_bars: pd.DataFrame, target_date) -> pd.DataFrame:
+    """Replace whatever `day_bars` has for `target_date` with production/nifty_live_poller.py's
+    live bars for that date, if the poller has any -- the live file re-fetches the WHOLE current
+    session (09:15 onward) every 5 minutes, so it's always fresher/more complete for today than
+    the offline nifty_5m.parquet, which typically only gets today's data after an EOD downloader
+    run. A no-op for any date the live poller doesn't have (i.e. every date but today)."""
+    live = _nifty_5m_live()
+    if live.empty:
+        return day_bars
+    live_day = live[live["timestamp"].dt.date == target_date]
+    if live_day.empty:
+        return day_bars
+    other_days = day_bars[day_bars["timestamp"].dt.date != target_date] if not day_bars.empty else day_bars
+    return pd.concat([other_days, live_day], ignore_index=True).sort_values("timestamp")
+
+
 @app.get("/prod2/nifty_intraday_bars")
 def prod2_nifty_intraday_bars(date: str = Query(...)) -> dict[str, object]:
-    """5-min NIFTY OHLC for one trading day (YYYY-MM-DD), read straight from
-    data/intraday/nifty_5m.parquet -- this is intentionally a separate read from
-    nifty_intraday_signals so a future live 5-min poller only has to replace this one
-    function, not the signals/markers path."""
+    """5-min NIFTY OHLC for one trading day (YYYY-MM-DD), read from data/intraday/nifty_5m.parquet
+    -- with today's bars (if the live poller is running) spliced in fresh, see
+    _splice_in_live_day. Intentionally a separate read from nifty_intraday_signals so a future
+    live 5-min poller only has to replace this one function, not the signals/markers path."""
     df = _nifty_5m()
-    if df.empty:
+    day = df[df["timestamp"].dt.date.astype(str) == date].sort_values("timestamp") if not df.empty else df
+    day = _splice_in_live_day(day, pd.Timestamp(date).date())
+    if day.empty:
         return {"date": date, "bars": []}
-    day = df[df["timestamp"].dt.date.astype(str) == date].sort_values("timestamp")
     bars = [{"ts": r.timestamp.isoformat(), "open": float(r.open), "high": float(r.high),
              "low": float(r.low), "close": float(r.close)} for r in day.itertuples()]
     return {"date": date, "bars": bars}
@@ -1093,16 +1189,24 @@ def prod2_nifty_intraday_bars_range(end_date: str = Query(...), trading_days: in
     (inclusive) -- feeds the Indices tab's 5m/15m charts so a 150-trailing-candle window (and
     left/right-arrow panning) can span backward across multiple sessions instead of being
     clipped to whichever single day is selected. `end_date` is always the LAST date on the
-    resulting chart -- nothing after it is included."""
+    resulting chart -- nothing after it is included. If end_date is today and the live poller
+    has bars for it (see _splice_in_live_day), today's bars come from there instead of the
+    offline dataset -- so opening the app any time after 9:15 shows everything from market open
+    up to now, not yesterday's close."""
     df = _nifty_5m()
-    if df.empty:
-        return {"end_date": end_date, "bars": []}
     end = pd.Timestamp(end_date).date()
-    scoped = df[df["timestamp"].dt.date <= end]
-    if scoped.empty:
+    scoped = df[df["timestamp"].dt.date <= end] if not df.empty else df
+    live = _nifty_5m_live()
+    live_today = live[live["timestamp"].dt.date == end] if not live.empty else live
+    if scoped.empty and live_today.empty:
         return {"end_date": end_date, "bars": []}
-    uniq_dates = sorted(scoped["timestamp"].dt.date.unique())[-trading_days:]
-    windowed = scoped[scoped["timestamp"].dt.date >= uniq_dates[0]].sort_values("timestamp")
+    hist_dates = sorted(scoped["timestamp"].dt.date.unique()) if not scoped.empty else []
+    # trailing_days counts trading days that HAVE data, whether from history or the live file --
+    # if today is live-only (not in the offline file yet), it still counts as one of the days.
+    n_hist_days = trading_days - (1 if not live_today.empty and end not in hist_dates else 0)
+    keep_dates = set(hist_dates[-n_hist_days:]) if n_hist_days > 0 else set()
+    windowed = scoped[scoped["timestamp"].dt.date.isin(keep_dates)] if not scoped.empty else scoped
+    windowed = _splice_in_live_day(windowed, end).sort_values("timestamp")
     bars = [{"ts": r.timestamp.isoformat(), "open": float(r.open), "high": float(r.high),
              "low": float(r.low), "close": float(r.close)} for r in windowed.itertuples()]
     return {"end_date": end_date, "bars": bars}
@@ -1264,7 +1368,8 @@ def _stream_subprocess_run(kind: str, cmd: list[str], label: str, cwd: Path, env
     _LM_JOBS[kind] = {"status": "running", "started": started, "module": label, "tail": ""}
     try:
         proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 encoding="utf-8", errors="replace")
         lines: list[str] = []
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -1331,9 +1436,14 @@ def prod2_run_all(background_tasks: BackgroundTasks) -> dict[str, object]:
 
 
 def _pipeline_run(start: str, end: str) -> None:
-    """Full daily pipeline (fetch -> FII -> silver -> features -> books) for a date range, in one subprocess."""
+    """Full daily pipeline (fetch -> FII -> silver -> features -> Buy/Cash/Sell Signals) for a
+    date range, in one subprocess -- see analysis/run_daily_pipeline.py for the full stage list."""
     label = f"daily_pipeline {start}..{end}"
-    env = {**os.environ, "PYTHONPATH": f"{SRC_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
+    # PYTHONIOENCODING=utf-8: run_daily_pipeline.py's own subprocess() calls already force this
+    # for ITS children (several print non-ASCII characters, e.g. pipeline/zones.py's "->" arrow
+    # glyph -- crashes outright without it), but the pipeline script's own process needs it too
+    # for consistency with _stream_subprocess_run's matching utf-8 decode below.
+    env = {**os.environ, "PYTHONPATH": f"{SRC_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}", "PYTHONIOENCODING": "utf-8"}
     _stream_subprocess_run("refresh", [sys.executable, "-u", str(PROJECT_ROOT / "analysis" / "run_daily_pipeline.py"), start, end],
                            label, PROJECT_ROOT, env, 6000)
 

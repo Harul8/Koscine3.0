@@ -19,7 +19,13 @@ NSE's published ban list before trading until this is added.
 
 Uses a wider put-side moneyness band than the symmetric condor's (long put targets ~90% of
 spot for the widest tier).
-Usage: python analysis/build_broken_wing_panel.py 2024-08-01 2026-08-05 bw_panel.parquet
+
+Usage:
+    python analysis/build_broken_wing_panel.py 2024-08-01 2026-08-05 bw_panel.parquet   # full rebuild
+    python analysis/build_broken_wing_panel.py --append 2026-08-12 bw_panel.parquet     # incremental:
+        only fetches bhavcopy for dates after the panel's current max date through END, appends
+        and de-dupes -- for wiring into a daily "Refresh" action (see api/main.py's
+        /prod2/refresh). Falls back to a full 2024-08-01 rebuild if OUT doesn't exist yet.
 """
 from __future__ import annotations
 import json, sys
@@ -33,7 +39,21 @@ from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from pipeline.config import SILVER_TABLES  # noqa: E402
 from koscine.config import SILVER_DATA_ROOT  # noqa: E402
 
-START, END, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
+APPEND = sys.argv[1] == "--append"
+DEDUP_KEYS = ["date", "symbol", "expiry", "strike", "opt_type"]
+if APPEND:
+    END, OUT = sys.argv[2], Path(sys.argv[3])
+    existing = pd.read_parquet(OUT) if OUT.exists() else None
+    if existing is not None and len(existing):
+        existing["date"] = pd.to_datetime(existing["date"])
+        START = (existing["date"].max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        existing = None
+        START = "2024-08-01"   # no existing panel -- behaves like a full build
+else:
+    START, END, OUT = sys.argv[1], sys.argv[2], Path(sys.argv[3])
+    existing = None
+
 CE_LO, CE_HI, PE_LO, PE_HI = 0.99, 1.10, 0.85, 1.01
 TOP_N = 50
 
@@ -55,6 +75,8 @@ print(f"  {len(TOP50_BY_DATE)} trading days with an OI-in-lots ranking", flush=T
 
 frames = []
 dates = list(pd.bdate_range(START, END))
+if not dates:
+    print(f"[build_broken_wing_panel] no business days in {START}..{END} -- nothing to fetch")
 for k, d in enumerate(dates):
     names = STATIC_NAMES | TOP50_BY_DATE.get(d, set())
     bc = load_bhavcopy(d)
@@ -73,8 +95,15 @@ for k, d in enumerate(dates):
     if k % 60 == 0:
         print(f"  {k}/{len(dates)}", flush=True)
 
-panel = pd.concat(frames, ignore_index=True)
-panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
-panel["group"] = panel["symbol"].map(lambda s: g2.get(s, "C_top50oi"))
+new_panel = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=DEDUP_KEYS + ["open", "high", "low", "close", "oi", "vol", "underlying"])
+if len(new_panel):
+    new_panel["date"] = pd.to_datetime(new_panel["date"]); new_panel["expiry"] = pd.to_datetime(new_panel["expiry"])
+    new_panel["group"] = new_panel["symbol"].map(lambda s: g2.get(s, "C_top50oi"))
+
+if existing is not None and len(existing):
+    panel = pd.concat([existing, new_panel], ignore_index=True).drop_duplicates(DEDUP_KEYS, keep="last")
+else:
+    panel = new_panel
+panel = panel.sort_values(["date", "symbol"]).reset_index(drop=True)
 panel.to_parquet(OUT, index=False)
-print(f"wrote {len(panel)} rows, {panel['symbol'].nunique()} unique symbols -> {OUT}")
+print(f"wrote {len(panel)} rows ({len(new_panel)} new), {panel['symbol'].nunique()} unique symbols -> {OUT}")

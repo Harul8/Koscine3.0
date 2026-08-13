@@ -16,10 +16,20 @@ already found for the symmetric/broken-wing condor (pre-dedup, raw candidate cou
   8%:   n=26/2y,  median Rs.14,305/lot   <- t3 (plateau point)
   10%:  n=24/2y,  median Rs.14,305/lot  (flat vs 8% -- no benefit going wider, not used)
 
-De-duplicated against Broken-Wing Condor: a skew candidate is dropped if the SAME symbol also
-has a Broken-Wing signal on the same entry_date -- skew is a secondary/complementary signal,
-not a duplicate of Broken-Wing's picks. De-dup removes a meaningful chunk -- post-dedup
-production counts:
+UNIFIED with the live /prod2/skew_strategy endpoint (2026-08, explicit user decision): universe
+and ROR gate now match exactly (koscine.liquid_universe.live_universe_for_date == NIFTY50 +
+that day's top-15 liquid non-Nifty50 tail; MIN_ENTRY_ROR == SKEW_MIN_ROR in api/main.py == 150%).
+Only the SINGLE best (highest entry_ror_pct) candidate PER TIER PER DAY is kept as a real signal
+-- matching the live panel's per-tier "top_picks[0] is THE 1-pick/day rule". Selection is
+entry-time-only (deterministic, never revisited); see analysis/append_daily_sell_signals.py for
+the separate, ongoing "mark still-open trades to market" concern this script does NOT handle day
+to day anymore.
+
+De-duplicated against Broken-Wing Condor (profitability-based, see
+gen_signal_dedup_and_fallback.py): a skew candidate is dropped if the SAME symbol also has a
+MORE PROFITABLE Broken-Wing signal on the same entry_date -- skew is a secondary/complementary
+signal, not a duplicate of Broken-Wing's picks. De-dup removes a meaningful chunk -- post-dedup
+production counts (pre-unification numbers, kept for context):
   t1_skew35: 251/2y (126/yr), median Rs.7,175/lot
   t2_skew6:   24/2y  (12/yr), median Rs.13,681/lot
   t3_skew8:    9/2y   (4/yr), median Rs.11,988/lot -- thin sample, treat as directional not precise
@@ -59,22 +69,35 @@ from koscine3.largemove.mover_v2 import LOCK_V2  # noqa: E402
 from koscine.config import SILVER_DATA_ROOT  # noqa: E402
 from koscine import liquid_universe  # noqa: E402
 
-# Backtest universe = fixed Nifty50 (see koscine/liquid_universe.py's module docstring for why
-# it's fixed rather than the live 50+15-daily-tail the API endpoints use). Same universe the
-# broken-wing script it de-dupes against uses.
-BACKTEST_UNIVERSE = liquid_universe.backtest_universe()
-
 SHORT_OTM, FWD, SAFE_DTE = 0.02, 5, 4
-DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 15, 130.0, 50   # MIN_ENTRY_ROR lowered from 150 -> 130:
-# tuned UP in frequency toward ~80-100/yr (was firing ~63.5/yr at 150) so Skew, Broken-Wing, and
-# Condor land at comparable ~80-100/yr each (~240-300/yr combined) in the merged Sell Signals
-# view, rather than Condor's much higher natural firing rate drowning the other two out whenever
-# they weren't also firing that same day. Calibrated empirically against the 2024-08..2026-08
-# panel (entry-ROR distribution of every structurally-valid candidate, with the candidate->final
-# shrinkage ratio measured from the real threshold=150 run) -- same data-driven-threshold
-# approach as pipeline/labels.py's _calibrate_k, not a guessed round number.
+DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 7, 115.0, 50   # DTE_MIN lowered 15 -> 7 (2026-08, explicit user
+# decision): 15 meant rolling past the WHOLE current expiry (not just its last few days) any time
+# fewer than 15 days remained, jumping a full month out (e.g. ITC fired Aug-25 expiry's 13 DTE
+# wasn't enough, so it rolled to Sep-29/48 DTE) -- 7 still clears E-4 forced exit (SAFE_DTE=4)
+# with a 3-day margin, same safety logic, just less conservative about how early it rolls.
+# MIN_ENTRY_ROR == SKEW_MIN_ROR (api/main.py) --
+# unified with the live panel's gate (2026-08). Lowered 150 -> 145 -> 130 -> 115 (2026-08,
+# explicit user decision, data-verified): Skew is the strongest performer of the three (mean
+# realized ROR ~119-142%) -- direct comparison confirmed its looser bands still meaningfully
+# outperform Condor's tightest tail on realized pnl/lot, and Condor has since been killed
+# entirely (see gen_sell_signal_history.py) -- Skew now absorbs a bigger share of the combined
+# ~200-250/yr signal-volume target (~130/yr), split with Broken-Wing (~120/yr).
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # entry_ror ratio becomes numerically degenerate (blows toward infinity)
+MIN_PROFIT_PER_LOT = 10_000.0   # 2026-08, explicit user decision -- see
+                                 # gen_sell_signal_history.py's identical constant for rationale.
+MIN_OI_LOTS = 100   # 2026-08, explicit user decision -- see gen_broken_wing_signal_history.py's
+                     # identical constant for rationale (excludes thin strikes from selection).
+_universe_cache: dict = {}
+
+
+def _universe_for(e_date) -> set:
+    """live_universe_for_date(), memoized per distinct date -- see gen_sell_signal_history.py's
+    identical helper for why (redundant per-symbol recomputation for a full-history rebuild)."""
+    key = pd.Timestamp(e_date)
+    if key not in _universe_cache:
+        _universe_cache[key] = liquid_universe.live_universe_for_date(key)
+    return _universe_cache[key]
 R = 0.065
 
 TIERS = [
@@ -152,8 +175,8 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             continue
         if sym in EXCLUDE_SYMBOLS:
             continue
-        if sym not in BACKTEST_UNIVERSE:
-            continue                  # outside the backtest's fixed Nifty50 universe
+        if sym not in _universe_for(e_date):
+            continue                  # same universe rule the live panel uses for this date
         p = tpos.get(pd.Timestamp(e_date))
         if p is None or p == 0:
             continue
@@ -171,9 +194,14 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
         if not win:
             continue   # entry is the very last day in history -- no forward data at all yet
+        lot = lot_size(sym, exp)   # needed up-front now: the OI-lots liquidity filter below
+                                    # divides raw share-OI by lot size before comparing to MIN_OI_LOTS
 
         def pick(ot, tgt):
             c = chain[chain["opt_type"] == ot]
+            if lot is not None and pd.notna(lot) and lot > 0:
+                c = c[c["oi"] / lot >= MIN_OI_LOTS]   # exclude thin strikes from consideration
+                                                       # entirely, not just flag them
             if c.empty:
                 return None
             return c.iloc[(c["strike"] - tgt).abs().argmin()]
@@ -230,7 +258,14 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         complete = exited_early or (len(win) == FWD)
         exit_value = vals[-1]
         pnl = round(credit - exit_value, 2)
-        lot = lot_size(sym, exp)
+        max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
+
+        def oi_lots(row):
+            v = row.get("oi")
+            if v is None or pd.isna(v) or lot is None or pd.isna(lot) or lot == 0:
+                return None
+            return round(float(v) / float(lot))
+
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
             "entry_date": pd.Timestamp(e_date).date().isoformat(),
@@ -238,9 +273,11 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
+            "oi_short": oi_lots(short_row), "oi_long": oi_lots(long_row),
             "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
-            "entry_ror_pct": round(entry_ror, 1), "clears_primary_bar": entry_ror > MIN_ENTRY_ROR,
+            "entry_ror_pct": round(entry_ror, 1),
+            "clears_primary_bar": entry_ror > MIN_ENTRY_ROR and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
@@ -286,9 +323,18 @@ cand_path = outdir / "skew_candidates_raw.parquet"
 cand_df = _merge_partial(all_out, cand_path, ["tier", "entry_date"])
 cand_df.to_parquet(cand_path, index=False)
 
-# The real signal-history CSV only ever contains candidates that clear their tier's primary bar
-# -- BW de-dup and the fallback "NS" row are both added later, by gen_signal_dedup_and_fallback.py.
-all_out = [r for r in all_out if r["clears_primary_bar"]]
+# The real signal-history CSV contains at most ONE row per (tier, day) -- the single highest-
+# entry_ror_pct candidate that clears that tier's primary bar, matching the live panel's per-tier
+# "top_picks[0] is THE 1-pick/day rule". BW de-dup and the cross-strategy fallback "NS" row are
+# both added later, by gen_signal_dedup_and_fallback.py.
+by_tier_date: dict[tuple, list[dict]] = {}
+for r in all_out:
+    by_tier_date.setdefault((r["tier"], r["entry_date"]), []).append(r)
+all_out = []
+for rows in by_tier_date.values():
+    passing = [r for r in rows if r["clears_primary_bar"]]
+    if passing:
+        all_out.append(max(passing, key=lambda r: r["entry_ror_pct"]))
 for r in all_out:
     del r["clears_primary_bar"]
 

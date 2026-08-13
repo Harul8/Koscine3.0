@@ -63,3 +63,6 @@ frontend/.vite/
 # ---- OS ----
 .DS_Store
 Thumbs.db
+# Added by code-review-graph
+.code-review-graph/
+.crg-venv
