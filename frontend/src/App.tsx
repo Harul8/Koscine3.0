@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Activity, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, Waves, X } from "lucide-react";
 import "./styles.css";
@@ -2613,7 +2613,28 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
   const defWin = (len: number) => ({ s: Math.max(0, len - DEFAULT_TRAILING), e: len });
   const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
   const [sel, setSel] = useState<number | null>(null);
-  useEffect(() => { setWin(defWin(series.length)); setSel(null); }, [series]);
+  // The 60s live-data poll (IndicesSignals) re-fetches `series` with a brand-new array identity
+  // every time, even when it's the SAME trailing window with just one more candle appended --
+  // resetting win/sel on every `series` change made the chart visibly snap back to the default
+  // view every minute, reading as "the page refreshed" even though nothing else did. Only reset
+  // on a genuinely NEW context (date/timeframe switch, detected via the window's start boundary
+  // moving or the series shrinking); a same-context growth (live poll) instead silently slides
+  // the window forward by the same delta ONLY if it was already pinned to "show latest" --
+  // if the user had scrolled back into history, their position is left untouched.
+  const prevSeriesRef = useRef<{ len: number; firstTs: string | null }>({ len: 0, firstTs: null });
+  useEffect(() => {
+    const prev = prevSeriesRef.current;
+    const firstTs = series.length ? series[0].ts : null;
+    const isNewContext = firstTs !== prev.firstTs || series.length < prev.len;
+    if (isNewContext) {
+      setWin(defWin(series.length));
+      setSel(null);
+    } else if (series.length > prev.len) {
+      const delta = series.length - prev.len;
+      setWin((w) => (w.e >= prev.len ? { s: w.s + delta, e: w.e + delta } : w));
+    }
+    prevSeriesRef.current = { len: series.length, firstTs };
+  }, [series]);
   const intraday = tf === "5m" || tf === "15m";
   const showIntraZones = intraday;
   // On a multi-day 5m/15m chart, the session-open (09:15) bar shows its DATE instead of the time
@@ -2901,9 +2922,10 @@ function IndicesSignals() {
   const [signals, setSignals] = useState<IntradaySignalsResp | null>(null);
   const [tf, setTf] = useState<NiftyTF>("5m");
 
-  useEffect(() => {
+  const fetchSignals = useCallback(() => {
     getJson<IntradaySignalsResp>("/prod2/nifty_intraday_signals").then(setSignals).catch(() => setSignals(null));
   }, []);
+  useEffect(() => { fetchSignals(); }, [fetchSignals]);
   // NIFTY's own daily OHLC (years of history) -- feeds the 1D/1W timeframe views, the date
   // dropdown (ALL trading days, not just days a signal fired), and the daily/weekly S/R zone
   // layers shown on every timeframe. Fetched once, independent of `date`/`tf`.
@@ -2921,20 +2943,27 @@ function IndicesSignals() {
   // 30 trailing trading days of 5-min bars ENDING at the selected date (never past it) -- enough
   // for a 150-trailing-candle 5m/15m view plus scrollback for the </>/arrow-key panning, without
   // clipping the chart to a single day the way the old per-date-only fetch did. When `date` is
-  // today, the API splices in production/nifty_live_poller.py's live bars (09:15 onward,
-  // refreshed every 5 min) -- poll every 60s here so the chart keeps moving forward on its own
-  // instead of needing a manual refresh.
-  useEffect(() => {
+  // today, the API splices in production/nifty_live_poller.py's live bars (09:15 onward).
+  const fetchRange = useCallback(() => {
     if (!date) return;
-    const fetchRange = () => {
-      getJson<{ end_date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars_range?end_date=${date}&trading_days=30`)
-        .then((d) => setBars5mRange(d.bars)).catch(() => setBars5mRange([]));
-    };
-    fetchRange();
-    if (date !== new Date().toLocaleDateString("en-CA")) return;
-    const id = setInterval(fetchRange, 60000);
-    return () => clearInterval(id);
+    getJson<{ end_date: string; bars: IntradayBar[] }>(`/prod2/nifty_intraday_bars_range?end_date=${date}&trading_days=30`)
+      .then((d) => setBars5mRange(d.bars)).catch(() => setBars5mRange([]));
   }, [date]);
+  useEffect(() => { fetchRange(); }, [fetchRange]);
+  // Push, not poll: a fixed-timer refetch was out of sync with the poller's actual 5-min cadence
+  // (up to 60s stale) and independently was what caused the chart-reset bug fixed earlier --
+  // subscribe to /prod2/nifty_live_events (SSE) instead, which the API server only pushes an
+  // `update` on when production/nifty_live_poller.py has actually written a new poll cycle.
+  // Refetches BOTH the chart bars and the signals table on every push, so a newly-fired signal
+  // shows up immediately too, not just the candle. Only subscribed while viewing today (a past
+  // date's chart is static, nothing there will ever change).
+  useEffect(() => {
+    if (!date || date !== new Date().toLocaleDateString("en-CA")) return;
+    const es = new EventSource(`${API_BASE}/prod2/nifty_live_events`);
+    es.addEventListener("update", () => { fetchRange(); fetchSignals(); });
+    es.onerror = () => { /* EventSource auto-reconnects on its own; nothing to do here */ };
+    return () => es.close();
+  }, [date, fetchRange, fetchSignals]);
 
   const weeklyBars = useMemo(() => {
     if (!dailyBars.length) return [];
@@ -2957,6 +2986,16 @@ function IndicesSignals() {
       const key = b.ts.slice(0, 7);
       (groups.get(key) ?? groups.set(key, []).get(key)!).push(b.ts);
     }
+    // Today's row only lands in dailyBars after an EOD downloader run -- without it, `date`
+    // (defaulted to today above) has no matching <option>, so the <select> silently falls back
+    // to displaying whichever day IS first in the list (yesterday) even though the chart itself
+    // is correctly showing today's live-spliced data. Add it explicitly so the dropdown's
+    // displayed value always matches what's actually on screen.
+    const today = new Date().toLocaleDateString("en-CA");
+    const todayKey = today.slice(0, 7);
+    const group = groups.get(todayKey);
+    if (group) { if (!group.includes(today)) group.push(today); }
+    else groups.set(todayKey, [today]);
     return [...groups.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([k, ds]) => [k, ds.slice().reverse()] as [string, string[]]);
   }, [dailyBars]);
 
@@ -3009,7 +3048,7 @@ function IndicesSignals() {
               <select value={date} onChange={(e) => setDate(e.target.value)} style={{ minWidth: 140 }}>
                 {dateGroups.length ? dateGroups.map(([ym, ds]) => (
                   <optgroup key={ym} label={monthLabel(ym)}>
-                    {ds.map((d) => <option key={d} value={d}>{d}</option>)}
+                    {ds.map((d) => <option key={d} value={d}>{d}{d === new Date().toLocaleDateString("en-CA") ? " (today)" : ""}</option>)}
                   </optgroup>
                 )) : <option value="">No trading days yet</option>}
               </select>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import os
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from scipy.optimize import brentq
 from scipy.stats import norm
 
@@ -53,6 +55,97 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_NIFTY_POLLER_PID_FILE = PROJECT_ROOT / "locks" / "prod_nifty_intraday" / "live_poller.pid"
+
+
+def _nifty_backfill_and_start_poller() -> None:
+    """Runs once on API server boot (see @app.on_event("startup") below): backfills any gap in
+    the offline NIFTY 5-min history (data/intraday/nifty_5m.parquet -- the EOD downloader only
+    runs when someone remembers to, so a server restart after a day or two off can find this
+    stale, same gap manually caught and fixed 2026-08-13), then starts
+    production/nifty_live_poller.py's continuous loop in the background so live 5-min polling +
+    signal firing is always running whenever the API server is, without a separate manual step.
+    Both stages are safe to run unconditionally/idempotently:
+      - the backfill fetch is a bounded, short (few-day) window merged into the existing parquet
+        (never overwrites/destroys history -- see the merge logic below, matching the manual
+        fix), and is a no-op if the file's already current.
+      - the poller's own run_loop() checks is_market_open() every cycle and just idles (60s
+        sleep, no network calls) outside 09:15-15:15 IST weekdays -- harmless to start any time
+        of day, including well before/after market hours or on a weekend.
+    Guarded by a PID file (locks/prod_nifty_intraday/live_poller.pid) so a `--reload` dev-server
+    restart, or restarting the API process while a previous poller instance is still alive,
+    doesn't spawn duplicate pollers double-writing the same files."""
+    import threading
+
+    def _worker() -> None:
+        try:
+            import psutil
+            hist_path = PROJECT_ROOT / "data" / "intraday" / "nifty_5m.parquet"
+            if hist_path.exists():
+                hist = pd.read_parquet(hist_path)
+                last = pd.to_datetime(hist["timestamp"]).max()
+                last_ist = last.tz_convert("Asia/Kolkata") if last.tzinfo else last.tz_localize("Asia/Kolkata")
+                today_ist = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+                if (today_ist - last_ist.normalize()).days > 0:
+                    tmp_path = PROJECT_ROOT / "data" / "intraday" / "_nifty_5m_backfill_tmp.parquet"
+                    start = (last_ist - pd.Timedelta(days=3)).date().isoformat()  # small overlap;
+                    # de-duped on merge below, so re-fetching a couple of already-covered days is harmless
+                    end = today_ist.date().isoformat()
+                    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+                    r = subprocess.run(
+                        [sys.executable, str(PROJECT_ROOT / "analysis" / "download_nifty_5m.py"),
+                         "--start", start, "--end", end, "--out", str(tmp_path)],
+                        cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True, timeout=120)
+                    if r.returncode == 0 and tmp_path.exists():
+                        new = pd.read_parquet(tmp_path)
+                        merged = (pd.concat([hist, new], ignore_index=True)
+                                  .drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True))
+                        merged.to_parquet(hist_path, index=False)
+                        tmp_path.unlink(missing_ok=True)
+                        print(f"[startup] NIFTY 5m backfill: {len(hist)} -> {len(merged)} bars "
+                              f"(gap through {last_ist.date()})", flush=True)
+                    else:
+                        print(f"[startup] NIFTY 5m backfill fetch failed (rc={r.returncode}): "
+                              f"{(r.stderr or '')[-400:]}", flush=True)
+        except Exception as e:   # noqa: BLE001 -- a backfill hiccup must never block the poller/server
+            print(f"[startup] NIFTY 5m backfill error: {e}", flush=True)
+
+        try:
+            import psutil
+            already_running = False
+            if _NIFTY_POLLER_PID_FILE.exists():
+                try:
+                    pid = int(_NIFTY_POLLER_PID_FILE.read_text().strip())
+                    proc = psutil.Process(pid)
+                    if proc.is_running() and "nifty_live_poller" in " ".join(proc.cmdline()):
+                        already_running = True
+                except (psutil.NoSuchProcess, ValueError):
+                    pass
+            if already_running:
+                print(f"[startup] NIFTY live poller already running (pid {pid}), not restarting", flush=True)
+                return
+            log_path = PROJECT_ROOT / "locks" / "prod_nifty_intraday" / "live_poller.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_f = open(log_path, "a", encoding="utf-8")
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+            proc = subprocess.Popen(
+                [sys.executable, str(PROJECT_ROOT / "production" / "nifty_live_poller.py")],
+                cwd=str(PROJECT_ROOT), env=env, stdout=log_f, stderr=subprocess.STDOUT,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            _NIFTY_POLLER_PID_FILE.write_text(str(proc.pid))
+            print(f"[startup] NIFTY live poller started (pid {proc.pid}), logging -> {log_path}", flush=True)
+        except Exception as e:   # noqa: BLE001 -- must never block server startup
+            print(f"[startup] NIFTY live poller launch error: {e}", flush=True)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+@app.on_event("startup")
+def _on_startup() -> None:
+    _NIFTY_POLLER_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _nifty_backfill_and_start_poller()
 
 
 def _run_dirs() -> list[Path]:
@@ -1260,6 +1353,42 @@ def prod2_nifty_regime() -> dict[str, object]:
     live chain) when the poller has one. Empty dict if the poller hasn't run/written yet --
     this is read-only, the API never runs the poller itself."""
     return _read_json(NIFTY_INTRADAY_LOCK / "regime_live.json") or {}
+
+
+@app.get("/prod2/nifty_live_events")
+async def prod2_nifty_live_events() -> StreamingResponse:
+    """Server-Sent-Events push for the Indices chart: tells connected browsers the moment
+    production/nifty_live_poller.py has written a new poll cycle, instead of the frontend
+    guessing on its own fixed timer (2026-08, explicit user decision -- replaced a 60s blind
+    poll that was out of sync with the poller's actual 5-min cadence and the chart-reset bug
+    it triggered). Watches regime_live.json's mtime -- the poller writes this file on EVERY
+    successful poll ("always, even unchanged -- gives a live 'as_of' heartbeat every poll
+    rather than only writing on a firing/resolving day", per its own docstring), so its mtime
+    changing is a reliable "there's new data" signal regardless of whether a signal actually
+    fired that cycle. On change, emits a bare `event: update` -- the client re-fetches bars +
+    signals itself via the existing endpoints rather than this stream carrying the payload,
+    keeping this endpoint cheap to hold open for hours and the data-shaping logic in one place.
+    Checks every 2s (lightweight stat() call, not a file read); sends a heartbeat comment every
+    15s so intermediary proxies/browsers don't time out an otherwise-quiet connection."""
+    path = NIFTY_INTRADAY_LOCK / "regime_live.json"
+
+    async def gen():
+        last_mtime = path.stat().st_mtime if path.exists() else None
+        last_heartbeat = asyncio.get_event_loop().time()
+        yield "event: connected\ndata: {}\n\n"
+        while True:
+            await asyncio.sleep(2)
+            mt = path.stat().st_mtime if path.exists() else None
+            if mt != last_mtime:
+                last_mtime = mt
+                yield "event: update\ndata: {}\n\n"
+            now = asyncio.get_event_loop().time()
+            if now - last_heartbeat >= 15:
+                last_heartbeat = now
+                yield ": heartbeat\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/prod2/price_history")

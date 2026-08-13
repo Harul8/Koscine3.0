@@ -61,4 +61,28 @@ def build_price_features(bars: pd.DataFrame) -> pd.DataFrame:
     df = df.merge(day_summary[["gap_pct"]].rename(columns={"gap_pct": "feature_gap_from_prev_close"}),
                    left_on="date", right_index=True, how="left")
 
+    # Opening-range width: the first 30 min's (6 bars) high-low range, as % of price -- 2026-08
+    # addition, individually AUC 0.616 for predicting the forward-30min busy/quiet regime (vs
+    # 0.65-0.66 for the rolling realized-vol features, 0.50-0.53 for everything else already
+    # above -- see the NIFTY 5-min leading-indicator research this session). A wide opening range
+    # tends to precede a wider move for the rest of the day (vol persistence), and it's NOT
+    # redundant with the rolling-vol features since it's fixed at the open rather than
+    # continuously updating. Leakage-safe: an EXPANDING high/low within the 30-min window (so a
+    # 9:20 bar only sees 9:15-9:20, not the full eventual 9:15-9:45 range), frozen at its final
+    # (fully-formed) value once the window closes -- never uses information from bars ahead of
+    # the row it's attached to.
+    min_since_open = day.cumcount()
+    in_opening_window = min_since_open < 6
+    running_high = df["high"].where(in_opening_window).groupby(df["date"]).cummax()
+    running_low = df["low"].where(in_opening_window).groupby(df["date"]).cummin()
+    or_high = running_high.groupby(df["date"]).ffill()
+    or_low = running_low.groupby(df["date"]).ffill()
+    # Normalize by the day's OPEN price (frozen, from day_summary above), not the current bar's
+    # close -- dividing by a continuously-moving close made this "frozen" range drift all through
+    # the day even after the opening window closed (caught in testing: values kept changing right
+    # up to 15:25 instead of freezing at ~09:45).
+    df = df.merge(day_summary[["day_open"]], left_on="date", right_index=True, how="left")
+    df["feature_opening_range_width_pct"] = (or_high - or_low) / df["day_open"]
+    df = df.drop(columns=["day_open"])
+
     return df
