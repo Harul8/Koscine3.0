@@ -55,13 +55,78 @@ def build_nifty_zones(cadence_days: int = 5) -> pd.DataFrame:
 
 
 def latest_zones() -> dict:
-    """Most recent day's zone snapshot -- what the live poller reads for its exit logic."""
+    """Most recent day's WEEKLY-scale zone snapshot -- what the live poller reads for its exit
+    logic. See latest_intraday_zones() below for the 15-min counterpart."""
     if not OUT_PATH.exists():
         return {}
     df = pd.read_parquet(OUT_PATH)
     if df.empty:
         return {}
     return df.iloc[-1].to_dict()
+
+
+def _cluster_intraday_swings(bars15: pd.DataFrame, k: int, tol: float) -> tuple[list[dict], list[dict]]:
+    """Swing-high/low clustering on 15-min bars -- same idea as pipeline/zones.py's weekly
+    clustering (swing pivots -> group within tolerance -> count touches), just at intraday
+    scale/tolerance instead of weekly. Mirrors the frontend's srLevels(tol=0.001) dotted-zone
+    overlay (frontend/src/App.tsx) so the live exit logic sees the SAME 15-min zones the chart
+    already draws, not only the weekly ones from build_nifty_zones()."""
+    n = len(bars15)
+    highs = bars15["high"].to_numpy()
+    lows = bars15["low"].to_numpy()
+    sh_idx = [i for i in range(k, n - k) if highs[i] == highs[i - k:i + k + 1].max()]
+    sl_idx = [i for i in range(k, n - k) if lows[i] == lows[i - k:i + k + 1].min()]
+
+    def cluster(idxs: list[int], prices) -> list[dict]:
+        pts = sorted((float(prices[i]) for i in idxs))
+        clusters: list[list[float]] = []
+        cur: list[float] = []
+        for p in pts:
+            if cur and abs(p - cur[-1]) / cur[-1] > tol:
+                clusters.append(cur)
+                cur = []
+            cur.append(p)
+        if cur:
+            clusters.append(cur)
+        return [{"level": sum(c) / len(c), "touches": len(c)} for c in clusters]
+
+    res = [z for z in cluster(sh_idx, highs) if z["touches"] >= 2]
+    sup = [z for z in cluster(sl_idx, lows) if z["touches"] >= 2]
+    return res, sup
+
+
+def latest_intraday_zones(bars5: pd.DataFrame, lookback_days: int = 10, k: int = 3, tol: float = 0.001) -> dict:
+    """Nearest 15-min-scale support/resistance to the LATEST close -- the intraday counterpart
+    to latest_zones() (weekly-scale). `bars5` should already carry enough trailing history
+    (production/nifty_live_poller.py passes today's live bars prepended with prior-session
+    context via _with_prior_session_context, same pattern the model features use). Returns {}
+    if there isn't enough bar history yet -- callers should treat that as "no 15-min zone
+    signal this cycle", not an error."""
+    if bars5.empty:
+        return {}
+    df = bars5.sort_values("timestamp").copy()
+    cutoff = df["timestamp"].max() - pd.Timedelta(days=lookback_days)
+    df = df[df["timestamp"] >= cutoff].set_index("timestamp")
+    if df.empty:
+        return {}
+    bars15 = df.resample("15min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna().reset_index()
+    if len(bars15) < 2 * k + 2:
+        return {}
+    res_zones, sup_zones = _cluster_intraday_swings(bars15, k=k, tol=tol)
+    current = float(bars15["close"].iloc[-1])
+    res_above = [z for z in res_zones if z["level"] > current]
+    sup_below = [z for z in sup_zones if z["level"] < current]
+    out: dict = {}
+    if res_above:
+        nearest = min(res_above, key=lambda z: z["level"])
+        out["resistance_level"] = nearest["level"]
+        out["resistance_valid_touches"] = nearest["touches"]
+    if sup_below:
+        nearest = max(sup_below, key=lambda z: z["level"])
+        out["support_level"] = nearest["level"]
+        out["support_valid_touches"] = nearest["touches"]
+    return out
 
 
 if __name__ == "__main__":

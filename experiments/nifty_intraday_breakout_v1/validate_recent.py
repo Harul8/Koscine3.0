@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import train_magnitude as tm  # noqa: E402
 
 ROOT = Path(r"C:\Users\rahul\Koscine 3.0")
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "production"))
 
 DATA = Path(__file__).resolve().parent / "data" / "v1_price_only.parquet"
@@ -60,7 +61,7 @@ def fit_and_predict() -> pd.DataFrame:
     model.fit(train[feats], train[target_col])
     pred = model.predict(test[feats])
 
-    out = test[["timestamp", "date", "close", target_col]].copy()
+    out = test[["timestamp", "date", "open", "high", "low", "close", target_col]].copy()
     out["pred"] = pred
     out = out.rename(columns={target_col: "y"})
     return out.reset_index(drop=True)
@@ -96,8 +97,9 @@ def backtest_signals(preds: pd.DataFrame) -> pd.DataFrame:
     Uses the SAME nifty_zones.parquet the live poller reads (that day's zone snapshot, looked
     up by date), not an empty/no-zones stub."""
     from nifty_live_poller import _check_exit   # noqa: E402  (needs production/ on sys.path)
+    from koscine import nifty_zones as nz       # noqa: E402  (needs ROOT on sys.path)
 
-    bars = preds[["timestamp", "close"]].reset_index(drop=True)
+    bars = preds[["timestamp", "open", "high", "low", "close"]].reset_index(drop=True)
     zones_by_date = _zones_by_date()
     signals = []
     open_sig = None
@@ -107,8 +109,14 @@ def backtest_signals(preds: pd.DataFrame) -> pd.DataFrame:
         ts, price = row["timestamp"], float(row["close"])
 
         if open_sig is not None:
+            # both zone timeframes computed from bars.iloc[:i+1] ONLY -- the same leakage-safe
+            # slice _check_exit itself gets, so a "signal" here never sees a zone that was only
+            # discoverable from bars ahead of the row being evaluated (2026-08, explicit user
+            # requirement: past-date signals must be fireable using only data available as of
+            # that candle, no future data).
             todays_zones = zones_by_date.get(pd.Timestamp(open_sig["entry_ts"]).date(), {})
-            exit_info = _check_exit(open_sig, bars.iloc[:i + 1], todays_zones)
+            zones_15m = nz.latest_intraday_zones(bars.iloc[:i + 1])
+            exit_info = _check_exit(open_sig, bars.iloc[:i + 1], todays_zones, zones_15m)
             if exit_info is not None:
                 open_sig.update(exit_info)
                 signals.append(open_sig)

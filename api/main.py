@@ -1361,16 +1361,20 @@ async def prod2_nifty_live_events() -> StreamingResponse:
     production/nifty_live_poller.py has written a new poll cycle, instead of the frontend
     guessing on its own fixed timer (2026-08, explicit user decision -- replaced a 60s blind
     poll that was out of sync with the poller's actual 5-min cadence and the chart-reset bug
-    it triggered). Watches regime_live.json's mtime -- the poller writes this file on EVERY
-    successful poll ("always, even unchanged -- gives a live 'as_of' heartbeat every poll
-    rather than only writing on a firing/resolving day", per its own docstring), so its mtime
-    changing is a reliable "there's new data" signal regardless of whether a signal actually
-    fired that cycle. On change, emits a bare `event: update` -- the client re-fetches bars +
+    it triggered). Watches nifty_5m_live.parquet's mtime, NOT regime_live.json's: the poller
+    writes the spot bars file unconditionally on every successful poll (poll_once(), before it
+    even attempts to score), but regime_live.json is only written once score_latest() succeeds
+    -- which needs 25+ same-day bars (the model's atr_20bar rolling window), so it stays
+    untouched from market open until ~11:20 IST every session. Watching it meant the chart got
+    zero live pushes for the first ~2 hours of every day (2026-08, found live: chart frozen at
+    the bar last fetched on page load, e.g. 10:20, while the backend had already moved on to
+    10:25/10:30 -- confirmed current via the bars endpoints themselves). nifty_5m_live.parquet
+    has no such gap. On change, emits a bare `event: update` -- the client re-fetches bars +
     signals itself via the existing endpoints rather than this stream carrying the payload,
     keeping this endpoint cheap to hold open for hours and the data-shaping logic in one place.
     Checks every 2s (lightweight stat() call, not a file read); sends a heartbeat comment every
     15s so intermediary proxies/browsers don't time out an otherwise-quiet connection."""
-    path = NIFTY_INTRADAY_LOCK / "regime_live.json"
+    path = PROJECT_ROOT / "data" / "intraday" / "nifty_5m_live.parquet"
 
     async def gen():
         last_mtime = path.stat().st_mtime if path.exists() else None

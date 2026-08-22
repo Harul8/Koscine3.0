@@ -2613,6 +2613,11 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
   const defWin = (len: number) => ({ s: Math.max(0, len - DEFAULT_TRAILING), e: len });
   const [win, setWin] = useState<{ s: number; e: number }>(defWin(series.length));
   const [sel, setSel] = useState<number | null>(null);
+  // Vertical compress/stretch (TradingView-style): 1 = auto-fit the visible price range, >1
+  // zooms in (stretches -- candles look taller), <1 zooms out (compresses -- candles look
+  // flatter). Independent of horizontal zoom/pan (`win`). See the price-axis drag/wheel/
+  // double-click handlers below.
+  const [vZoom, setVZoom] = useState(1);
   // The 60s live-data poll (IndicesSignals) re-fetches `series` with a brand-new array identity
   // every time, even when it's the SAME trailing window with just one more candle appended --
   // resetting win/sel on every `series` change made the chart visibly snap back to the default
@@ -2629,6 +2634,7 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
     if (isNewContext) {
       setWin(defWin(series.length));
       setSel(null);
+      setVZoom(1);
     } else if (series.length > prev.len) {
       const delta = series.length - prev.len;
       setWin((w) => (w.e >= prev.len ? { s: w.s + delta, e: w.e + delta } : w));
@@ -2687,7 +2693,15 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
   }, [dailyFull, lastVisibleTs]);
   const intraZoneLevels = useMemo(() => {
     if (!showIntraZones || !lastVisibleTs || intraZoneSource.length < 5) return [];
-    const scoped = intraZoneSource.filter((b) => b.ts <= lastVisibleTs);
+    let scoped = intraZoneSource.filter((b) => b.ts <= lastVisibleTs);
+    if (scoped.length < 5) return [];
+    // Trailing 9 TRADING days only (2026-08, explicit user decision): this layer is meant to
+    // capture RECENT intraday price structure, not the full ~30-trading-day window the chart
+    // loads for panning/scrollback -- without this bound, older bars diluted it with stale
+    // levels far outside what's actually relevant to a 5m/15m trader right now.
+    const uniqDates = Array.from(new Set(scoped.map((b) => b.ts.slice(0, 10)))).sort();
+    const cutoffDate = uniqDates.length > 9 ? uniqDates[uniqDates.length - 9] : uniqDates[0];
+    scoped = scoped.filter((b) => b.ts.slice(0, 10) >= cutoffDate);
     if (scoped.length < 5) return [];
     const pts = scoped.map(barToPricePoint);
     let ath = -Infinity;
@@ -2702,6 +2716,13 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
       ev.preventDefault();
       const rect = node.getBoundingClientRect();
       const frac = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      // Scrolling over the LEFT price-axis margin (where the price grid labels live) zooms
+      // vertically instead of the usual horizontal time-zoom -- same TradingView convention as
+      // the drag handler below, just via the wheel.
+      if (frac * W < padX) {
+        setVZoom((z) => Math.max(0.2, Math.min(6, z * (ev.deltaY < 0 ? 1.1 : 1 / 1.1))));
+        return;
+      }
       const cursorIdx = s + frac * n;
       const factor = ev.deltaY < 0 ? 0.82 : 1.22;
       let width = Math.round(n * factor);
@@ -2713,6 +2734,45 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
     node.addEventListener("wheel", onWheel, { passive: false });
     return () => node.removeEventListener("wheel", onWheel);
   }, [s, n, total]);
+
+  // Vertical drag-to-stretch/compress on the price axis (TradingView convention): mousedown in
+  // the left margin starts a drag; moving the mouse up stretches (vZoom increases, candles get
+  // taller), moving down compresses. Double-click the same margin resets to auto-fit.
+  useEffect(() => {
+    const node = wrapRef.current;
+    if (!node) return;
+    let dragging = false, startY = 0, startZoom = 1;
+    const inAxis = (clientX: number) => {
+      const rect = node.getBoundingClientRect();
+      return ((clientX - rect.left) / rect.width) * W < padX;
+    };
+    const onDown = (ev: MouseEvent) => {
+      if (!inAxis(ev.clientX)) return;
+      dragging = true; startY = ev.clientY; startZoom = vZoom;
+      ev.preventDefault();
+    };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragging) return;
+      const deltaPx = startY - ev.clientY;   // up = positive = stretch
+      setVZoom(Math.max(0.2, Math.min(6, startZoom * Math.exp(deltaPx / 150))));
+    };
+    const onUp = () => { dragging = false; };
+    const onDbl = (ev: MouseEvent) => {
+      if (!inAxis(ev.clientX)) return;
+      ev.stopPropagation();   // don't also trigger the whole-chart double-click (pan/selection reset)
+      setVZoom(1);
+    };
+    node.addEventListener("mousedown", onDown);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    node.addEventListener("dblclick", onDbl, true);   // capture phase, so it runs before the chart's own onDoubleClick
+    return () => {
+      node.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      node.removeEventListener("dblclick", onDbl, true);
+    };
+  }, [vZoom]);
 
   // keyboard: left/right arrows pan (10% of window per press), up/down zoom -- same convention
   // as Candles (stock charts). Attached to the chart's own wrapper node (not `window`), so arrow
@@ -2762,11 +2822,14 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
   });
   const rawHi = Math.max(...vis.map((p) => p.high), ...visTrades.map((t) => Math.max(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
   const rawLo = Math.min(...vis.map((p) => p.low), ...visTrades.map((t) => Math.min(t.entry_underlying, t.exit_underlying ?? t.entry_underlying)));
-  const pad = (rawHi - rawLo) * 0.06 || 1;
-  const hi = rawHi + pad, lo = rawLo - pad;
+  // vZoom=1 reproduces the old fixed-6%-padding auto-fit exactly; >1 shrinks the effective
+  // range around the same midpoint (stretch -- candles get taller), <1 grows it (compress).
+  const rawMid = (rawHi + rawLo) / 2;
+  const half = ((rawHi - rawLo) / 2 || 1) * 1.06 / vZoom;
+  const hi = rawMid + half, lo = rawMid - half;
   const y = (v: number) => padTop + (1 - (v - lo) / (hi - lo || 1)) * (H - padTop - padBot);
   const up = "#167c80", down = "#9a2431";
-  const atDefault = s === Math.max(0, total - DEFAULT_TRAILING) && e === total;
+  const atDefault = s === Math.max(0, total - DEFAULT_TRAILING) && e === total && vZoom === 1;
   const grid = niceTicks(lo, hi, 8);
 
   const idxFromClientX = (clientX: number): number => {
@@ -2795,13 +2858,23 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
 
   return (
     <div ref={wrapRef} className="candles-wrap" style={{ position: "relative" }} tabIndex={0}
-         onClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}
-         onDoubleClick={() => { setWin(defWin(total)); setSel(null); }}>
+         // Single click just dismisses any open popup (click-away-to-close); the candle-detail
+         // popup itself now only opens on DOUBLE click (2026-08, explicit user decision -- it
+         // was popping up on every single click, too eager while panning/scrubbing the chart).
+         // Zoom-reset moved off double-click since the "Reset" button below already covers it
+         // and double-click's job here is now the popup, not zoom.
+         onClick={() => setSel(null)}
+         onDoubleClick={(ev) => { const idx = idxFromClientX(ev.clientX); setSel((prev) => (prev === idx ? null : idx)); }}>
       <div className="candles-toolbar">
         <button type="button" title="Pan back" disabled={s <= 0} onClick={() => panBy(-1)}>‹</button>
         <button type="button" title="Pan forward" disabled={e >= total} onClick={() => panBy(1)}>›</button>
-        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => setWin(defWin(total))}>Reset</button>
+        <button type="button" title="Reset zoom" disabled={atDefault} onClick={() => { setWin(defWin(total)); setVZoom(1); }}>Reset</button>
       </div>
+      {/* Purely a cursor hint over the draggable price-axis strip (left margin) -- the actual
+          drag/wheel/double-click handlers are attached at the wrapper level above, not here. */}
+      <div title="Drag to stretch/compress vertically · double-click to reset"
+           style={{ position: "absolute", left: 0, top: `${(padTop / H) * 100}%`, bottom: `${(padBot / H) * 100}%`,
+                    width: `${(padX / W) * 100}%`, cursor: "ns-resize" }} />
       <svg viewBox={`0 0 ${W} ${H}`} className="spark">
         {grid.map((g, gi) => (
           <g key={`grid${gi}`}>
@@ -2858,7 +2931,11 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
           return (
             <g key={`wlv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
-              <text x={W - padX - 4} y={y(L.price) - 3} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (W)</text>
+              {/* label sits in the right margin PAST the line's end (padX-wide band the candles
+                  never draw into), not overlapping-left over the line/candles the way a
+                  textAnchor="end" label anchored just inside the plot edge used to (2026-08,
+                  explicit user decision -- was landing on top of the most recent candles) */}
+              <text x={W - padX + 3} y={y(L.price) + 2} fontSize={7} fill={color} textAnchor="start">{num(L.price, 1)}×{L.touches}(W)</text>
             </g>
           );
         })}
@@ -2870,7 +2947,7 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
           return (
             <g key={`dlv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.55} />
-              <text x={W - padX - 4} y={y(L.price) + 10} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (D)</text>
+              <text x={W - padX + 3} y={y(L.price) + 11} fontSize={7} fill={color} textAnchor="start">{num(L.price, 1)}×{L.touches}(D)</text>
             </g>
           );
         })}
@@ -2883,12 +2960,12 @@ function IntradayCandles({ series, trades, tf, dailyFull, weeklyFull, intraZoneS
           return (
             <g key={`ilv${li}`}>
               <line x1={xStart} x2={W - padX} y1={y(L.price)} y2={y(L.price)} stroke={color} strokeWidth={0.6} strokeDasharray="2 3" />
-              <text x={W - padX - 4} y={y(L.price) + 21} fontSize={9} fill={color} textAnchor="end">{num(L.price, 1)} ×{L.touches} (15m)</text>
+              <text x={W - padX + 3} y={y(L.price) + 20} fontSize={7} fill={color} textAnchor="start">{num(L.price, 1)}×{L.touches}(15m)</text>
             </g>
           );
         })}
         {ticks.map((i) => (
-          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={10} fill={isDateTick(vis[i].ts) ? dateColor : "#60706a"}
+          <text key={i} x={x(i)} y={H - padBot + 16} fontSize={7} fill={isDateTick(vis[i].ts) ? dateColor : "#60706a"}
                 fontWeight={isDateTick(vis[i].ts) ? 700 : 400}
                 textAnchor={i === 0 ? "start" : i === n - 1 ? "end" : "middle"}>{tickLabel(vis[i].ts)}</text>
         ))}

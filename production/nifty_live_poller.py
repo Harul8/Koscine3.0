@@ -36,10 +36,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -139,7 +140,7 @@ def fetch_chain_nse(session: requests.Session, symbol: str = NIFTY_SYMBOL) -> pd
         r.raise_for_status()
         payload = r.json()
     except Exception as e:   # noqa: BLE001 -- any NSE failure falls back to Upstox, never crash the poll
-        print(f"[nse] fetch failed: {e}")
+        print(f"[nse] fetch failed: {e}", flush=True)
         return None
     records = payload.get("records", {})
     rows = records.get("data", [])
@@ -213,7 +214,7 @@ def fetch_chain_upstox(token: str, symbol_underlying_key: str = "NSE_INDEX|Nifty
             row[f"{side}_close"] = ltps.get(c["instrument_key"])
         return pd.DataFrame(by_strike.values())
     except Exception as e:   # noqa: BLE001 -- both sources failed; caller treats None as "skip this poll"
-        print(f"[upstox] chain fetch failed: {e}")
+        print(f"[upstox] chain fetch failed: {e}", flush=True)
         return None
 
 
@@ -343,7 +344,7 @@ def _save_regime(regime: str, pred_move_pct: float, spot: float, ts: pd.Timestam
 
 
 # --------------------------------------------------------------------------- pattern/zone exit
-def _check_exit(open_sig: dict, bars: pd.DataFrame, zones: dict) -> dict | None:
+def _check_exit(open_sig: dict, bars: pd.DataFrame, zones_weekly: dict, zones_15m: dict) -> dict | None:
     """Pattern/zone-based exit -- NOT a fixed-bar hold. Mutates open_sig in place with the
     running direction/peak-price tracking state; returns an exit dict once triggered, else None.
 
@@ -355,8 +356,13 @@ def _check_exit(open_sig: dict, bars: pd.DataFrame, zones: dict) -> dict | None:
        Exit once price has given back more than EROSION_GIVEBACK_FRAC of that peak favorable
        move (the move is stalling/reversing -- "erode our profits", per your framing) OR price
        has entered the nearest support/resistance zone band on the side the move is heading
-       toward (koscine/nifty_zones.py -- the same zone engine used for stocks; zones are where
-       a move statistically becomes more likely to stall or reverse, not just an arbitrary %).
+       toward. TWO zone timeframes are checked, matching the solid(weekly)/dotted(15-min) S/R
+       overlay the Indices chart already draws (2026-08, explicit user decision -- previously
+       only the weekly-scale zone from koscine.nifty_zones.latest_zones() was consulted, so the
+       exit logic couldn't see the tighter intraday zones the chart visually shows): whichever
+       zone (weekly or 15-min) is NEARER to the current price is checked first, since that's the
+       one price would reach first. zones are where a move statistically becomes more likely to
+       stall or reverse, not just an arbitrary %.
     3. MAX_HOLD_BARS (2hr) and the session close are hard backstops, not the primary trigger --
        a signal that never resolves a clear direction or reaches a zone still eventually closes
        rather than running forever or carrying overnight risk.
@@ -389,12 +395,26 @@ def _check_exit(open_sig: dict, bars: pd.DataFrame, zones: dict) -> dict | None:
         giveback = (peak_price - current) * direction           # positive = giving gains back
         if peak_move > 0 and giveback >= EROSION_GIVEBACK_FRAC * peak_move:
             exit_reason = "erosion"
-        elif direction > 0 and zones.get("resistance_level") and \
-                current >= zones["resistance_level"] * (1 - ZONE_BUFFER_PCT):
-            exit_reason = "resistance_zone"
-        elif direction < 0 and zones.get("support_level") and \
-                current <= zones["support_level"] * (1 + ZONE_BUFFER_PCT):
-            exit_reason = "support_zone"
+        elif direction > 0:
+            candidates = []
+            if zones_weekly.get("resistance_level"):
+                candidates.append(("resistance_zone_weekly", float(zones_weekly["resistance_level"])))
+            if zones_15m.get("resistance_level"):
+                candidates.append(("resistance_zone_15m", float(zones_15m["resistance_level"])))
+            for reason, level in sorted(candidates, key=lambda x: x[1]):   # nearest (lowest) first
+                if current >= level * (1 - ZONE_BUFFER_PCT):
+                    exit_reason = reason
+                    break
+        elif direction < 0:
+            candidates = []
+            if zones_weekly.get("support_level"):
+                candidates.append(("support_zone_weekly", float(zones_weekly["support_level"])))
+            if zones_15m.get("support_level"):
+                candidates.append(("support_zone_15m", float(zones_15m["support_level"])))
+            for reason, level in sorted(candidates, key=lambda x: x[1], reverse=True):   # nearest (highest) first
+                if current <= level * (1 + ZONE_BUFFER_PCT):
+                    exit_reason = reason
+                    break
 
     if exit_reason is None and latest["timestamp"].time() >= SESSION_FORCE_EXIT_TIME:
         exit_reason = "session_close"
@@ -429,11 +449,19 @@ def _with_prior_session_context(bars: pd.DataFrame, lookback_bars: int = 100) ->
 
 # --------------------------------------------------------------------------- score + fire
 def score_latest(bars: pd.DataFrame, booster, feature_cols: list[str]) -> tuple[pd.Timestamp, float] | None:
-    if len(bars) < 25:   # need enough today-bars for the longest same-day rolling window (atr_20bar)
+    if bars.empty:
         return None
+    # features.py's rolling windows are now continuous across the session boundary (2026-08
+    # change), so the 20-bar ATR window is satisfied from the prior session's prepended tail --
+    # scoring no longer needs to wait for 25 SAME-DAY bars (~11:20 IST) the way it used to. The
+    # per-row isna() check just below is still the real gate: if _with_prior_session_context
+    # couldn't find any prior history (e.g. very first day of data ever), features legitimately
+    # come back NaN and we correctly skip rather than score garbage.
     scoring_buffer = _with_prior_session_context(bars)
     feats = feat_mod.build_price_features(scoring_buffer)
     feats = feats[feats["timestamp"].isin(bars["timestamp"])]   # score only today's own bars
+    if feats.empty:
+        return None
     # .iloc[[-1]] (list index), NOT .iloc[-1] -- the latter collapses the row to a Series,
     # which pandas gives a single dtype (object) once the source columns are heterogeneous,
     # and LightGBM's predict() rejects object-dtype input outright.
@@ -455,7 +483,7 @@ def _beep_alert(pattern: list[tuple[int, int]]) -> None:
         for freq, dur in pattern:
             winsound.Beep(freq, dur)
     except Exception as e:  # noqa: BLE001
-        print(f"[poll] beep alert failed: {e}")
+        print(f"[poll] beep alert failed: {e}", flush=True)
 
 
 # Entry (new signal fired): higher-pitched, 3 beeps -- the actionable moment, most attention-
@@ -478,35 +506,36 @@ def poll_once() -> None:
 
     bars = fetch_spot_bars_upstox(token)
     if bars.empty:
-        print("[poll] no spot bars returned, skipping")
+        print("[poll] no spot bars returned, skipping", flush=True)
         return
     bars.to_parquet(SPOT_LIVE, index=False)
 
     session = make_session()
     chain = fetch_chain_nse(session)
     if chain is None:
-        print("[poll] NSE chain fetch failed, falling back to Upstox")
+        print("[poll] NSE chain fetch failed, falling back to Upstox", flush=True)
         chain = fetch_chain_upstox(token)
     if chain is not None:
         chain.to_parquet(CHAIN_LIVE, index=False)
     else:
-        print("[poll] both NSE and Upstox chain fetch failed this cycle -- spot/scoring still proceeds")
+        print("[poll] both NSE and Upstox chain fetch failed this cycle -- spot/scoring still proceeds", flush=True)
 
     result = score_latest(bars, booster, feature_cols)
     if result is None:
-        print("[poll] not enough bar history yet to score")
+        print("[poll] no prior-session history available to score from yet (expected only "
+              "on the very first day of data, or if nifty_5m.parquet is missing)", flush=True)
         return
     ts, pred_move_pct = result
     pred_move_pct *= 100
     spot = float(bars.iloc[-1]["close"])
-    print(f"[poll] {ts} spot={spot:.1f} predicted_move={pred_move_pct:.3f}%")
+    print(f"[poll] {ts} spot={spot:.1f} predicted_move={pred_move_pct:.3f}%", flush=True)
 
     # regime read every poll (not a fired signal -- see REGIME_LIVE's comment above)
     if pred_move_pct >= MOVE_THRESHOLD_PCT:
         direction = _direction_hint(bars)
         _save_regime("big_move_expected", pred_move_pct, spot, ts, direction, chain)
         print(f"[poll] regime=big_move_expected direction_hint={direction.get('direction')} "
-              f"(low confidence, {direction.get('basis')})")
+              f"(low confidence, {direction.get('basis')})", flush=True)
     else:
         _save_regime("consolidation", pred_move_pct, spot, ts, None, chain)
 
@@ -516,8 +545,9 @@ def poll_once() -> None:
 
     # resolve an open signal via pattern/zone-based exit (not a fixed-bar hold) -- see _check_exit
     if open_sig is not None:
-        zones = nifty_zones.latest_zones()
-        exit_info = _check_exit(open_sig, bars, zones)
+        zones_weekly = nifty_zones.latest_zones()
+        zones_15m = nifty_zones.latest_intraday_zones(_with_prior_session_context(bars, lookback_bars=1000))
+        exit_info = _check_exit(open_sig, bars, zones_weekly, zones_15m)
         if exit_info is not None:
             for s in signals:
                 if s["entry_ts"] == open_sig["entry_ts"]:
@@ -525,7 +555,7 @@ def poll_once() -> None:
                     break
             state["open_signal"] = None
             print(f"[poll] resolved signal from {open_sig['entry_ts']}: "
-                  f"realized {exit_info['realized_move_pct']:.3f}% ({exit_info['exit_reason']})")
+                  f"realized {exit_info['realized_move_pct']:.3f}% ({exit_info['exit_reason']})", flush=True)
             _beep_alert(_BEEP_EXIT)
         else:
             state["open_signal"] = open_sig   # persist updated direction/peak_price tracking
@@ -539,7 +569,7 @@ def poll_once() -> None:
                    "direction": None, "peak_price": None}
         signals.append(new_sig)
         state["open_signal"] = new_sig
-        print(f"[poll] FIRED: predicted {pred_move_pct:.3f}% >= {MOVE_THRESHOLD_PCT}% threshold")
+        print(f"[poll] FIRED: predicted {pred_move_pct:.3f}% >= {MOVE_THRESHOLD_PCT}% threshold", flush=True)
         _beep_alert(_BEEP_ENTRY)
 
     _save_signals(signals)   # always, even unchanged -- gives a live "as_of" heartbeat every
@@ -547,20 +577,65 @@ def poll_once() -> None:
     _save_state(state)
 
 
+def _next_aligned_mark(now: datetime) -> datetime:
+    """Smallest wall-clock 5-min grid mark (HH:00, HH:05, HH:10, ... -- zero seconds/
+    microseconds) strictly after `now`. Candles close ON this grid (9:15, 9:20, 9:25...), so
+    polling aligned to it means each poll reliably sees that candle's real close instead of a
+    partial print from mid-candle -- and it self-corrects every cycle (based on wall-clock time,
+    not "300s since the last poll finished"), so a slow poll or a late/mid-session (re)start
+    never lets the schedule drift off the grid the way a flat sleep(POLL_SECONDS) would."""
+    mark = now.replace(second=0, microsecond=0, minute=(now.minute // 5) * 5)
+    if mark <= now:
+        mark += timedelta(minutes=5)
+    return mark
+
+
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+
+
+def _keep_system_awake(awake: bool) -> None:
+    """Stop Windows from sleeping the whole machine while the market is open (2026-08, explicit
+    user requirement: the poller/API/Indices chart must keep running through 15:15 IST even if
+    the laptop is locked). Locking the screen does NOT by itself pause background processes --
+    Sleep (idle standby, e.g. this machine's 15-min AC timeout) is what actually kills them, so
+    this is scoped to that specifically. Deliberately does NOT set ES_DISPLAY_REQUIRED -- the
+    screen is still allowed to lock/turn off, only the SYSTEM needs to stay awake. Cleared
+    (awake=False) once the market closes so normal sleep behavior resumes outside trading hours.
+    Never let a failure here (non-Windows, call error) crash the poll loop -- staying awake is a
+    nice-to-have for unattended runs, not the poller's actual job."""
+    try:
+        flags = _ES_CONTINUOUS | (_ES_SYSTEM_REQUIRED if awake else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception as e:  # noqa: BLE001
+        print(f"[poll] keep-awake call failed: {e}", flush=True)
+
+
 def run_loop() -> None:
-    print(f"[nifty_live_poller] starting, polling every {POLL_SECONDS}s during "
-          f"{MARKET_OPEN}-{MARKET_CLOSE} IST weekdays", flush=True)
+    print(f"[nifty_live_poller] starting -- polling wall-clock-aligned every 5 min "
+          f"({MARKET_OPEN}-{MARKET_CLOSE} IST weekdays)", flush=True)
     while True:
         now = datetime.now(IST)
-        if is_market_open(now):
-            try:
-                poll_once()
-            except Exception as e:   # noqa: BLE001 -- one bad poll must not kill the whole session
-                print(f"[poll] ERROR: {e}")
-            time.sleep(POLL_SECONDS)
-        else:
-            print(f"[nifty_live_poller] market closed ({now.time()}), sleeping 60s")
+        if not is_market_open(now):
+            _keep_system_awake(False)   # outside market hours -- let the machine sleep normally
+            print(f"[nifty_live_poller] market closed ({now.time()}), sleeping 60s", flush=True)
             time.sleep(60)
+            continue
+        _keep_system_awake(True)        # market open -- hold the system awake (renewed every poll)
+        # First poll of the day (or of a mid-session restart): wait for the nearest aligned mark
+        # rather than firing immediately off-grid -- if we're before market open, that's exactly
+        # 09:15; if the poller is starting/restarting mid-session, it's the next 5-min mark from
+        # right now (e.g. started at 11:18 -> first poll at 11:20, per your instruction).
+        market_open_today = now.replace(hour=MARKET_OPEN.hour, minute=MARKET_OPEN.minute, second=0, microsecond=0)
+        target = market_open_today if now < market_open_today else _next_aligned_mark(now)
+        wait_s = (target - now).total_seconds()
+        if wait_s > 0:
+            print(f"[nifty_live_poller] waiting {wait_s:.0f}s for next aligned poll at {target.time()}", flush=True)
+            time.sleep(wait_s)
+        try:
+            poll_once()
+        except Exception as e:   # noqa: BLE001 -- one bad poll must not kill the whole session
+            print(f"[poll] ERROR: {e}", flush=True)
 
 
 if __name__ == "__main__":

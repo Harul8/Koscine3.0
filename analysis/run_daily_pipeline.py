@@ -78,7 +78,7 @@ def main(start: str, end: str) -> None:
     # 3) Buy Signals: K3 predictions (5-day book + direction overlay + 1-day book)
     env3 = {**os.environ, "PYTHONPATH": str(Path(K3) / "src")}
     run("K3 5-day mover book", [PY, "-m", "koscine3.largemove.mover_v2"], K3, env3)
-    run("K3 pick premium OHLC", [PY, "-u", "analysis/premium_ohlc.py"], K3, env3)  # book_premiums.csv (near-ATM CE/PE OHLC per v2 pick)
+    run("K3 pick premium OHLC", [PY, "-u", "analysis/premium_ohlc.py", "--append"], K3, env3)  # book_premiums.csv (near-ATM CE/PE OHLC per v2 pick) -- incremental (2026-08): only the trailing LOOKBACK_DAYS of picks are recomputed, not the full ~2yr book every run
     run("K3 direction overlay", [PY, "-m", "koscine3.largemove.direction_stage2"], K3, env3)
     run("K3 1-day book", [PY, "-m", "koscine3.largemove.next_day"], K3, env3)
     run("K3 v3 mover-precision book", [PY, "-m", "koscine3.largemove.mover_v3"], K3, env3)

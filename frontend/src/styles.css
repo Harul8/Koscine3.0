@@ -138,6 +138,9 @@ button:hover {
   width: 100%;
   height: auto;
   display: block;
+  overflow: visible; /* S/R zone labels sit in the right margin band just past the plot area
+                         (frontend/src/App.tsx's IntradayCandles) -- SVG's UA-default overflow:
+                         hidden would clip a label that runs slightly wider than that band */
 }
 
 .controls-band label.chk {

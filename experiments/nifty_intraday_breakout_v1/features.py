@@ -1,9 +1,19 @@
 """Leakage-safe price-only 5-min feature builder for the NIFTY intraday breakout model.
 
 Reads data/intraday/nifty_5m.parquet (native 5-min NIFTY 50 index candles -- no real
-volume/OI, the raw index has neither). All rolling windows reset at the session boundary
-(grouped by trading date) so an overnight gap never contaminates an intraday realized-vol
-or momentum estimate -- the gap itself is captured separately as its own feature.
+volume/OI, the raw index has neither).
+
+Rolling return/vol/ATR windows are CONTINUOUS across the session boundary (2026-08 change,
+explicit user decision -- previously grouped/reset per trading date). Resetting them at every
+day boundary meant the first ~10-20 bars of EVERY session had NaN atr_20bar_pct/realized_vol_*
+(rolling min_periods not yet satisfied within that day alone), which dropna()-based training
+(dataset.py/finalize_magnitude.py) silently excluded from the training set entirely -- the
+model had never seen an early-session feature vector, so live scoring couldn't start until
+~25 same-day bars accumulated (~11:20 IST) even though the underlying true-range/volatility
+math is well-defined using the prior session's tail bars; nothing about it requires resetting
+at 09:15. `feature_gap_from_prev_close` and the opening-range features below are still
+deliberately day-scoped -- those represent the discrete overnight jump and each day's own
+specific opening window, not a rolling estimate, so they're supposed to reset.
 
 Column convention (matches experiments/intraday_exit_v1's leakage discipline): every
 backward-looking column here is prefixed `feature_`. This module produces ONLY features --
@@ -29,28 +39,33 @@ def build_price_features(bars: pd.DataFrame) -> pd.DataFrame:
     df["feature_session_fraction"] = (minutes - SESSION_START_MIN) / SESSION_LEN_MIN
     df["feature_day_of_week"] = df["timestamp"].dt.dayofweek
 
+    # group_keys=False groupby kept ONLY for the day-scoped sections below (opening-range,
+    # gap, cumcount) -- the rolling return/vol/ATR features intentionally do NOT use it, see
+    # the module docstring.
     day = df.groupby("date", sort=False, group_keys=False)
-    ret1 = day["close"].transform(lambda s: s.pct_change())
+    ret1 = df["close"].pct_change()
     df["feature_return_1bar"] = ret1
-    df["feature_return_3bar"] = day["close"].transform(lambda s: s.pct_change(3))
-    df["feature_return_6bar"] = day["close"].transform(lambda s: s.pct_change(6))
-    df["feature_return_12bar"] = day["close"].transform(lambda s: s.pct_change(12))
-    df["feature_realized_vol_6bar"] = ret1.groupby(df["date"]).transform(lambda s: s.rolling(6, min_periods=3).std())
-    df["feature_realized_vol_12bar"] = ret1.groupby(df["date"]).transform(lambda s: s.rolling(12, min_periods=6).std())
-    df["feature_realized_vol_24bar"] = ret1.groupby(df["date"]).transform(lambda s: s.rolling(24, min_periods=12).std())
+    df["feature_return_3bar"] = df["close"].pct_change(3)
+    df["feature_return_6bar"] = df["close"].pct_change(6)
+    df["feature_return_12bar"] = df["close"].pct_change(12)
+    df["feature_realized_vol_6bar"] = ret1.rolling(6, min_periods=3).std()
+    df["feature_realized_vol_12bar"] = ret1.rolling(12, min_periods=6).std()
+    df["feature_realized_vol_24bar"] = ret1.rolling(24, min_periods=12).std()
 
-    # True Range %, session-scoped -- same formula as
+    # True Range %, continuous across sessions -- same formula as
     # src/koscine3/outcomes/clean_move_contract.py::_true_range / pipeline/labels.py::_compute_atr,
-    # applied to 5-min bars instead of daily.
-    prev_close = day["close"].transform(lambda s: s.shift(1))
+    # applied to 5-min bars instead of daily. For the first bar of a new day, prev_close is now
+    # the prior session's actual last close (not NaN'd out by a day-groupby shift), so true range
+    # correctly reflects the overnight gap itself for that bar instead of silently understating
+    # it to just that bar's own high-low.
+    prev_close = df["close"].shift(1)
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - prev_close).abs(),
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     df["feature_true_range_pct"] = tr / df["close"]
-    df["feature_atr_20bar_pct"] = df["feature_true_range_pct"].groupby(df["date"]).transform(
-        lambda s: s.rolling(20, min_periods=10).mean())
+    df["feature_atr_20bar_pct"] = df["feature_true_range_pct"].rolling(20, min_periods=10).mean()
     df["feature_range_compression"] = (
         df["feature_true_range_pct"] / df["feature_atr_20bar_pct"].replace(0, np.nan))
 
