@@ -214,7 +214,7 @@ def download_options(token: str, limit: int | None) -> None:
                 time.sleep(RATE_SLEEP)
         return ckey[k].get((float(strike), ot))
 
-    t0, n_ok, n_miss = time.time(), 0, 0
+    t0, n_ok, n_miss, n_incomplete = time.time(), 0, 0, 0
     for i, (_, r) in enumerate(want.iterrows()):
         sym, exp = r["symbol"], str(r["expiry"])
         ik = key_for(sym, exp, r["strike"], r["opt_type"])
@@ -225,14 +225,25 @@ def download_options(token: str, limit: int | None) -> None:
         d_to = min(date.fromisoformat(str(r["d_to"])) + timedelta(days=FWD_PAD_DAYS),
                    date.fromisoformat(exp))
         got = []
+        chunk_failed = False
         for a, b in _chunks(d_from, d_to):
             try:
                 resp = _get(f"{V2}/expired-instruments/historical-candle/{quote(ik, safe='')}"
                             f"/1minute/{b.isoformat()}/{a.isoformat()}", token)
                 got += (resp.get("data") or {}).get("candles") or []
             except RuntimeError as e:
+                chunk_failed = True
                 print(f"    candles {sym} {r['strike']}{r['opt_type']} {a}..{b}: {e}", flush=True)
             time.sleep(RATE_SLEEP)
+        if chunk_failed:
+            # A contract whose chunk failed (e.g. a 429 that outlived its retry budget) but whose
+            # other chunk succeeded would otherwise be written with MISSING DAYS -- and since the
+            # resume check keys on "is this contract present in the output", it would look
+            # complete and never be retried. Silent gaps are worse than absence, so write nothing
+            # and let a re-run fetch it whole. Same discipline as the NIFTY chain downloader's
+            # failure-rate threshold.
+            n_incomplete += 1
+            continue
         m = to_marks(got)
         if m.empty:
             n_miss += 1
@@ -246,11 +257,13 @@ def download_options(token: str, limit: int | None) -> None:
             el = (time.time() - t0) / 60
             rate = (i + 1) / el if el else 0
             eta = (len(want) - i - 1) / rate / 60 if rate else 0
-            print(f"  [{i+1:,}/{len(want):,}] ok={n_ok:,} miss={n_miss:,} "
+            print(f"  [{i+1:,}/{len(want):,}] ok={n_ok:,} miss={n_miss:,} incomplete={n_incomplete:,} "
                   f"| {el:.0f}min elapsed, ETA {eta:.1f}h -> checkpoint", flush=True)
     if frames:
         pd.concat(frames, ignore_index=True).to_parquet(OUT_OPT, index=False)
-    print(f"[n50] options done: {n_ok:,} contracts, {n_miss:,} unavailable -> {OUT_OPT}", flush=True)
+    print(f"[n50] options done: {n_ok:,} contracts, {n_miss:,} unavailable, "
+          f"{n_incomplete:,} skipped as incomplete (re-run to fetch them whole) "
+          f"-> {OUT_OPT}", flush=True)
 
 
 def download_equity(token: str) -> None:
