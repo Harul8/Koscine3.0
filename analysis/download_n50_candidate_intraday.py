@@ -80,6 +80,14 @@ def _get(url: str, token: str) -> dict:
                 return json.loads(r.read().decode())
         except HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
+            if e.code in (401, 403):
+                # Upstox access tokens expire daily (~03:30 IST). Without this, an overnight run
+                # that outlives its token would rip through every remaining contract, "succeed"
+                # with almost everything marked unavailable, and bury the cause in the log.
+                # Abort loudly instead -- the run is resumable, so a fresh token just continues.
+                raise SystemExit(f"\n*** AUTH FAILED (HTTP {e.code}) -- the access token has most "
+                                 f"likely expired.\n*** Refresh UPSTOX_ACCESS_TOKEN and re-run; "
+                                 f"already-downloaded contracts are skipped.\n{body[:200]}")
             if e.code == 429:
                 ra = e.headers.get("Retry-After") if e.headers else None
                 wait = float(ra) if ra and ra.isdigit() else min(3 * (2 ** rl), 60)
