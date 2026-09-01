@@ -517,6 +517,9 @@ MIN_OI_LOTS = 100   # 2026-08, explicit user decision: shared across all 3 live 
 # endpoints (and the offline generators -- see gen_broken_wing_signal_history.py's identical
 # constant) -- a strike with <=100 lots of open interest is excluded from strike selection
 # entirely (too thin to fill/exit at a sane price), not just flagged for display.
+MIN_OI_LOTS_SELL = 500   # 2026-09, explicit user decision: the SOLD (short) leg specifically
+# needs a much higher liquidity floor than the bought (long) leg -- see
+# gen_broken_wing_signal_history.py's identical constant for rationale.
 
 CONDOR_DTE_MIN, CONDOR_MIN_ROR = 9, 10_000_000.0   # safety floor (delivery-margin) + THE quality
 # gate -- raised 150 -> 350 -> 300 -> 500 -> effectively infinite = KILLED (2026-08, explicit
@@ -567,17 +570,17 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
         if ce.empty or pe.empty:
             continue
         lot = lots.get(sym)
-        def nearest(df, target):
+        def nearest(df, target, min_oi):
             if lot is not None and pd.notna(lot) and lot > 0:
-                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                liquid = df[df["open_int"] / lot >= min_oi]
                 if not liquid.empty:
                     df = liquid
                 else:
                     return None
             r = df.iloc[(df["strike"] - target).abs().argmin()]
             return r
-        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
-        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        sce = nearest(ce, u * (1 + short_otm), MIN_OI_LOTS_SELL); lce = nearest(ce, u * (1 + short_otm + wing), MIN_OI_LOTS)
+        spe = nearest(pe, u * (1 - short_otm), MIN_OI_LOTS_SELL); lpe = nearest(pe, u * (1 - short_otm - wing), MIN_OI_LOTS)
         if any(x is None for x in (sce, lce, spe, lpe)):
             continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
@@ -637,12 +640,13 @@ def prod2_sell_strategies(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     }
 
 
-SKEW_DTE_MIN, SKEW_MIN_ROR = 7, 115.0   # DTE_MIN lowered 15 -> 7 (2026-08, explicit user
-# decision) -- see analysis/gen_skew_signal_history.py's identical constant for the full
-# rationale (15 forced a roll past the WHOLE current expiry, not just its last few days).
-# MIN_ROR: safety floor (delivery-margin) + THE quality gate --
-# lowered 150 -> 145 -> 130 -> 115 (2026-08, explicit user decision, data-verified) -- see
-# analysis/gen_skew_signal_history.py's identical constant for the full rationale.
+SKEW_DTE_MIN = 7   # lowered 15 -> 7 (2026-08, explicit user decision) -- see
+# analysis/gen_skew_signal_history.py's identical constant for the full rationale (15 forced a
+# roll past the WHOLE current expiry, not just its last few days).
+SKEW_TIER_MIN_ROR = {"t1_skew35": 115.0, "t2_skew6": 100.0, "t3_skew8": 90.0}   # per-tier
+# (2026-09) -- previously one shared SKEW_MIN_ROR across all 3 tiers; split so t2/t3 can be
+# relaxed independently of t1 -- see analysis/gen_skew_signal_history.py's identical
+# TIER_MIN_ROR constant for the full data-verified rationale behind each tier's value.
 # Three tiers mirroring Broken-Wing's design: wider wing -> more credit banked, fewer signals.
 # t1 is the everyday base tier (>=~Rs.7k median PnL/lot floor), t2/t3 progressively rarer.
 # 10% wing tested and found to plateau exactly at 8%'s payout with fewer signals -- not used.
@@ -681,16 +685,16 @@ def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: 
         if ce.empty or pe.empty:
             continue
         lot = lots.get(sym)
-        def nearest(df, target):
+        def nearest(df, target, min_oi):
             if lot is not None and pd.notna(lot) and lot > 0:
-                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                liquid = df[df["open_int"] / lot >= min_oi]
                 if not liquid.empty:
                     df = liquid
                 else:
                     return None
             return df.iloc[(df["strike"] - target).abs().argmin()]
-        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing))
-        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing))
+        sce = nearest(ce, u * (1 + short_otm), MIN_OI_LOTS_SELL); lce = nearest(ce, u * (1 + short_otm + wing), MIN_OI_LOTS)
+        spe = nearest(pe, u * (1 - short_otm), MIN_OI_LOTS_SELL); lpe = nearest(pe, u * (1 - short_otm - wing), MIN_OI_LOTS)
         if any(x is None for x in (sce, lce, spe, lpe)):
             continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
@@ -743,7 +747,9 @@ def _skew_candidates(day: pd.DataFrame, short_otm: float, wing: float, dte_min: 
 @app.get("/prod2/skew_strategy")
 def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
                         dte_min: int = Query(SKEW_DTE_MIN, ge=0, le=30),
-                        min_ror: float = Query(SKEW_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+                        t1_min_ror: float = Query(SKEW_TIER_MIN_ROR["t1_skew35"], ge=0, le=1000),
+                        t2_min_ror: float = Query(SKEW_TIER_MIN_ROR["t2_skew6"], ge=0, le=1000),
+                        t3_min_ror: float = Query(SKEW_TIER_MIN_ROR["t3_skew8"], ge=0, le=1000)) -> dict[str, object]:
     """Live DEFINED-RISK single-side credit spread, evaluated at THREE wing-width tiers
     simultaneously (mirroring Broken-Wing's tiering): back out BS implied vol for the
     ~short_otm% OTM call and put separately, sell whichever side is relatively richer
@@ -751,8 +757,10 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     banked, fewer signals clear the gate (same pattern found for the condor/broken-wing).
     De-duplicated against Broken-Wing Condor: a symbol already firing a Broken-Wing signal
     today is excluded here -- skew is a secondary/complementary signal source, not a duplicate.
-    Entry requires DTE >= dte_min AND entry-time credit/max_risk > min_ror. Each tier's
-    `fired_today` flag tells you which tier(s) are live."""
+    Entry requires DTE >= dte_min AND entry-time credit/max_risk > that tier's own min_ror
+    (t1/t2/t3, independently tunable). Each tier's `fired_today` flag tells you which tier(s)
+    are live."""
+    tier_min_ror = {"t1_skew35": t1_min_ror, "t2_skew6": t2_min_ror, "t3_skew8": t3_min_ror}
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "tiers": []}
@@ -770,25 +778,25 @@ def prod2_skew_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
     exclude = set(EXCLUDE_SYMBOLS)
     for tier in BW_TIERS:
         bw_out = _bw_candidates(day, 0.02, tier["wing_ce"], tier["wing_pe"], BW_DTE_MIN,
-                                BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR, bw_a_mcap, g2, lots, ivlast)
+                                BW_TIER_MCAP_MIN_ROR[tier["id"]], BW_TIER_OTHER_MIN_ROR[tier["id"]], bw_a_mcap, g2, lots, ivlast)
         exclude |= {c["symbol"] for c in bw_out if c["in_window"]}
 
     tiers_out = []
     for tier in SKEW_TIERS:
-        out = _skew_candidates(day, short_otm, tier["wing"], dte_min, min_ror, g2, lots, ivlast, exclude)
+        out = _skew_candidates(day, short_otm, tier["wing"], dte_min, tier_min_ror[tier["id"]], g2, lots, ivlast, exclude)
         out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
         in_window = [c for c in out if c["in_window"]]
         top_picks = sorted(in_window, key=lambda c: c["ror_pct"], reverse=True)[:3]
         tiers_out.append({
             "id": tier["id"], "label": tier["label"], "wing": tier["wing"], "fired_today": bool(in_window),
             "backtest": {**tier["backtest"], "note": SKEW_NOTE,
-                        "window": "2024-08..2026-08 (2y, richer-side 2% OTM, DTE>=15 w/ roll-forward, "
-                                  "entry ror>150%, de-duped vs Broken-Wing, pre-cost)"},
+                        "window": f"2024-08..present (richer-side 2% OTM, DTE>=7 w/ roll-forward, "
+                                  f"entry ror>{tier_min_ror[tier['id']]:.0f}%, de-duped vs Broken-Wing, pre-cost)"},
             "candidates": out, "top_picks": top_picks,
         })
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "dte_min": dte_min, "min_ror": min_ror},
+        "params": {"short_otm": short_otm, "dte_min": dte_min, **{f"{k}_min_ror": v for k, v in tier_min_ror.items()}},
         "excluded_by_broken_wing": sorted(exclude),
         "tiers": tiers_out,
     }
@@ -801,14 +809,16 @@ EXCLUDE_SYMBOLS = {"ANGELONE"}
 
 BW_DTE_MIN = 7   # lowered 9 -> 7 (2026-08, explicit user decision) -- see
 # gen_broken_wing_signal_history.py's identical constant for rationale
-BW_MCAP_MIN_ROR, BW_OTHER_MIN_ROR = 150.0, 155.0   # stratified entry gate: mega-caps are
-    # structurally lower-IV (steadier, less wing-breach risk -- itself a quality trait for a
-    # defined-risk seller) so they rarely clear a uniform bar; relaxing it specifically for them
-    # lifted mega-cap share from ~13% to 13-28%/tier without a win-rate cost in backtest.
-    # History: 150/155 -> 145/150 -> 120/125 -> 190/195 -> 150/155 (2026-08, explicit user
-    # decision) -- see analysis/gen_broken_wing_signal_history.py's identical constant for the
-    # full rationale (ROR% alone couldn't hit the Rs.8k mean-pnl/lot target; backed off again and
-    # did the actual lifting via BW_MIN_PROFIT_PER_LOT below).
+BW_TIER_MCAP_MIN_ROR = {"t1_2x6": 150.0, "t2_3x8": 110.0, "t3_2x10": 110.0}   # per-tier
+BW_TIER_OTHER_MIN_ROR = {"t1_2x6": 155.0, "t2_3x8": 115.0, "t3_2x10": 115.0}   # (2026-09) --
+    # stratified entry gate: mega-caps are structurally lower-IV (steadier, less wing-breach
+    # risk -- itself a quality trait for a defined-risk seller) so they rarely clear a uniform
+    # bar; relaxing it specifically for them lifted mega-cap share from ~13% to 13-28%/tier
+    # without a win-rate cost in backtest. Previously ONE shared pair applied to all 3 tiers --
+    # split per-tier so t2/t3 can be relaxed independently of t1 -- see
+    # analysis/gen_broken_wing_signal_history.py's identical dicts for the full data-verified
+    # rationale behind each tier's value (t1 150/155 unchanged; t2/t3 110/115, the "Option B" of
+    # a 2-option sweep each).
 BW_MIN_PROFIT_PER_LOT = 19_000.0   # BW-specific override of the shared MIN_PROFIT_PER_LOT
     # (Rs.10,000, used by Condor/Skew) -- see gen_broken_wing_signal_history.py's identical
     # constant for the full rationale (the lever that actually got BW's mean realized pnl/lot
@@ -898,16 +908,16 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
         if ce.empty or pe.empty:
             continue
         lot = lots.get(sym)
-        def nearest(df, target):
+        def nearest(df, target, min_oi):
             if lot is not None and pd.notna(lot) and lot > 0:
-                liquid = df[df["open_int"] / lot >= MIN_OI_LOTS]
+                liquid = df[df["open_int"] / lot >= min_oi]
                 if not liquid.empty:
                     df = liquid
                 else:
                     return None
             return df.iloc[(df["strike"] - target).abs().argmin()]
-        sce = nearest(ce, u * (1 + short_otm)); lce = nearest(ce, u * (1 + short_otm + wing_ce))
-        spe = nearest(pe, u * (1 - short_otm)); lpe = nearest(pe, u * (1 - short_otm - wing_pe))
+        sce = nearest(ce, u * (1 + short_otm), MIN_OI_LOTS_SELL); lce = nearest(ce, u * (1 + short_otm + wing_ce), MIN_OI_LOTS)
+        spe = nearest(pe, u * (1 - short_otm), MIN_OI_LOTS_SELL); lpe = nearest(pe, u * (1 - short_otm - wing_pe), MIN_OI_LOTS)
         if any(x is None for x in (sce, lce, spe, lpe)):
             continue
         psce, plce, pspe, plpe = _opt_price(sce), _opt_price(lce), _opt_price(spe), _opt_price(lpe)
@@ -956,9 +966,7 @@ def _bw_candidates(day: pd.DataFrame, short_otm: float, wing_ce: float, wing_pe:
 
 @app.get("/prod2/broken_wing_strategy")
 def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
-                               dte_min: int = Query(BW_DTE_MIN, ge=0, le=30),
-                               mcap_min_ror: float = Query(BW_MCAP_MIN_ROR, ge=0, le=1000),
-                               other_min_ror: float = Query(BW_OTHER_MIN_ROR, ge=0, le=1000)) -> dict[str, object]:
+                               dte_min: int = Query(BW_DTE_MIN, ge=0, le=30)) -> dict[str, object]:
     """Live DEFINED-RISK broken-wing iron condor, evaluated at THREE asymmetry tiers simultaneously
     (all narrow-call/wide-put): Tier 1 2%/6% (everyday base signal, fires most often), Tier 2 3%/8%,
     Tier 3 2%/10% (rarest, highest quality). Max loss at expiry = max(call_wing, put_wing) -
@@ -972,11 +980,12 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
     Universe is the UNION of the static A/B groups and today's dynamic top-50-by-OI-in-lots
     stocks (not raw share OI, which is dominated by cheap high-share-count names -- OI-in-lots
-    correctly surfaces mega-caps). Entry gate is STRATIFIED: mega-caps (A_mcap30) need
-    entry_ror > mcap_min_ror (120% default, lower than the uniform 150% -- they're structurally
-    lower-IV/steadier, so a uniform bar under-represents them), everyone else needs > other_min_ror
-    (150%, unchanged). KNOWN GAP: does not exclude F&O-ban-listed stocks -- no ban-list data
-    source exists in this codebase; cross-check live picks against NSE's published ban list."""
+    correctly surfaces mega-caps). Entry gate is STRATIFIED AND PER-TIER (BW_TIER_MCAP_MIN_ROR /
+    BW_TIER_OTHER_MIN_ROR): mega-caps (A_mcap30) need entry_ror > that tier's mcap threshold
+    (lower than the "everyone else" threshold -- they're structurally lower-IV/steadier, so a
+    uniform bar under-represents them). KNOWN GAP: does not exclude F&O-ban-listed stocks -- no
+    ban-list data source exists in this codebase; cross-check live picks against NSE's published
+    ban list."""
     contracts, iv = _sell_sources()
     if contracts is None:
         return {"as_of": None, "tiers": []}
@@ -992,6 +1001,7 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
 
     tiers_out = []
     for tier in BW_TIERS:
+        mcap_min_ror, other_min_ror = BW_TIER_MCAP_MIN_ROR[tier["id"]], BW_TIER_OTHER_MIN_ROR[tier["id"]]
         out = _bw_candidates(day, short_otm, tier["wing_ce"], tier["wing_pe"], dte_min,
                              mcap_min_ror, other_min_ror, a_mcap, g2, lots, ivlast)
         out.sort(key=lambda r: (r["in_window"], r["ror_pct"]), reverse=True)
@@ -1001,13 +1011,15 @@ def prod2_broken_wing_strategy(short_otm: float = Query(0.02, ge=0.01, le=0.08),
             "id": tier["id"], "label": tier["label"], "wing_ce": tier["wing_ce"], "wing_pe": tier["wing_pe"],
             "fired_today": bool(in_window),
             "backtest": {**tier["backtest"], "note": BW_NOTE,
-                        "window": "2024-08..2026-08 (2y, short 2% OTM, DTE>=9 w/ roll-forward, "
-                                  "stratified entry gate, pre-cost)"},
+                        "window": f"2024-08..present (short 2% OTM, DTE>=7 w/ roll-forward, "
+                                  f"entry ror> mcap {mcap_min_ror:.0f}% / other {other_min_ror:.0f}%, pre-cost)"},
             "candidates": out, "top_picks": top_picks,
         })
     return {
         "as_of": last.date().isoformat(),
-        "params": {"short_otm": short_otm, "dte_min": dte_min, "mcap_min_ror": mcap_min_ror, "other_min_ror": other_min_ror},
+        "params": {"short_otm": short_otm, "dte_min": dte_min,
+                   **{f"{t['id']}_mcap_min_ror": BW_TIER_MCAP_MIN_ROR[t["id"]] for t in BW_TIERS},
+                   **{f"{t['id']}_other_min_ror": BW_TIER_OTHER_MIN_ROR[t["id"]] for t in BW_TIERS}},
         "universe_size": len(universe),
         "tiers": tiers_out,
     }

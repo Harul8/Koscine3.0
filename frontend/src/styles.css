@@ -616,6 +616,14 @@ table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right: 1px solid #d8
   font-size: 12px;
 }
 
+/* Position column: the SOLD (short) strike of each leg is darker/bolder than the bought
+   (long) one, so which side is actually written is visually obvious, not just positional
+   (short listed first) convention. */
+.pos-sell {
+  color: #172126;
+  font-weight: 700;
+}
+
 .group-tag {
   font-weight: 650;
 }

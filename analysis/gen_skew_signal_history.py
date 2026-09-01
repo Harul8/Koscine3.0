@@ -18,7 +18,7 @@ already found for the symmetric/broken-wing condor (pre-dedup, raw candidate cou
 
 UNIFIED with the live /prod2/skew_strategy endpoint (2026-08, explicit user decision): universe
 and ROR gate now match exactly (koscine.liquid_universe.live_universe_for_date == NIFTY50 +
-that day's top-15 liquid non-Nifty50 tail; MIN_ENTRY_ROR == SKEW_MIN_ROR in api/main.py == 150%).
+that day's top-15 liquid non-Nifty50 tail; TIER_MIN_ROR == SKEW_TIER_MIN_ROR in api/main.py).
 Only the SINGLE best (highest entry_ror_pct) candidate PER TIER PER DAY is kept as a real signal
 -- matching the live panel's per-tier "top_picks[0] is THE 1-pick/day rule". Selection is
 entry-time-only (deterministic, never revisited); see analysis/append_daily_sell_signals.py for
@@ -36,7 +36,7 @@ production counts (pre-unification numbers, kept for context):
 Combined with Broken-Wing's 403/2y (201/yr): 687/2y = 343.5/yr grand total, in the 320-350
 target range.
 
-Gating criterion is MIN_ENTRY_ROR: the entry-time credit/max_risk ratio (knowable before the
+Gating criterion is TIER_MIN_ROR (per-tier): the entry-time credit/max_risk ratio (knowable before the
 trade), not the realized ror_pct column (an ex-post outcome). IV-richness (skew = CE-IV - PE-IV)
 picks which side to sell, but is not itself a hard filter beyond that.
 
@@ -70,24 +70,32 @@ from koscine.config import SILVER_DATA_ROOT  # noqa: E402
 from koscine import liquid_universe  # noqa: E402
 
 SHORT_OTM, FWD, SAFE_DTE = 0.02, 5, 4
-DTE_MIN, MIN_ENTRY_ROR, MIN_VOL = 7, 115.0, 50   # DTE_MIN lowered 15 -> 7 (2026-08, explicit user
+DTE_MIN, MIN_VOL = 7, 50   # DTE_MIN lowered 15 -> 7 (2026-08, explicit user
 # decision): 15 meant rolling past the WHOLE current expiry (not just its last few days) any time
 # fewer than 15 days remained, jumping a full month out (e.g. ITC fired Aug-25 expiry's 13 DTE
 # wasn't enough, so it rolled to Sep-29/48 DTE) -- 7 still clears E-4 forced exit (SAFE_DTE=4)
 # with a 3-day margin, same safety logic, just less conservative about how early it rolls.
-# MIN_ENTRY_ROR == SKEW_MIN_ROR (api/main.py) --
-# unified with the live panel's gate (2026-08). Lowered 150 -> 145 -> 130 -> 115 (2026-08,
-# explicit user decision, data-verified): Skew is the strongest performer of the three (mean
-# realized ROR ~119-142%) -- direct comparison confirmed its looser bands still meaningfully
-# outperform Condor's tightest tail on realized pnl/lot, and Condor has since been killed
-# entirely (see gen_sell_signal_history.py) -- Skew now absorbs a bigger share of the combined
-# ~200-250/yr signal-volume target (~130/yr), split with Broken-Wing (~120/yr).
+# TIER_MIN_ROR (per-tier, 2026-09): previously ONE shared MIN_ENTRY_ROR across all 3 tiers --
+# split per-tier (== SKEW_TIER_MIN_ROR in api/main.py) so t2/t3 can be relaxed independently of
+# t1, without re-tuning t1's own gate. t1=115 unchanged (data-verified 2026-08: Skew is the
+# strongest performer of the three, mean realized ROR ~119-142% -- looser bands still
+# meaningfully outperform Condor's tightest tail on realized pnl/lot, and Condor has since been
+# killed entirely, see gen_sell_signal_history.py). t2=100, t3=90 (2026-09, explicit user
+# decision, data-verified against skew_candidates_raw.parquet): t2 was the "safe" relax option
+# of a 2-option sweep (n/yr 40->59, mean pnl/lot -2.6%, worst DD unchanged at -5.3% -- the more
+# aggressive t2 option crossed a real DD cliff to -18.5% and was rejected); t3 was the
+# "aggressive" option of its own 3-option sweep (n/yr 20->45, mean pnl/lot -10.7%, worst DD
+# unchanged at -2.7% -- t3's candidate pool tolerates loosening much better than t2's does).
+TIER_MIN_ROR = {"t1_skew35": 115.0, "t2_skew6": 100.0, "t3_skew8": 90.0}
 MIN_RISK_FRAC = 0.10   # max_risk must be >= 10% of wing width; below that, credit~=width and the
                         # entry_ror ratio becomes numerically degenerate (blows toward infinity)
 MIN_PROFIT_PER_LOT = 10_000.0   # 2026-08, explicit user decision -- see
                                  # gen_sell_signal_history.py's identical constant for rationale.
 MIN_OI_LOTS = 100   # 2026-08, explicit user decision -- see gen_broken_wing_signal_history.py's
                      # identical constant for rationale (excludes thin strikes from selection).
+MIN_OI_LOTS_SELL = 500   # 2026-09, explicit user decision -- see gen_broken_wing_signal_history.py's
+                          # identical constant for rationale (the sold/short leg needs a much
+                          # higher liquidity floor than the bought/long leg).
 _universe_cache: dict = {}
 
 
@@ -140,10 +148,13 @@ g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_tex
 # signals -- 4.6x below the next-weakest name (TMPV, Rs.2,820) -- not a fluke of a small sample.
 EXCLUDE_SYMBOLS = {"ANGELONE"}
 
-mk = load_market_data(columns=["date", "symbol", "atm_iv"])
+mk = load_market_data(columns=["date", "symbol", "atm_iv", "close"])
 mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str); mk = mk.sort_values(["symbol", "date"])
 mk["iv_ratio"] = mk.groupby("symbol")["atm_iv"].transform(lambda s: s / s.rolling(252, min_periods=60).median())
 IV = mk.set_index(["symbol", "date"])["iv_ratio"].to_dict()
+# 2026-09, explicit user decision -- see gen_broken_wing_signal_history.py's identical constant
+# for rationale: `underlying` is the ENTRY date's close, LTP needs the SIGNAL date's close.
+CLOSE = mk.set_index(["symbol", "date"])["close"].to_dict()
 tdays = np.array(sorted(mk["date"].unique())); tpos = {d: k for k, d in enumerate(tdays)}
 
 lot_df = pd.read_parquet(SILVER_DATA_ROOT / "lot_size.parquet", columns=["symbol", "expiry_month", "lot"])
@@ -168,6 +179,7 @@ def legseq(sym, ot, exp, strike, win):
 
 
 def run_tier(tier_id: str, wing: float) -> list[dict]:
+    min_ror = TIER_MIN_ROR[tier_id]
     out = []
     for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
         e_date_str = pd.Timestamp(e_date).date().isoformat()
@@ -197,17 +209,20 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         lot = lot_size(sym, exp)   # needed up-front now: the OI-lots liquidity filter below
                                     # divides raw share-OI by lot size before comparing to MIN_OI_LOTS
 
-        def pick(ot, tgt):
+        def pick(ot, tgt, min_oi):
             c = chain[chain["opt_type"] == ot]
             if lot is not None and pd.notna(lot) and lot > 0:
-                c = c[c["oi"] / lot >= MIN_OI_LOTS]   # exclude thin strikes from consideration
-                                                       # entirely, not just flag them
+                c = c[c["oi"] / lot >= min_oi]   # exclude thin strikes from consideration
+                                                  # entirely, not just flag them
             if c.empty:
                 return None
             return c.iloc[(c["strike"] - tgt).abs().argmin()]
 
-        sce, lce = pick("CE", u * (1 + SHORT_OTM)), pick("CE", u * (1 + SHORT_OTM + wing))
-        spe, lpe = pick("PE", u * (1 - SHORT_OTM)), pick("PE", u * (1 - SHORT_OTM - wing))
+        # sce/spe are always the near-strike (SOLD, whichever side ends up richer below) picks;
+        # lce/lpe are always the far-strike (bought) picks -- so the sell/buy OI floors apply by
+        # position here, before the CE-vs-PE richer-side decision, same as BW.
+        sce, lce = pick("CE", u * (1 + SHORT_OTM), MIN_OI_LOTS_SELL), pick("CE", u * (1 + SHORT_OTM + wing), MIN_OI_LOTS)
+        spe, lpe = pick("PE", u * (1 - SHORT_OTM), MIN_OI_LOTS_SELL), pick("PE", u * (1 - SHORT_OTM - wing), MIN_OI_LOTS)
         if any(x is None for x in (sce, lce, spe, lpe)):
             continue
         if sce["open"] < 3 or spe["open"] < 3 or sce["vol"] < MIN_VOL or spe["vol"] < MIN_VOL:
@@ -238,6 +253,10 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         # carried through to the cross-tier fallback pass below (FALLBACK_MIN_ROR).
 
         vals, dd, exited_early = [], 0.0, False
+        leg_closes = []   # (short_close, long_close) per kept day, parallel to `vals` -- lets
+                          # the exit row show the ACTUAL per-leg closing premiums exit_value was
+                          # computed from, not just the aggregate.
+        exit_days = []    # win[i] per kept day, parallel to `vals` -- for the exit-day underlying (LTP) lookup below.
         for i in range(len(win)):
             sb, lb = seq_s[1][i], seq_l[1][i]
             if not (sb is None or lb is None or sb[2] < MIN_VOL or lb[2] < MIN_VOL):
@@ -245,6 +264,8 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
                 value = max(0.0, min(width, value))
                 upnl = credit - value
                 vals.append(value)
+                leg_closes.append((sb[1], lb[1]))
+                exit_days.append(win[i])
                 dd = min(dd, upnl)
             if (exp - win[i]).days <= SAFE_DTE:
                 exited_early = True
@@ -258,7 +279,25 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         complete = exited_early or (len(win) == FWD)
         exit_value = vals[-1]
         pnl = round(credit - exit_value, 2)
+        # raw (unclamped) per-leg exit premiums -- can differ slightly from the [0,width]-clamped
+        # exit_value above on a rare stale/illiquid print, same as entry's sell/buy_premium vs
+        # credit already can.
+        exit_sell_premium, exit_buy_premium = round(leg_closes[-1][0], 2), round(leg_closes[-1][1], 2)
+        exit_underlying_raw = CLOSE.get((sym, exit_days[-1]))
+        exit_underlying = round(float(exit_underlying_raw), 1) if exit_underlying_raw is not None and pd.notna(exit_underlying_raw) else None
         max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
+
+        # "Buy PnL" hedge analysis -- see gen_broken_wing_signal_history.py's identical block for
+        # the full rationale. Skew only sells one side already (`side`/`short_row`), so the hedge
+        # is simply the opposite type at that SAME short strike.
+        buy_ot = "PE" if side == "CE" else "CE"
+        buy_strike = float(short_row["strike"])
+        buy_seq = legseq(sym, buy_ot, exp, buy_strike, win)
+        buy_pnl_per_lot = None
+        if buy_seq is not None and buy_seq[0] > 0:
+            buy_valid_closes = [b[1] for b in buy_seq[1] if b is not None and b[2] >= MIN_VOL]
+            if buy_valid_closes and lot is not None and pd.notna(lot):
+                buy_pnl_per_lot = round((max(buy_valid_closes) - buy_seq[0]) * lot, 1)
 
         def oi_lots(row):
             v = row.get("oi")
@@ -266,10 +305,12 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
                 return None
             return round(float(v) / float(lot))
 
+        signal_underlying = CLOSE.get((sym, t))
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
             "entry_date": pd.Timestamp(e_date).date().isoformat(),
             "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
+            "signal_underlying": round(float(signal_underlying), 1) if signal_underlying is not None and pd.notna(signal_underlying) else None,
             "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
@@ -277,12 +318,15 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "entry_ror_pct": round(entry_ror, 1),
-            "clears_primary_bar": entry_ror > MIN_ENTRY_ROR and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
+            "clears_primary_bar": entry_ror > min_ror and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
             "lot_size": int(lot) if lot is not None and pd.notna(lot) else None,
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
+            "exit_underlying": exit_underlying,
             "exit_value": round(exit_value, 2),
+            "exit_sell_premium": exit_sell_premium, "exit_buy_premium": exit_buy_premium,
             "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None),
+            "buy_pnl_per_lot": buy_pnl_per_lot,
             "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
             "outcome": ("win" if pnl > 0 else "loss") if complete else "pending",
         })

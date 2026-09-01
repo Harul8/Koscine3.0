@@ -39,6 +39,9 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(r"C:\Users\rahul\Koscine 3.0")
+sys.path.insert(0, str(ROOT)); sys.path.insert(0, str(ROOT / "src"))
+from koscine3.data.sources import load_market_data  # noqa: E402
+
 OUTDIR = ROOT / "locks" / "prod_sell_strategies"
 FWD, SAFE_DTE, MIN_VOL = 5, 4, 50
 
@@ -84,6 +87,24 @@ def _mark_pending(panel_path: str, today: str) -> None:
         b = cbar.get((sym, ot, exp, strike))
         return b.get(pd.Timestamp(d)) if b else None
 
+    def legseq(sym, ot, exp, strike, win):
+        # same entry-open + per-day-close sequence lookup the gen_*_signal_history.py generators
+        # use for the "Buy PnL" hedge comparison -- kept in sync here so a re-marked pending
+        # trade's buy_pnl_per_lot doesn't go stale relative to its own exit_value.
+        b = cbar.get((sym, ot, exp, strike))
+        if not b:
+            return None
+        e = b.get(win[0])
+        if not e or e[0] <= 0:
+            return None
+        return e[0], [b.get(d) for d in win]
+
+    # underlying close, for exit_underlying (Exit LTP) -- the SIGNAL date's underlying close is
+    # already logged at fire time, but the EXIT day's close isn't known until now.
+    mk = load_market_data(columns=["date", "symbol", "close"])
+    mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str)
+    CLOSE = mk.set_index(["symbol", "date"])["close"].to_dict()
+
     cutoff = pd.bdate_range(end=today, periods=FWD + 1)[0].strftime("%Y-%m-%d")
 
     for name, fname, is_skew in STRATEGIES:
@@ -106,6 +127,11 @@ def _mark_pending(panel_path: str, today: str) -> None:
             credit = float(row["credit"])
             width = credit + float(row["max_risk"])   # width == credit + max_risk, always (max_risk = width - credit)
             vals, dd, exited_early = [], 0.0, False
+            leg_closes = []   # (sell_close, buy_close) per kept day, parallel to `vals` -- same
+                              # exit_sell_premium/exit_buy_premium breakdown the generators track,
+                              # kept in sync here so a re-marked pending trade's Exit-value
+                              # breakdown doesn't go stale relative to its own exit_value.
+            exit_days = []    # win[i] per kept day, parallel to `vals` -- for exit_underlying.
             for d in win:
                 if is_skew:
                     side = row["side"]
@@ -113,6 +139,7 @@ def _mark_pending(panel_path: str, today: str) -> None:
                     lb = bar(row["symbol"], side, exp, float(row["long_strike"]), d)
                     ok = sb is not None and lb is not None and sb[2] >= MIN_VOL and lb[2] >= MIN_VOL
                     value = max(0.0, min(width, sb[1] - lb[1])) if ok else None
+                    leg_pair = (sb[1], lb[1]) if ok else None
                 else:
                     legbars = [bar(row["symbol"], "CE", exp, float(row["short_ce"]), d),
                                bar(row["symbol"], "CE", exp, float(row["long_ce"]), d),
@@ -120,8 +147,11 @@ def _mark_pending(panel_path: str, today: str) -> None:
                                bar(row["symbol"], "PE", exp, float(row["long_pe"]), d)]
                     ok = all(b is not None and b[2] >= MIN_VOL for b in legbars)
                     value = max(0.0, min(width, (legbars[0][1] - legbars[1][1]) + (legbars[2][1] - legbars[3][1]))) if ok else None
+                    leg_pair = (legbars[0][1] + legbars[2][1], legbars[1][1] + legbars[3][1]) if ok else None
                 if value is not None:
                     vals.append(value)
+                    leg_closes.append(leg_pair)
+                    exit_days.append(d)
                     dd = min(dd, credit - value)
                 if (exp - d).days <= SAFE_DTE:
                     exited_early = True
@@ -130,10 +160,36 @@ def _mark_pending(panel_path: str, today: str) -> None:
                 continue
             complete = exited_early or (len(win) == FWD)
             exit_value = vals[-1]
+            exit_sell_premium, exit_buy_premium = leg_closes[-1]
+            exit_underlying_raw = CLOSE.get((row["symbol"], exit_days[-1]))
+            exit_underlying = round(float(exit_underlying_raw), 1) if exit_underlying_raw is not None and pd.notna(exit_underlying_raw) else None
             pnl = round(credit - exit_value, 2)
             risk = float(row["max_risk"])
             lot = row.get("lot_size")
+
+            # "Buy PnL" hedge comparison -- same OPPOSITE-type, SAME-strike-as-sold logic the
+            # generators use (see gen_broken_wing_signal_history.py for the full rationale),
+            # over the full FWD-day window regardless of this trade's own early-exit timing.
+            if is_skew:
+                side = row["side"]
+                buy_ot = "PE" if side == "CE" else "CE"
+                buy_strike = float(row["short_strike"])
+            else:
+                richer_side = row.get("richer_side")
+                buy_ot = "PE" if richer_side == "CE" else "CE"
+                buy_strike = float(row["short_ce"]) if richer_side == "CE" else float(row["short_pe"])
+            buy_seq = legseq(row["symbol"], buy_ot, exp, buy_strike, win)
+            buy_pnl_per_lot = None
+            if buy_seq is not None and buy_seq[0] > 0:
+                buy_valid_closes = [b[1] for b in buy_seq[1] if b is not None and b[2] >= MIN_VOL]
+                if buy_valid_closes and pd.notna(lot):
+                    buy_pnl_per_lot = round((max(buy_valid_closes) - buy_seq[0]) * lot, 1)
+
             df.at[idx, "exit_value"] = round(exit_value, 2)
+            df.at[idx, "exit_sell_premium"] = round(exit_sell_premium, 2)
+            df.at[idx, "exit_buy_premium"] = round(exit_buy_premium, 2)
+            df.at[idx, "exit_underlying"] = exit_underlying
+            df.at[idx, "buy_pnl_per_lot"] = buy_pnl_per_lot
             df.at[idx, "pnl"] = pnl
             df.at[idx, "pnl_per_lot"] = round(pnl * lot, 1) if pd.notna(lot) else None
             df.at[idx, "ror_pct"] = round(pnl / risk * 100, 1)
