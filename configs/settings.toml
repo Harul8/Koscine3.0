@@ -1,0 +1,49 @@
+# Koscine settings. Every path, cost and limit used by src/koscine4 lives here.
+# Paths are relative to the project root (the folder holding pyproject.toml).
+
+[paths]
+silver = "data/silver"            # existing silver tables (input)
+intraday = "data/intraday"        # 5-minute index chains and stock option marks
+pit = "data/pit"                  # point-in-time input tables built by koscine4.store
+outcomes = "data/outcomes"        # outcome tables, kept apart from inputs
+model_store = "models"            # trained models, one folder per model and cutoff
+runs = "runs"                     # harness run outputs (large, not tracked in git)
+records = "records"               # gate decisions and run summaries (tracked in git)
+strategies = "configs/strategies" # one TOML file per strategy specification
+
+[universe]
+top_n = 30                        # U-1: largest F&O stocks by market value (decision A1)
+option_days_window = 20           # U-2: look-back for the options-traded check
+min_option_days_share = 0.80      # U-2: share of those days with options traded
+
+[harness]
+gap_trading_days = 10             # V-3: gap between last training outcome and first test date
+sealed_months = 12                # V-12: most recent months kept untouched
+
+[selection]
+max_new_trades_per_week = 5       # S-7
+max_open_per_instrument = 1       # S-8
+
+[costs]
+# Statutory NSE F&O costs, ported from analysis/index_credit_spread_1515.py.
+# To be re-checked against current exchange circulars in phase 4 before any result is used.
+brokerage_per_order = 20.0        # rupees
+stt_sell_pct = 0.0625             # percent of premium, sell side
+exchange_txn_pct = 0.03503        # percent of premium
+sebi_per_crore = 10.0             # rupees per crore of turnover
+stamp_buy_pct = 0.003             # percent of premium, buy side
+gst_pct = 18.0                    # percent, on brokerage and exchange and SEBI fees
+# slippage_pct_per_leg is deliberately unset: the harness sweeps it and reports break-even (V-8, V-9).
+
+[risk]
+# The owner sets every value below (decision A3, requirement R-7).
+# The daily run refuses to produce a live list while any is missing.
+# capital =
+# risk_per_trade_pct =
+# max_open_risk_pct =
+# drawdown_halve_pct =
+# drawdown_pause_pct =
+# expiry_safety_days =
+# index_book_trades_per_week =
+# stock_book_trades_per_week =
+# max_correlated_trades =
