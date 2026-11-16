@@ -1,12 +1,13 @@
 # ---- Data & generated artifacts (large / reproducible) ----
-data/
-models/
+/data/
+/models/
+experiments/**/data/
 locks/
 runs/
 reports/
 predictions/
 catboost_info/
-Universe/
+/Universe/
 .tmp_refresh_repro/
 
 # Data / model / archive file types (anywhere, incl. experiments/)
