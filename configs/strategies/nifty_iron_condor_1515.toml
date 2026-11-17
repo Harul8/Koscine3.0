@@ -1,0 +1,33 @@
+# Index search candidate (IX-6): iron condor at 15:15.
+name = "nifty_iron_condor_1515"
+family = "nifty_iron_condor"
+book = "index"
+instruments = ["NIFTY"]
+structure = "iron_condor"
+decision_time = "1430"
+entry_time = "1515"
+
+[expiry]
+min_dte = 7
+
+[strikes]
+short_otm_pct = 2.0
+wing_pct = 1.0
+max_snap_pct = 0.35
+
+[exit]
+max_hold_sessions = 5
+safety_days = 4
+
+[liquidity]
+min_volume = 100
+min_open_interest = 50
+min_premium = 5.0
+
+[score]
+source = "take_all"
+threshold = 0.0
+
+[selection]
+weekly_cap = true
+max_per_day = 1

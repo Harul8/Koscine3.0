@@ -1,0 +1,32 @@
+# Baseline (M-1): the same straddle, at most five a week, highest implied volatility first.
+name = "baseline_iv_rank_straddle"
+family = "stock_long_straddle"
+
+book = "stock"
+structure = "long_straddle"
+decision_time = "evening"
+entry_time = "next_open"
+
+[expiry]
+min_dte = 7
+
+[strikes]
+max_snap_pct = 2.5
+
+[exit]
+max_hold_sessions = 5
+safety_days = 3
+
+[liquidity]
+min_volume = 50
+min_open_interest = 20
+min_premium = 5.0
+
+[score]
+source = "feature"
+feature = "atm_iv"
+threshold = 0.0
+
+[selection]
+weekly_cap = true
+max_per_day = 1

@@ -2,6 +2,7 @@
 # Paths are relative to the project root (the folder holding pyproject.toml).
 
 [paths]
+raw = "data/raw"                  # downloaded exchange and vendor files (input)
 silver = "data/silver"            # existing silver tables (input)
 intraday = "data/intraday"        # 5-minute index chains and stock option marks
 pit = "data/pit"                  # point-in-time input tables built by koscine4.store
@@ -11,29 +12,123 @@ runs = "runs"                     # harness run outputs (large, not tracked in g
 records = "records"               # gate decisions and run summaries (tracked in git)
 strategies = "configs/strategies" # one TOML file per strategy specification
 
+[availability]
+# D-3: when each source's row for day D becomes usable.
+#   "evening"       the evening of D
+#   "next_preopen"  before the open of the next session
+#   "next_evening"  the evening of the next session
+# The owner confirmed on 2026-11-17 that FII/DII and participant data are published the same evening.
+prices_raw = "evening"
+option_quotes = "evening"
+flows_fii_dii = "evening"
+flows_participant_oi = "evening"
+events = "evening"
+
+[sources]
+# The exchange's public archive: one zip of daily reports per trading day.
+report_bundle_url = "https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{ddmmyy}.zip"
+symbol_changes_url = "https://nsearchives.nseindia.com/content/equities/symbolchange.csv"
+user_agent = "Mozilla/5.0 (compatible; research-data-client)"
+workers = 4                       # parallel downloads
+timeout_seconds = 30
+retries = 3
+
+[store]
+min_symbols_for_session = 50     # a date counts as a trading session when this many stocks traded
+gap_down_ratio = 0.75             # open / previous close at or below this is a corporate-action candidate
+gap_up_ratio = 1.50               # ... or at or above this
+declared_search_days = 5          # calendar days either side of a declared split date to look for the gap
+declared_match_tolerance = 0.15   # how far the observed gap may be from the declared factor
+declared_loose_tolerance = 0.25   # a large gap this close to a declared ratio takes the declared ratio; the rest is the day's move
+clean_ratio_tolerance = 0.03      # an undeclared gap this close to a round ratio is treated as a split
+named_open_close_tolerance = 0.15 # a demerger whose close is this far below its open takes its factor from the close
+demerger_min_gap = 0.05           # a demerger the exchange names is adjusted when the open is this far below the previous close
+min_price_for_inferred = 20.0     # undeclared gaps on cheaper stocks are listed, not applied
+max_break_days_for_inferred = 20  # a gap across a longer break in the data is listed, not applied
+restore_tolerance = 0.005         # silver close vs exchange previous close: beyond this the row was back-adjusted
+restore_min_run = 3               # ...and only when at least this many rows in a row agree
+missing_error_recent_sessions = 60  # a missing index session this recent stops a refresh; older ones are listed
+jump_review_pct = 30.0            # D-1: adjusted one-day changes above this are listed for review
+stale_run_sessions = 5            # D-8: this many identical zero-volume sessions in a row is an error
+max_staleness_days = 7            # D-10: intraday files older than this fail the freshness check
+observed_max_age_days = 45        # D-11: an exchange share count this recent counts as observed
+share_glitch_window = 5           # D-11: trailing observations used to drop a short disagreement around a split
+
+[features]
+min_days_to_expiry = 5            # the near expiry is the first one at least this many calendar days away
+max_atm_distance = 0.03           # an at-the-money strike further than this from the forward is not used
+
 [universe]
-top_n = 30                        # U-1: largest F&O stocks by market value (decision A1)
+top_n = 30                       # U-1: largest F&O stocks by market value (decision A1)
 option_days_window = 20           # U-2: look-back for the options-traded check
 min_option_days_share = 0.80      # U-2: share of those days with options traded
+max_value_age_sessions = 5        # a market value older than this many sessions is not used for ranking
 
 [harness]
 gap_trading_days = 10             # V-3: gap between last training outcome and first test date
 sealed_months = 12                # V-12: most recent months kept untouched
+default_start = "2012-01-01"      # first test date of a run when none is given
+default_slippage_pct = 1.0        # assumed slippage, percent of option price per leg; every report also gives break-even
+
+[gate2]
+# Proposed gate 2 numbers. They need the owner's agreement before any strategy is judged against them.
+min_positive_year_share = 0.667   # positive in at least two of every three calendar years
+min_independent_bets = 100
+# max_drawdown_pct =              # the owner's limit, in percent of one trade's maximum loss
 
 [selection]
 max_new_trades_per_week = 5       # S-7
 max_open_per_instrument = 1       # S-8
 
+[selection.groups]
+# S-9: instruments that tend to lose together. Bank Nifty counts with bank stocks.
+banks = ["BANKNIFTY", "HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK", "BANKBARODA", "PNB",
+         "FEDERALBNK", "IDFCFIRSTB", "AUBANK", "CANBK", "YESBANK", "BANDHANBNK", "UNIONBANK"]
+
 [costs]
-# Statutory NSE F&O costs, ported from analysis/index_credit_spread_1515.py.
-# To be re-checked against current exchange circulars in phase 4 before any result is used.
-brokerage_per_order = 20.0        # rupees
-stt_sell_pct = 0.0625             # percent of premium, sell side
-exchange_txn_pct = 0.03503        # percent of premium
-sebi_per_crore = 10.0             # rupees per crore of turnover
+# NSE option costs (V-8). Rates that changed over time are in the dated schedule below.
+brokerage_per_order = 20.0        # rupees, flat, per leg per side
+sebi_per_crore = 10.0             # rupees per crore of premium turnover
 stamp_buy_pct = 0.003             # percent of premium, buy side
-gst_pct = 18.0                    # percent, on brokerage and exchange and SEBI fees
-# slippage_pct_per_leg is deliberately unset: the harness sweeps it and reports break-even (V-8, V-9).
+gst_pct = 18.0                    # percent, on brokerage, exchange charge and SEBI fee
+
+# Each row applies from its date until the next row.
+# Checked on 2026-11-17 against broker and press notices: the 1 Oct 2024 and 1 Apr 2026 rows.
+# The earlier rows are from memory of the Finance Acts and are NOT confirmed; they matter only for old test years.
+[[costs.schedule]]
+from = "2010-01-01"
+stt_sell_pct = 0.017              # percent of premium, sell side (not confirmed)
+exchange_txn_pct = 0.05           # percent of premium (not confirmed)
+
+[[costs.schedule]]
+from = "2016-06-01"
+stt_sell_pct = 0.05               # not confirmed
+exchange_txn_pct = 0.05
+
+[[costs.schedule]]
+from = "2023-04-01"
+stt_sell_pct = 0.0625
+exchange_txn_pct = 0.05
+
+[[costs.schedule]]
+from = "2024-10-01"
+stt_sell_pct = 0.1                # confirmed
+exchange_txn_pct = 0.03503        # confirmed
+
+[[costs.schedule]]
+from = "2026-04-01"
+stt_sell_pct = 0.15               # confirmed (Union Budget 2026)
+exchange_txn_pct = 0.03503
+
+[risk_model]
+margin_factor = 1.25              # R-6: estimated margin for a spread = its maximum loss x this. An estimate, not the exchange figure.
+min_sessions_to_expiry_at_entry = 2
+
+[ledger]
+suspend_after_trades = 20         # L-4: live trades looked at before a strategy can be suspended
+suspend_z = 2.0                   # ...when the live mean is this many standard errors below the backtest mean
+drift_low_pct = 0.5               # L-5: a live feature outside these percentiles of its history is flagged
+drift_high_pct = 99.5
 
 [risk]
 # The owner sets every value below (decision A3, requirement R-7).

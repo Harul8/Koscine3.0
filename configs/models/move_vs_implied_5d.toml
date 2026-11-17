@@ -1,0 +1,24 @@
+# Predicts the 5-session move minus the implied move. A linear check on the same question.
+# Trained on every F&O stock that existed at the time; scores only the month's list (U-6).
+name = "move_vs_implied_5d"
+kind = "regression"
+algorithm = "ridge"
+decision_time = "evening"
+min_train_rows = 2000
+seed = 7
+features = [
+    "ret_1d", "ret_5d", "ret_20d", "dist_ma20", "dist_ma50", "dist_ma200", "gap_open",
+    "rv_5", "rv_20", "rv_60", "rv_ratio_5_20", "parkinson_10", "atr_pct_14", "range_pct", "volume_ratio_20", "rv_20_pctile",
+    "atm_iv", "iv_rv_ratio", "iv_minus_rv", "implied_move_5d", "iv_chg_5d", "iv_pctile", "term_slope",
+    "skew", "pcr_oi", "pcr_oi_chg_5d", "fut_oi_chg_5d", "straddle_pct", "dte_near", "opt_volume_ratio_20",
+    "days_to_results", "results_in_5d", "days_since_results",
+    "nifty_ret_5d", "nifty_rv_20", "vix_pctile", "vix_chg_5d", "breadth_ma50", "fii_net_5d_z", "fii_idx_fut_ratio",
+]
+
+[target]
+table = "moves"
+column = "excess"
+horizon = 5
+
+[params]
+alpha = 50.0

@@ -1,0 +1,35 @@
+# Existing idea 1, rerun through the harness (V-16): sell a put spread 2% below the index at 15:15.
+name = "banknifty_put_credit_spread_1515"
+family = "banknifty_credit_spread"
+book = "index"
+instruments = ["BANKNIFTY"]
+structure = "credit_spread"
+side = "put"
+decision_time = "1430"
+entry_time = "1515"
+notes = "Ported from analysis/index_credit_spread_1515.py: 2% out-of-the-money short, 5-session hold, safety exit before expiry."
+
+[expiry]
+min_dte = 7
+
+[strikes]
+short_otm_pct = 2.0
+wing_pct = 2.0
+max_snap_pct = 0.35
+
+[exit]
+max_hold_sessions = 5
+safety_days = 4
+
+[liquidity]
+min_volume = 100
+min_open_interest = 50
+min_premium = 5.0
+
+[score]
+source = "take_all"
+threshold = 0.0
+
+[selection]
+weekly_cap = true
+max_per_day = 1

@@ -54,6 +54,14 @@ class Settings:
     selection: Mapping[str, Any]
     costs: Mapping[str, Any]
     risk: Mapping[str, Any] = field(default_factory=dict)
+    sections: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+    def section(self, name: str) -> Mapping[str, Any]:
+        """Any other section of the settings file, such as [store] or [availability]."""
+        try:
+            return self.sections[name]
+        except KeyError:
+            raise SettingsError(f"Section [{name}] is missing from {SETTINGS_FILE}.") from None
 
     def path(self, name: str) -> Path:
         try:
@@ -104,4 +112,5 @@ def load_settings(root: Path | None = None, file: Path | None = None) -> Setting
         selection=dict(raw["selection"]),
         costs=dict(raw["costs"]),
         risk=dict(raw.get("risk", {})),
+        sections={k: dict(v) for k, v in raw.items() if isinstance(v, dict)},
     )

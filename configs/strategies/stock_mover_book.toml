@@ -1,0 +1,35 @@
+# Existing idea 3, rerun through the harness (V-16): buy a near out-of-the-money strangle on the
+# stocks a model ranks as the likeliest large movers. Needs: models.train --model mover_abs_5d.
+# The threshold is the predicted 5-session move, as a fraction: 0.05 = 5%.
+name = "stock_mover_book"
+family = "stock_mover"
+
+book = "stock"
+structure = "long_strangle"
+decision_time = "evening"
+entry_time = "next_open"
+
+[expiry]
+min_dte = 7
+
+[strikes]
+max_snap_pct = 2.5
+otm_pct = 3.0
+
+[exit]
+max_hold_sessions = 4
+safety_days = 3
+
+[liquidity]
+min_volume = 50
+min_open_interest = 20
+min_premium = 5.0
+
+[score]
+source = "model"
+model = "mover_abs_5d"
+threshold = 0.05
+
+[selection]
+weekly_cap = true
+max_per_day = 1

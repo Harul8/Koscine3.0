@@ -1,0 +1,32 @@
+# Index search candidate (IX-6): long straddle, entered at the next open.
+# Scheduled-event dates for the indices (policy, budget) are not held yet, so this takes every signal.
+name = "nifty_long_straddle"
+family = "nifty_long_straddle"
+book = "index"
+instruments = ["NIFTY"]
+structure = "long_straddle"
+decision_time = "evening"
+entry_time = "next_open"
+
+[expiry]
+min_dte = 5
+
+[strikes]
+max_snap_pct = 0.35
+
+[exit]
+max_hold_sessions = 5
+safety_days = 2
+
+[liquidity]
+min_volume = 100
+min_open_interest = 50
+min_premium = 5.0
+
+[score]
+source = "take_all"
+threshold = 0.0
+
+[selection]
+weekly_cap = true
+max_per_day = 1

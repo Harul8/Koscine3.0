@@ -1,0 +1,33 @@
+# Baseline (M-1): buy the at-the-money straddle on every stock in the monthly list, every day.
+# No weekly cap and overlapping trades allowed, so it measures the structure itself on every signal. Its results are stored as outcomes for models to learn from.
+name = "baseline_take_all_straddle"
+family = "stock_long_straddle"
+
+book = "stock"
+structure = "long_straddle"
+decision_time = "evening"
+entry_time = "next_open"
+
+[expiry]
+min_dte = 7
+
+[strikes]
+max_snap_pct = 2.5
+
+[exit]
+max_hold_sessions = 5
+safety_days = 3
+
+[liquidity]
+min_volume = 50
+min_open_interest = 20
+min_premium = 5.0
+
+[score]
+source = "take_all"
+threshold = 0.0
+
+[selection]
+weekly_cap = false
+allow_overlap = true        # one result per decision day; used to measure, never to trade
+save_as_outcome = true

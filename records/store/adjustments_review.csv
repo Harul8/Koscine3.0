@@ -1,0 +1,102 @@
+instrument,ex_date,factor,kind,source,observed_gap,declared_ratio,applied,note
+360ONE,2023-03-02,0.25,split_or_bonus,owner,,,True,added by owner: IIFL Wealth: face value split Rs 2 to Re 1 and 1:1 bonus on the same day. The exchange file has no row under the old symbol; the opening gap was 0.276.
+63MOONS,2022-05-02,0.6204717775905644,unexplained_gap,price,0.6204717775905644,,False,move across a 104-day break in the data; not applied
+63MOONS,2024-03-18,0.6629052631578948,unexplained_gap,price,0.6629052631578948,,False,move across a 97-day break in the data; not applied
+AARTIIND,2022-10-19,0.8727345952476843,demerger_declared,declared:exchange+price,0.8727345952476843,,True,exchange: DEMERGER; factor taken from the opening gap
+ABB,2019-12-20,0.8970189701897019,demerger_declared,declared:exchange+price,0.8970189701897019,,True,exchange: DEMERGER; factor taken from the opening gap
+ABFRL,2025-05-22,0.3643799962818368,demerger_declared,declared:exchange+price,0.3643799962818368,,True,exchange: DEMERGER; factor taken from the opening gap
+ABGSHIP,2018-01-02,0.14963503649635035,unexplained_gap,price,0.14963503649635035,,False,move across a 1-day break in the data; not applied
+ABGSHIP,2018-01-03,6.658536585365854,unexplained_gap,price,6.658536585365854,,False,move across a 1-day break in the data; not applied
+ABIRLANUVO,2016-01-20,0.481227760160732,demerger_declared,declared:exchange+price,0.481227760160732,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+ABREL,2019-10-11,0.44207662661527997,demerger_declared,declared:exchange+price,0.44207662661527997,,True,exchange: DEMERGER; factor taken from the opening gap
+ADANIENT,2015-06-03,0.17229199372056514,demerger_declared,declared:exchange+price,0.8999999999999999,,True,"exchange: SCHEME OF ARRANGEMENT; factor taken from the close, because the price was found after the open"
+ADANIENT,2018-04-05,0.8781776163750413,demerger_declared,declared:exchange+price,0.8781776163750413,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+ADANIENT,2018-09-06,0.711068973690448,demerger_declared,declared:exchange+price,0.711068973690448,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+ARVIND,2018-11-28,0.3518726892782511,demerger_declared,declared:exchange+price,0.3518726892782511,,True,exchange: DEMERGER; factor taken from the opening gap
+BAJAJHIND,2011-09-21,0.8817891373801916,rights_declared,declared:exchange+price,0.8817891373801916,,True,exchange: RIGHTS 2:1 @ PREM RS.35/-; factor taken from the opening gap
+BEML,2022-09-08,0.7961064738029854,demerger_declared,declared:exchange+price,0.7961064738029854,,True,exchange: DEMERGER; factor taken from the opening gap
+BFUTILITIE,2010-03-11,0.8473943303344084,demerger_declared,declared:exchange+price,0.8473943303344084,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+BHARTIARTL,2019-04-23,0.9301659988551804,rights_declared,declared:exchange+price,0.9301659988551804,,True,exchange: RIGHTS 19:67@PRM RS 215; factor taken from the opening gap
+BSOFT,2019-01-24,0.6231248557581353,demerger_declared,declared:exchange+price,0.6231248557581353,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+CANFINHOME,2015-01-23,0.9173256649892164,rights_declared,declared:exchange+price,0.9173256649892164,,True,exchange: RIGHTS 3:10@PREM RS 440; factor taken from the opening gap
+CCAVENUE,2025-06-26,0.9099056603773584,rights_declared,declared:exchange+price,0.9099056603773584,,True,exchange: RIGHTS 67:267@PRM RS 9/-; factor taken from the opening gap
+CENTRALBK,2011-03-17,0.8644859813084113,rights_declared,declared:exchange+price,0.8644859813084113,,True,exchange: RIGHTS-3:5@PRIUM RS.93; factor taken from the opening gap
+CESC,2018-10-30,0.7789351851851852,demerger_declared,declared:exchange+price,0.7789351851851852,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+CGPOWER,2016-03-15,0.283322601416613,demerger_declared,declared:exchange+price,0.34127495170637473,,True,"exchange: SCHEME OF ARRANGEMENT; factor taken from the close, because the price was found after the open"
+CUB,2018-07-10,0.9090909090909091,declared_unconfirmed,declared:exchange,0.9783422459893047,1.1,False,"declared, but no matching price gap near the date"
+DHANBANK,2024-12-27,0.7462112644198146,rights_declared,declared:exchange+price,0.7462112644198146,,True,exchange: RIGHTS 14:25@PRM RS 11/-; factor taken from the opening gap
+EDUCOMP,2018-01-02,0.4615384615384616,unexplained_gap,price,0.4615384615384616,,False,move across a 1-day break in the data; not applied
+EDUCOMP,2018-01-03,2.30188679245283,unexplained_gap,price,2.30188679245283,,False,move across a 1-day break in the data; not applied
+EMBDL,2011-12-07,0.8743038981702467,demerger_declared,declared:exchange+price,0.8743038981702467,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+EMBDL,2026-05-06,0.7148742092099456,unexplained_gap,price,0.7148742092099456,,False,move across a 142-day break in the data; not applied
+FEL,2013-04-17,0.9,demerger_declared,declared:exchange+price,0.9,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+FEL,2013-06-21,0.6707482993197279,demerger_declared,declared:exchange+price,0.9,,True,"exchange: SCHEME OF ARRANGEMENT; factor taken from the close, because the price was found after the open"
+FEL,2016-05-11,0.13240648791790796,demerger_declared,declared:exchange+price,0.13240648791790796,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+GFLLIMITED,2019-08-22,0.06885394789124141,demerger_declared,declared:exchange+price,0.06885394789124141,,True,exchange: DEMERGER; move across a 17-day break in the data
+GFLLIMITED,2021-04-13,0.647438855560683,demerger_declared,declared:exchange+price,0.647438855560683,,True,exchange: DEMERGER; move across a 19-day break in the data
+GMRAIRPORT,2022-01-11,0.9029927760577915,demerger_declared,declared:exchange+price,0.9029927760577915,,True,exchange: DEMERGER; factor taken from the opening gap
+GODREJIND,2015-01-05,0.9992006394884093,declared_unconfirmed,declared:vendor,0.9981390627643376,1.0008,False,"declared, but no matching price gap near the date"
+GRASIM,2010-05-26,0.8529538594221647,demerger_declared,declared:exchange+price,0.8529538594221647,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+GRASIM,2017-07-19,0.8182061477290106,demerger_declared,declared:exchange+price,0.8182061477290106,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+GVKPIL,2022-08-12,0.4,unexplained_gap,price,0.4,,False,move across a 375-day break in the data; not applied
+GVKPIL,2022-08-12,6.0,unexplained_gap,price,6.0,,False,previous close below the minimum price
+GVPIL,2024-10-08,0.7040637760062222,unexplained_gap,price,0.7040637760062222,,False,move across a 85-day break in the data; not applied
+GVT&D,2011-12-14,0.7616632860040567,demerger_declared,declared:exchange+price,0.9077079107505072,,True,"exchange: SCHEME OF ARRANGEMENT; factor taken from the close, because the price was found after the open"
+GVT&D,2023-08-16,1.5037559754154337,unexplained_gap,price,1.5037559754154337,,False,move across a 86-day break in the data; not applied
+GVT&D,2024-11-05,4.001129560600926,unexplained_gap,price,4.001129560600926,,False,move across a 403-day break in the data; not applied
+HINDZINC,2016-04-06,0.8728246318607764,special_dividend_declared,declared:exchange+price,0.8728246318607764,,True,exchange: SPL DIV-RS 24 PER SHARE; factor taken from the opening gap
+IDEA,2019-03-29,0.6189655172413793,rights_declared,declared:exchange+price,0.6189655172413793,,True,exchange: RIGHTS 87:38@PRM RS 2.50; factor taken from the opening gap
+IDFC,2015-10-01,0.4902516838000709,demerger_declared,declared:exchange+price,0.4902516838000709,,True,exchange: DEMERGER; factor taken from the opening gap
+IGL,2025-02-03,0.5,split_or_bonus,declared:exchange,0.4908011119535002,2.0,True,declared for 2025-01-31; seen across a 3-day break in the data
+IIFL,2019-05-30,0.5029344831716374,demerger_declared,declared:exchange+price,0.5029344831716374,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+INDHOTEL,2017-10-04,0.9433962264150942,rights_declared,declared:exchange+price,0.9433962264150942,,True,exchange: RIGHTS 1:5 @ PRM RS 74/-; factor taken from the opening gap
+INOXWIND,2024-05-17,0.25,declared_unconfirmed,declared:exchange,0.9967759764185704,4.0,False,"declared, but no matching price gap near the date"
+INTELLECT,2017-07-17,0.9104134762633997,rights_declared,declared:exchange+price,0.9104134762633997,,True,exchange: RIGHTS 5:22 @ PRM RS 81/-; factor taken from the opening gap
+ITC,2025-01-06,0.9460132890365448,demerger_declared,declared:exchange+price,0.9460132890365448,,True,exchange: DEMERGER; factor taken from the opening gap
+JINDALSAW,2011-11-22,0.9452054794520548,demerger_declared,declared:exchange+price,0.9452054794520548,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+JINDALSAW,2016-08-25,0.9305019305019306,demerger_declared,declared:exchange+price,0.9305019305019306,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+JISLJALEQS,2011-11-08,0.9523809523809523,declared_unconfirmed,declared:vendor,0.9891989198919893,1.05,False,"declared, but no matching price gap near the date"
+JSL,2015-11-19,0.37267080745341613,demerger_declared,declared:exchange+price,0.37267080745341613,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+KTKBANK,2011-02-25,0.9482758620689655,rights_declared,declared:exchange+price,0.9482758620689655,,True,exchange: RIGHTS 2:5@ PREM RS 75; factor taken from the opening gap
+KTKBANK,2016-10-24,0.8102027883396704,rights_declared,declared:exchange+price,0.8102027883396704,,True,exchange: RIGHTS 1:2 @ PREM RS 60/-; factor taken from the opening gap
+LTF,2021-01-21,0.9340394800192586,rights_declared,declared:exchange+price,0.9340394800192586,,True,exchange: RIGHTS 17:74@PRM RS 55/-; factor taken from the opening gap
+M&MFIN,2020-07-22,0.5923650724001756,rights_declared,declared:exchange+price,0.5923650724001756,,True,exchange: RIGHTS 1:1 @ PRM RS 48/-; factor taken from the opening gap
+MFSL,2016-01-27,0.7039864291772688,demerger_declared,declared:exchange+price,0.7039864291772688,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+MOTHERSON,2022-01-14,0.8302810902896081,demerger_declared,declared:exchange+price,0.8302810902896081,,True,exchange: DEMERGER; factor taken from the opening gap
+NAGAROIL,2019-10-22,0.7499999999999999,unexplained_gap,price,0.7499999999999999,,False,previous close below the minimum price
+NAUKRI,2010-09-27,0.5,split_or_bonus,declared:exchange,0.5897840968931016,2.0,True,opening gap differs from the declared ratio by 18%
+NCC,2014-09-18,0.6289308176100629,rights_declared,declared:exchange+price,0.6289308176100629,,True,exchange: RIGHTS 7:6@PREMIUM RS 18; factor taken from the opening gap
+NMDC,2022-10-27,0.7055449330783938,demerger_declared,declared:exchange+price,0.7055449330783938,,True,exchange: DEMERGER; factor taken from the opening gap
+PEL,2022-08-30,0.5476511808980016,demerger_declared,declared:exchange+price,0.5476511808980016,,True,exchange: DEMERGER; factor taken from the opening gap
+POLARIS,2014-10-09,0.8064516129032258,demerger_declared,declared:exchange+price,0.8064516129032258,,True,exchange: SCH OF ARRANGMNT/DEMERGER; factor taken from the opening gap
+RAYMOND,2024-07-11,0.6039098887867939,demerger_declared,declared:exchange+price,0.6039098887867939,,True,exchange: DEMERGER; factor taken from the opening gap
+RAYMOND,2025-05-14,0.3356133733938503,demerger_declared,declared:exchange+price,0.3356133733938503,,True,exchange: DEMERGER; factor taken from the opening gap
+RELCAPITAL,2017-09-05,0.8402540302882268,demerger_declared,declared:exchange+price,0.8402540302882268,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+RELIANCE,2023-07-20,0.9078593169942115,demerger_declared,declared:exchange+price,0.9078593169942115,,True,exchange: DEMERGER; factor taken from the opening gap
+RNAVAL,2023-03-17,275.02750275027506,declared_unconfirmed,declared:vendor,1.025,0.003636,False,"declared, but no matching price gap near the date"
+RNAVAL,2023-07-14,275.02750275027506,declared_unconfirmed,declared:vendor,0.9814814814814814,0.003636,False,"declared, but no matching price gap near the date"
+SAIL,2015-05-13,0.2,declared_unconfirmed,declared:silver,0.997761801016703,5.0,False,"declared, but no matching price gap near the date"
+SAMMAANCAP,2024-02-01,0.8808988764044944,rights_declared,declared:exchange+price,0.8808988764044944,,True,exchange: RIGHTS 1:2 @PRM RS 148; factor taken from the opening gap
+SCI,2023-03-31,0.7757977621218399,demerger_declared,declared:exchange+price,0.7757977621218399,,True,exchange: DEMERGER; factor taken from the opening gap
+SIEMENS,2025-04-07,0.4971439586863225,demerger_declared,declared:exchange+price,0.4971439586863225,,True,exchange: DEMERGER; factor taken from the opening gap
+SINTEX,2017-05-25,0.17195004803073968,demerger_declared,declared:exchange+price,0.17195004803073968,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+SOUTHBANK,2017-02-16,0.8758314855875832,rights_declared,declared:exchange+price,0.8758314855875832,,True,exchange: RIGHTS 1:3 @ PREM RS 13/-; factor taken from the opening gap
+SOUTHBANK,2024-02-27,0.9002695417789757,rights_declared,declared:exchange+price,0.9002695417789757,,True,exchange: RIGHTS 1:4 @ PRM RS 21/-; factor taken from the opening gap
+STAR,2013-12-19,0.39805054969964865,special_dividend_declared,declared:exchange+price,0.39805054969964865,,True,exchange: SPL DIV RS 500 PER SHARE; factor taken from the opening gap
+STAR,2014-10-16,0.8633454636717279,special_dividend_declared,declared:exchange+price,0.8633454636717279,,True,exchange: SPECIAL DIV-RS.105 PR SH; factor taken from the opening gap
+STAR,2024-12-06,0.4377293693815023,demerger_declared,declared:exchange+price,0.4377293693815023,,True,exchange: DEMERGER; factor taken from the opening gap
+STLTECH,2016-06-15,0.804572672836146,demerger_declared,declared:exchange+price,0.804572672836146,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+STLTECH,2025-05-09,0.7076003219500977,demerger_declared,declared:exchange+price,0.7076003219500977,,True,exchange: DEMERGER; move across a 16-day break in the data
+TATACHEM,2020-03-04,0.4348126164676651,demerger_declared,declared:exchange+price,0.4348126164676651,,True,exchange: DEMERGER; factor taken from the opening gap
+TATACOMM,2019-09-17,0.6208997188378631,demerger_declared,declared:exchange+price,0.6208997188378631,,True,exchange: DEMERGER; factor taken from the opening gap
+TATASTEEL,2018-01-31,0.9479925243281562,rights_declared,declared:exchange+price,0.9479925243281562,,True,exchange: RIGHTS 4Fully/2Partly; factor taken from the opening gap
+TITAGARH,2014-06-13,1.6206236323851202,unexplained_gap,price,1.6206236323851202,,False,move across a 36-day break in the data; not applied
+TITAGARH,2014-08-06,0.7263689700130378,unexplained_gap,price,0.7263689700130378,,False,move across a 40-day break in the data; not applied
+TMPV,2025-10-14,0.6053726825576996,demerger_declared,declared:exchange+price,0.6053726825576996,,True,exchange: DEMERGER; factor taken from the opening gap
+TRIVENI,2011-05-03,0.4004014049172102,demerger_declared,declared:exchange+price,0.7014550928248872,,True,"exchange: SCHEME OF ARRANGEMENT; factor taken from the close, because the price was found after the open"
+TRIVENI,2026-07-22,0.6149522799575822,demerger_declared,declared:exchange+price,0.6149522799575822,,True,exchange: DEMERGER; factor taken from the opening gap
+TTML,2013-08-07,0.8823532006921179,declared_unconfirmed,declared:exchange,0.9843749999999999,1.133333,False,"declared, but no matching price gap near the date"
+UNOMINDA,2022-06-09,0.5,declared_unconfirmed,declared:silver,0.9853867036331081,2.0,False,"declared, but no matching price gap near the date"
+VEDL,2026-04-30,0.37422440537745605,demerger_declared,declared:exchange+price,0.37422440537745605,,True,exchange: DEMERGER; factor taken from the opening gap
+WIPRO,2013-04-09,0.9068627450980392,demerger_declared,declared:exchange+price,0.9068627450980392,,True,exchange: SCHEME OF ARRANGEMENT; factor taken from the opening gap
+WOCKPHARMA,2022-03-08,0.919911829537105,rights_declared,declared:exchange+price,0.919911829537105,,True,exchange: RIGHTS3:10@PRM RS 220; factor taken from the opening gap

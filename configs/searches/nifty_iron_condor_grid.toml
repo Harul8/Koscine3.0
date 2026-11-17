@@ -1,0 +1,10 @@
+# Index strategy search (IX-1 to IX-4). Written before running. 3 x 2 x 2 x 2 = 24 cells.
+base = "nifty_iron_condor_1515"
+select_until = "2020-12-31"
+min_trades = 40
+
+[grid]
+"strikes.short_otm_pct" = [1.5, 2.0, 3.0]
+"strikes.wing_pct" = [1.0, 2.0]
+"expiry.min_dte" = [7, 14]
+"exit.max_hold_sessions" = [3, 5]

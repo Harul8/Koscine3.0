@@ -1,0 +1,132 @@
+check,severity,instrument,date,detail
+ohlc_out_of_order,review,INDIAVIX,2013-08-22,high/low do not bracket open/close
+missing_sessions,review,63MOONS,2020-04-23,"297 session(s) without a row, first 2020-04-23, last 2024-03-15"
+missing_sessions,review,ABAN,2026-03-12,"50 session(s) without a row, first 2026-03-12, last 2026-08-10"
+missing_sessions,review,ADANIENSOL,2018-10-04,"185 session(s) without a row, first 2018-10-04, last 2022-02-11"
+missing_sessions,review,ALOKTEXT,2018-01-02,"1 session(s) without a row, first 2018-01-02, last 2018-01-02"
+missing_sessions,review,AMTEKAUTO,2018-01-02,"111 session(s) without a row, first 2018-01-02, last 2019-03-29"
+missing_sessions,review,APLAPOLLO,2012-01-17,"2 session(s) without a row, first 2012-01-17, last 2012-09-11"
+missing_sessions,review,BRFL,2019-11-26,"114 session(s) without a row, first 2019-11-26, last 2022-12-09"
+missing_sessions,review,CAPF,2010-08-20,"73 session(s) without a row, first 2010-08-20, last 2010-12-02"
+missing_sessions,review,COREEDUTEC,2015-11-27,"107 session(s) without a row, first 2015-11-27, last 2016-06-10"
+missing_sessions,review,DEEPAKNTR,2010-10-20,"92 session(s) without a row, first 2010-10-20, last 2014-02-06"
+missing_sessions,review,EDUCOMP,2022-09-15,"538 session(s) without a row, first 2022-09-15, last 2026-08-28"
+missing_sessions,review,EMBDL,2025-12-16,"92 session(s) without a row, first 2025-12-16, last 2026-05-05"
+missing_sessions,review,FEL,2016-05-13,"69 session(s) without a row, first 2016-05-13, last 2022-11-21"
+missing_sessions,review,FORCEMOT,2023-10-26,"75 session(s) without a row, first 2023-10-26, last 2024-02-13"
+missing_sessions,review,GFLLIMITED,2019-08-06,"47 session(s) without a row, first 2019-08-06, last 2025-11-12"
+missing_sessions,review,GITANJALI,2018-09-10,"110 session(s) without a row, first 2018-09-10, last 2019-03-29"
+missing_sessions,review,GODFRYPHLP,2011-05-24,"1 session(s) without a row, first 2011-05-24, last 2011-05-24"
+missing_sessions,review,GTL,2020-06-19,"49 session(s) without a row, first 2020-06-19, last 2020-09-11"
+missing_sessions,review,GUJENERGY,2026-07-02,"10 session(s) without a row, first 2026-07-02, last 2026-07-15"
+missing_sessions,review,GVKPIL,2018-01-02,"364 session(s) without a row, first 2018-01-02, last 2022-08-11"
+missing_sessions,review,GVPIL,2024-07-16,"111 session(s) without a row, first 2024-07-16, last 2026-05-18"
+missing_sessions,review,GVT&D,2023-05-23,"329 session(s) without a row, first 2023-05-23, last 2024-11-04"
+missing_sessions,review,HDIL,2022-05-24,"331 session(s) without a row, first 2022-05-24, last 2026-03-27"
+missing_sessions,review,HLVLTD,2021-10-12,"149 session(s) without a row, first 2021-10-12, last 2024-07-15"
+missing_sessions,review,ICIL,2010-01-29,"84 session(s) without a row, first 2010-01-29, last 2013-07-08"
+missing_sessions,review,ICSA,2018-12-26,"161 session(s) without a row, first 2018-12-26, last 2020-03-06"
+missing_sessions,review,JPASSOCIAT,2024-08-08,"227 session(s) without a row, first 2024-08-08, last 2026-01-30"
+missing_sessions,review,JSWHL,2024-11-22,"141 session(s) without a row, first 2024-11-22, last 2025-08-01"
+missing_sessions,review,KFA,2014-12-01,"111 session(s) without a row, first 2014-12-01, last 2015-06-19"
+missing_sessions,review,OPTOCIRCUI,2018-01-02,"105 session(s) without a row, first 2018-01-02, last 2022-05-20"
+missing_sessions,review,ORBITCORP,2017-07-19,"114 session(s) without a row, first 2017-07-19, last 2018-02-02"
+missing_sessions,review,PGEL,2012-04-24,"2 session(s) without a row, first 2012-04-24, last 2013-05-17"
+missing_sessions,review,PIIND,2011-07-01,"2 session(s) without a row, first 2011-07-01, last 2012-08-07"
+missing_sessions,review,POONAWALLA,2021-06-09,"40 session(s) without a row, first 2021-06-09, last 2021-08-04"
+missing_sessions,review,RCOM,2022-08-29,"294 session(s) without a row, first 2022-08-29, last 2025-07-31"
+missing_sessions,review,RELCAPITAL,2022-09-09,"193 session(s) without a row, first 2022-09-09, last 2024-02-23"
+missing_sessions,review,RELINFRA,2025-12-22,"79 session(s) without a row, first 2025-12-22, last 2026-07-31"
+missing_sessions,review,RNAVAL,2014-06-13,"38 session(s) without a row, first 2014-06-13, last 2022-10-28"
+missing_sessions,review,ROLTA,2023-04-13,"304 session(s) without a row, first 2023-04-13, last 2025-06-27"
+missing_sessions,review,SINTEX,2022-03-22,"180 session(s) without a row, first 2022-03-22, last 2022-12-09"
+missing_sessions,review,SOLARINDS,2011-05-11,"1 session(s) without a row, first 2011-05-11, last 2011-05-11"
+missing_sessions,review,SREINFRA,2022-09-12,"103 session(s) without a row, first 2022-09-12, last 2023-05-31"
+missing_sessions,review,STERLINBIO,2018-04-18,"110 session(s) without a row, first 2018-04-18, last 2018-11-02"
+missing_sessions,review,STLTECH,2025-04-24,"10 session(s) without a row, first 2025-04-24, last 2025-05-08"
+missing_sessions,review,TATASTLBSL,2019-01-08,"58 session(s) without a row, first 2019-01-08, last 2019-04-01"
+missing_sessions,review,TITAGARH,2014-05-09,"108 session(s) without a row, first 2014-05-09, last 2022-12-05"
+missing_sessions,review,TTML,2018-01-02,"1 session(s) without a row, first 2018-01-02, last 2018-01-02"
+missing_sessions,review,TULIP,2014-09-09,"107 session(s) without a row, first 2014-09-09, last 2015-03-27"
+missing_sessions,review,UNOMINDA,2011-07-14,"75 session(s) without a row, first 2011-07-14, last 2014-02-28"
+large_move,review,63MOONS,2013-08-01,adjusted change of -64.5% in one session
+large_move,review,63MOONS,2013-08-05,adjusted change of +34.3% in one session
+large_move,review,63MOONS,2022-05-02,adjusted change of -41.0% across a 104-day break in the data
+large_move,review,63MOONS,2024-03-18,adjusted change of -31.9% across a 97-day break in the data
+large_move,review,ABGSHIP,2018-01-02,adjusted change of -85.0% in one session
+large_move,review,ABGSHIP,2018-01-03,adjusted change of +568.3% in one session
+large_move,review,AMTEKAUTO,2015-08-19,adjusted change of -30.6% in one session
+large_move,review,AMTEKAUTO,2015-09-03,adjusted change of -35.0% in one session
+large_move,review,AMTEKAUTO,2015-09-11,adjusted change of +53.9% in one session
+large_move,review,BANDHANBNK,2020-03-26,adjusted change of +39.3% in one session
+large_move,review,BANKBARODA,2017-10-25,adjusted change of +31.4% in one session
+large_move,review,BANKINDIA,2017-10-25,adjusted change of +34.1% in one session
+large_move,review,CANBK,2017-10-25,adjusted change of +38.7% in one session
+large_move,review,CCAVENUE,2018-09-28,adjusted change of -70.8% in one session
+large_move,review,COREEDUTEC,2013-02-25,adjusted change of -62.4% in one session
+large_move,review,COREEDUTEC,2013-02-27,adjusted change of -45.8% in one session
+large_move,review,DHFL,2018-09-21,adjusted change of -42.6% in one session
+large_move,review,DHFL,2019-08-06,adjusted change of +31.9% in one session
+large_move,review,DISHTV,2019-01-25,adjusted change of -33.2% in one session
+large_move,review,EDUCOMP,2018-01-02,adjusted change of -54.7% in one session
+large_move,review,EDUCOMP,2018-01-03,adjusted change of +141.5% in one session
+large_move,review,EMBDL,2015-06-22,adjusted change of +30.1% in one session
+large_move,review,EMBDL,2017-04-17,adjusted change of +40.0% in one session
+large_move,review,FEL,2016-05-25,adjusted change of +52.9% across a 13-day break in the data
+large_move,review,FORCEMOT,2024-02-14,adjusted change of +31.9% across a 112-day break in the data
+large_move,review,GTL,2011-06-20,adjusted change of -62.2% in one session
+large_move,review,GTL,2011-09-09,adjusted change of +32.9% in one session
+large_move,review,GTLINFRA,2011-06-20,adjusted change of -42.7% in one session
+large_move,review,GVKPIL,2022-08-12,adjusted change of +128.0% across a 375-day break in the data
+large_move,review,GVT&D,2023-08-16,adjusted change of +57.9% across a 86-day break in the data
+large_move,review,GVT&D,2024-11-05,adjusted change of +293.8% across a 403-day break in the data
+large_move,review,IDEA,2019-11-19,adjusted change of +36.0% in one session
+large_move,review,IDEA,2020-02-19,adjusted change of +40.0% in one session
+large_move,review,IDEA,2020-03-13,adjusted change of +33.3% in one session
+large_move,review,IDEA,2020-03-18,adjusted change of -35.1% in one session
+large_move,review,IGL,2012-04-10,adjusted change of -33.9% in one session
+large_move,review,INDUSINDBK,2020-03-26,adjusted change of +44.7% in one session
+large_move,review,JETAIRWAYS,2019-04-18,adjusted change of -31.5% in one session
+large_move,review,JETAIRWAYS,2019-06-18,adjusted change of -40.8% in one session
+large_move,review,JETAIRWAYS,2019-06-20,adjusted change of +89.9% in one session
+large_move,review,KSOILS,2011-08-16,adjusted change of -31.3% in one session
+large_move,review,NAGAROIL,2012-04-03,adjusted change of +36.9% in one session
+large_move,review,OPTOCIRCUI,2013-05-31,adjusted change of -37.7% in one session
+large_move,review,OPTOCIRCUI,2013-07-15,adjusted change of +34.4% in one session
+large_move,review,PCJEWELLER,2018-05-04,adjusted change of +43.8% in one session
+large_move,review,PCJEWELLER,2018-05-07,adjusted change of +37.6% in one session
+large_move,review,PNB,2017-10-25,adjusted change of +46.2% in one session
+large_move,review,RANBAXY,2013-09-16,adjusted change of -30.3% in one session
+large_move,review,RCOM,2017-12-20,adjusted change of +35.7% in one session
+large_move,review,RCOM,2017-12-26,adjusted change of +31.9% in one session
+large_move,review,RCOM,2017-12-27,adjusted change of +33.5% in one session
+large_move,review,RCOM,2018-05-17,adjusted change of +56.2% in one session
+large_move,review,RCOM,2019-02-04,adjusted change of -34.9% in one session
+large_move,review,RELINFRA,2019-02-06,adjusted change of -32.1% in one session
+large_move,review,RELINFRA,2019-06-20,adjusted change of +34.9% in one session
+large_move,review,RELMEDIA,2010-10-05,adjusted change of +36.8% in one session
+large_move,review,RNAVAL,2018-01-01,adjusted change of +32.4% in one session
+large_move,review,RNAVAL,2018-05-17,adjusted change of +32.9% in one session
+large_move,review,RPOWER,2019-02-04,adjusted change of -34.8% in one session
+large_move,review,RPOWER,2019-02-05,adjusted change of -30.2% in one session
+large_move,review,SAMMAANCAP,2019-09-30,adjusted change of -34.4% in one session
+large_move,review,SAMMAANCAP,2020-03-19,adjusted change of -33.7% in one session
+large_move,review,SAMMAANCAP,2020-06-19,adjusted change of +31.1% in one session
+large_move,review,SINTEX,2017-05-25,adjusted change of +44.4% in one session
+large_move,review,SUZLON,2013-02-28,adjusted change of -34.0% in one session
+large_move,review,TATAMTRDVR,2019-10-29,adjusted change of +37.6% in one session
+large_move,review,TITAGARH,2014-06-13,adjusted change of +54.0% across a 36-day break in the data
+large_move,review,TMPV,2019-10-29,adjusted change of +35.9% in one session
+large_move,review,UNIONBANK,2017-10-25,adjusted change of +34.2% in one session
+large_move,review,UNITDSPR,2012-11-12,adjusted change of +34.7% in one session
+large_move,review,UNITECH,2015-06-03,adjusted change of -35.7% in one session
+large_move,review,YESBANK,2019-02-14,adjusted change of +30.6% in one session
+large_move,review,YESBANK,2019-10-03,adjusted change of +32.8% in one session
+large_move,review,YESBANK,2020-03-06,adjusted change of -56.1% in one session
+large_move,review,YESBANK,2020-03-09,adjusted change of +31.6% in one session
+large_move,review,YESBANK,2020-03-11,adjusted change of +35.5% in one session
+large_move,review,YESBANK,2020-03-16,adjusted change of +45.2% in one session
+large_move,review,YESBANK,2020-03-17,adjusted change of +58.1% in one session
+large_move,review,ZEEL,2021-09-14,adjusted change of +40.0% in one session
+large_move,review,ZEEL,2021-09-22,adjusted change of +31.7% in one session
+large_move,review,ZEEL,2024-01-23,adjusted change of -32.6% in one session

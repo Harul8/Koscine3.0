@@ -1,0 +1,10 @@
+# The owner's corrections to the adjustment table (requirement D-1).
+#   [[reject]] switches off an event the build applied.
+#   [[add]] supplies an event, replacing whatever the build found on that date.
+
+[[add]]
+instrument = "360ONE"
+ex_date = "2023-03-02"
+factor = 0.25
+kind = "split_or_bonus"
+reason = "IIFL Wealth: face value split Rs 2 to Re 1 and 1:1 bonus on the same day. The exchange file has no row under the old symbol; the opening gap was 0.276."

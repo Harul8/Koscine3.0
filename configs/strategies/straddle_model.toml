@@ -1,0 +1,33 @@
+# The move-against-implied model as a strategy: buy the straddle where the model expects a positive
+# result after costs. Needs: baseline_take_all_straddle run, then models.train --model straddle_edge.
+name = "straddle_model"
+family = "stock_long_straddle"
+
+book = "stock"
+structure = "long_straddle"
+decision_time = "evening"
+entry_time = "next_open"
+
+[expiry]
+min_dte = 7
+
+[strikes]
+max_snap_pct = 2.5
+
+[exit]
+max_hold_sessions = 5
+safety_days = 3
+
+[liquidity]
+min_volume = 50
+min_open_interest = 20
+min_premium = 5.0
+
+[score]
+source = "model"
+model = "straddle_edge"
+threshold = 0.0
+
+[selection]
+weekly_cap = true
+max_per_day = 1
