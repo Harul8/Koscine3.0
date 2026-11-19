@@ -17,7 +17,7 @@ import pandas as pd
 
 from koscine4.settings import Settings
 from koscine4.store.surface import black_price, implied_vol
-from koscine4.strategies.structures import SELL, max_loss_per_share
+from koscine4.strategies.structures import SELL, max_loss_per_share, net_debit
 
 STATE_FILE = Path("risk") / "state.json"
 PROPOSAL_FILE = Path("risk") / "proposal.json"
@@ -45,26 +45,34 @@ def margin_estimate(legs, prices, lot: float, margin_factor: float) -> float:
 
 
 def scenario_margin(legs, prices, lot: float, spot: float, date, cfg, book: str, margin_factor: float) -> tuple[float, dict]:
-    """Estimated margin per lot (R-6), in the manner of the exchange's SPAN method: the worst loss over a grid
-    of price and volatility moves, plus exposure margin on the sold legs' notional value.
+    """Estimated margin per lot (R-6), in the manner of the exchange's SPAN method: what the position would owe
+    at the worst of a grid of price and volatility moves, plus exposure margin on the sold legs' notional value.
 
-    Each leg is revalued with Black's formula at its own implied volatility, worked out from its reference
-    price; the index level stands in for the forward. The price moves come from those volatilities over the
-    margin period, never less than a floor. When a volatility cannot be worked out, the fallback is maximum
-    loss x `margin_factor`. Bought options only: no margin. `cfg` is the [margin] settings section.
+    As in SPAN, the premium received is not netted off: the requirement is the worst-case loss plus what the
+    position owes now (SPAN subtracts the net option value, which is negative for a credit). Each leg is
+    revalued with Black's formula at its own implied volatility, worked out from its reference price; the
+    index level stands in for the forward. The price scan comes from those volatilities, never less than a
+    floor. The [margin] settings were fitted to Zerodha's F&O calculator on 2026-11-18 prices. When a
+    volatility cannot be worked out, the fallback is the most the legs can owe at expiry (a spread's width)
+    x `margin_factor`, plus exposure. Bought options only: no margin. `cfg` is the [margin] section.
     """
     if not any(l.side == SELL for l in legs):
         return 0.0, {"method": "bought options only: no margin"}
-    fallback = margin_estimate(legs, prices, lot, margin_factor)
+    side = np.array([l.side for l in legs], dtype=float)
+    sold = float(-side[side < 0].sum())
+    rate = float(cfg["exposure_pct_index" if book == "index" else "exposure_pct_stock"]) / 100.0
+    exposure = rate * float(spot) * sold if spot and spot > 0 else 0.0
+    owed_at_expiry = max(max_loss_per_share(legs, prices) - net_debit(legs, prices), 0.0)
+    fallback = (owed_at_expiry * margin_factor + exposure) * lot
     date = pd.Timestamp(date)
     t = np.array([max((l.expiry - date).days, 0.5) / 365.0 for l in legs])
     strikes = np.array([l.strike for l in legs], dtype=float)
     calls = np.array([l.opt_type == "CE" for l in legs])
-    side = np.array([l.side for l in legs], dtype=float)
     px = np.array(prices, dtype=float)
     iv = implied_vol(px, np.full(len(legs), float(spot)), strikes, t, calls) if spot and spot > 0 else np.full(len(legs), np.nan)
     if not np.isfinite(iv).all():
-        return fallback, {"method": f"fallback: maximum loss x {margin_factor:g} (a leg's implied volatility could not be worked out)"}
+        return fallback, {"method": f"fallback: the most the legs can owe at expiry x {margin_factor:g}, plus exposure "
+                                    "(a leg's implied volatility could not be worked out)"}
     daily_sd = float(iv.mean()) / math.sqrt(252.0)
     floor = float(cfg["min_price_scan_pct_index" if book == "index" else "min_price_scan_pct_stock"]) / 100.0
     scan = max(float(cfg["price_scan_sigmas"]) * daily_sd * math.sqrt(float(cfg["margin_period_days"])), floor)
@@ -86,11 +94,10 @@ def scenario_margin(legs, prices, lot: float, spot: float, date, cfg, book: str,
         l = cover * loss(sign * extreme * scan, 1.0)
         if l > worst:
             worst, where = l, f"extreme price {sign * extreme * scan * 100:+.1f}% at {cover:g} of its loss"
-    sold = float(-side[side < 0].sum())
-    exposure = float(cfg["exposure_pct_index" if book == "index" else "exposure_pct_stock"]) / 100.0 * spot * sold
-    per_lot = (worst + exposure) * lot
+    span = max(worst - value_now, 0.0)                   # worst loss plus what the position owes now
+    per_lot = (span + exposure) * lot
     return per_lot, {"method": "scenario", "price_scan_pct": round(scan * 100, 2), "worst_scenario": where,
-                     "scenario_loss_per_share": round(worst, 2), "exposure_per_share": round(exposure, 2),
+                     "span_per_share": round(span, 2), "exposure_per_share": round(exposure, 2),
                      "implied_vols": [round(float(v), 4) for v in iv], "fallback_would_be": round(fallback, 0)}
 
 

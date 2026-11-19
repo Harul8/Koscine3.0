@@ -1,4 +1,4 @@
-# Index strategy search (IX-1 to IX-4, IX-7). Written before running. 3 x 3 x 2 x 2 x 2 = 72 cells; a setting is chosen for each expiry kind.
+# Index strategy search (IX-1 to IX-4). Written before running. 3 x 3 x 2 x 2 = 36 cells; the nearest expiry, as in the base strategy.
 base = "banknifty_put_credit_spread_1515"
 select_until = "2020-12-31"      # the setting is chosen on trades entered up to here, then applied unchanged after
 min_trades = 40
@@ -8,4 +8,3 @@ min_trades = 40
 "strikes.wing_pct" = [1.0, 2.0, 3.0]
 "expiry.min_dte" = [7, 14]
 "side" = ["put", "call"]
-"expiry.kind" = ["weekly", "monthly"]

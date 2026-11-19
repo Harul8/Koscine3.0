@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from koscine4.harness.costs import exercise_cost, order_cost, rates_on, with_slippage
+from koscine4.harness.costs import order_cost, rates_on, settlement_cost, with_slippage
 from koscine4.harness.market import MarketData, TrackRecord
 from koscine4.selection.select import BookState, select
 from koscine4.strategies.base import Candidate, PositionState, Strategy, _row
@@ -202,8 +202,9 @@ def price_one(legs, entry_prices, exit_prices, lot: float, entry_date, exit_date
     """Money for one trade at one slippage level. `legs` are (expiry, strike, type, side) tuples.
 
     A trade that reached expiry ("expired") is settled by the exchange at intrinsic value: there is
-    no closing order, so no slippage and no order costs on the way out, but a bought option that
-    finishes in the money pays securities transaction tax on exercise.
+    no closing order, so no slippage and no exchange charge or premium tax on the way out. Each leg
+    still pays the broker's flat brokerage, and a bought option that finishes in the money pays
+    securities transaction tax on exercise.
     """
     sides = [l[3] for l in legs]
     settled = exit_reason == "expired"
@@ -213,7 +214,7 @@ def price_one(legs, entry_prices, exit_prices, lot: float, entry_date, exit_date
     r_in, r_out = rates_on(costs, entry_date), rates_on(costs, exit_date)
     cost = sum(order_cost(e, lot, s == BUY, r_in) for e, s in zip(entry, sides))
     if settled:
-        cost += sum(exercise_cost(x, lot, r_out) for x, s in zip(exit_, sides) if s == BUY and x > 0)
+        cost += sum(settlement_cost(x, lot, s == BUY, r_out) for x, s in zip(exit_, sides))
     else:
         cost += sum(order_cost(x, lot, s != BUY, r_out) for x, s in zip(exit_, sides) if x > 0)
     as_legs = [type("L", (), {"expiry": l[0], "strike": l[1], "opt_type": l[2], "side": l[3]})() for l in legs]

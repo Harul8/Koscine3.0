@@ -127,7 +127,7 @@ def search(name: str, settings: Settings | None = None, start=None, end=None, fi
                                       "start": str(start.date()), "end": str(end.date()), "slippage_pct": slippage,
                                       "spec_fingerprint": spec.fingerprint(), "data_snapshot": snapshot, "spec": spec.to_dict(),
                                       "summary": _block(priced)})
-        row = {"cell": i, **cell, "expiry_kind": str(spec.expiry.get("kind", "any")), "run_id": rid, "all": _block(priced)}
+        row = {"cell": i, **cell, "expiry_kind": str(spec.expiry.get("kind", "nearest")), "run_id": rid, "all": _block(priced)}
         if fills == "daily":
             row["early"] = _block(priced[priced["entry_date"] <= split])
             row["late"] = _block(priced[priced["entry_date"] > split])

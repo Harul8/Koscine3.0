@@ -25,15 +25,15 @@ class Leg:
         return f"{'BUY' if self.side == BUY else 'SELL'} {self.expiry.date()} {self.strike:g} {self.opt_type}"
 
 
-def choose_expiry(chain: pd.DataFrame, date, min_dte: int, max_dte: int | None = None, kind: str = "any") -> pd.Timestamp | None:
+def choose_expiry(chain: pd.DataFrame, date, min_dte: int, max_dte: int | None = None, kind: str = "nearest") -> pd.Timestamp | None:
     """The nearest option expiry at least `min_dte` calendar days after `date` (and at most `max_dte`).
 
-    kind "monthly" keeps expiries that also have a futures contract; "weekly" keeps the others (IX-7).
+    kind "nearest" takes either; "monthly" keeps expiries that also have a futures contract; "weekly" keeps the others (IX-7).
     """
     date = pd.Timestamp(date)
     is_opt = chain["opt_type"].isin(["CE", "PE"])
     exp = pd.DatetimeIndex(sorted(chain.loc[is_opt, "expiry"].unique()))
-    if kind != "any":
+    if kind in ("weekly", "monthly"):
         monthly = set(pd.DatetimeIndex(chain.loc[~is_opt, "expiry"].unique()))
         exp = pd.DatetimeIndex([e for e in exp if (e in monthly) == (kind == "monthly")])
     dte = (exp - date).days
@@ -65,7 +65,7 @@ def build_legs(spec: StrategySpec, chain: pd.DataFrame, spot: float, date, direc
 
     `direction` (+1 up, -1 down) is used only when the spec's side is "model".
     """
-    expiry = choose_expiry(chain, date, int(spec.expiry["min_dte"]), spec.expiry.get("max_dte"), str(spec.expiry.get("kind", "any")))
+    expiry = choose_expiry(chain, date, int(spec.expiry["min_dte"]), spec.expiry.get("max_dte"), str(spec.expiry.get("kind", "nearest")))
     if expiry is None or not spot or spot <= 0:
         return None
     opts = chain[(chain["expiry"] == expiry) & chain["opt_type"].isin(["CE", "PE"])]

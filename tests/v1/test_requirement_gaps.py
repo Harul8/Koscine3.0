@@ -11,7 +11,7 @@ import pytest
 
 import synthetic as S
 from koscine4.harness import search as grid_search
-from koscine4.harness.costs import exercise_cost, order_cost, rates_on, with_slippage
+from koscine4.harness.costs import exercise_cost, order_cost, rates_on, settlement_cost, with_slippage
 from koscine4.harness.engine import price_one, run_engine
 from koscine4.harness.market import MarketData, TrackRecord
 from koscine4.harness.stats import summarise
@@ -139,7 +139,8 @@ def test_an_index_strategy_must_say_which_expiries_it_trades():
     with pytest.raises(SpecError, match="expiry.kind"):
         from_dict(spec_dict(expiry={"min_dte": 7, "kind": "quarterly"}))
     stock = from_dict(spec_dict(book="stock", instruments=[], structure="long_straddle", expiry={"min_dte": 7}, strikes={"max_snap_pct": 1.0}))
-    assert stock.expiry.get("kind", "any") == "any"
+    assert stock.expiry.get("kind", "nearest") == "nearest"
+    assert from_dict(spec_dict(expiry={"min_dte": 7, "kind": "nearest"})).expiry["kind"] == "nearest"
 
 
 def test_reports_split_results_by_expiry_kind():
@@ -226,8 +227,10 @@ def test_an_option_held_to_expiry_pays_exercise_tax_instead_of_closing_costs(big
     buy_in, sell_in = with_slippage(8.0, True, 1.0), with_slippage(3.0, False, 1.0)
     entry_costs = order_cost(buy_in, 50.0, True, r) + order_cost(sell_in, 50.0, False, r)
     tax = 12.0 * 50.0 * r["stt_exercise_pct"] / 100.0                       # only the bought leg in the money is taxed
-    assert got["cost"] == pytest.approx(entry_costs + tax)
-    assert got["pnl"] == pytest.approx((12.0 - buy_in - (2.0 - sell_in)) * 50.0 - entry_costs - tax)   # no exit slippage
+    brokerage = 2 * r["brokerage_per_order"] * (1 + r["gst_pct"] / 100.0)    # every settled leg pays the broker's flat fee
+    assert got["cost"] == pytest.approx(entry_costs + tax + brokerage)
+    assert got["pnl"] == pytest.approx((12.0 - buy_in - (2.0 - sell_in)) * 50.0 - entry_costs - tax - brokerage)   # no exit slippage
+    assert settlement_cost(0.0, 50.0, False, r) == pytest.approx(r["brokerage_per_order"] * (1 + r["gst_pct"] / 100.0))
     assert exercise_cost(-3.0, 50.0, r) == 0.0
     with pytest.raises(KeyError, match="stt_exercise_pct"):
         exercise_cost(1.0, 1.0, {})
@@ -248,11 +251,12 @@ def test_scenario_margin_for_a_credit_spread_is_bounded_and_bought_options_need_
     exposure = float(cfg["exposure_pct_index"]) / 100.0 * spot * 75.0
     assert 0 < per_lot - exposure <= width                                          # a spread never loses more than its width
     assert inputs["price_scan_pct"] >= float(cfg["min_price_scan_pct_index"])
-    assert per_lot == pytest.approx(inputs["scenario_loss_per_share"] * 75.0 + exposure, rel=1e-3)
+    assert per_lot == pytest.approx(inputs["span_per_share"] * 75.0 + exposure, rel=1e-3)
+    assert per_lot - exposure > (k_short - k_long - prices[0] + prices[1]) * 75.0       # the credit is not netted off, as in SPAN
     bought = risk_rules.scenario_margin([Leg(e, k_short, "PE", BUY)], prices[:1], 75.0, spot, date, cfg, "index", 1.25)
     assert bought[0] == 0.0
     impossible, inputs = risk_rules.scenario_margin(legs, [0.0, 0.0], 75.0, spot, date, cfg, "index", 1.25)
-    assert inputs["method"].startswith("fallback") and impossible == pytest.approx(risk_rules.margin_estimate(legs, [0.0, 0.0], 75.0, 1.25))
+    assert inputs["method"].startswith("fallback") and impossible == pytest.approx(width * 1.25 + exposure)   # width x factor, plus exposure
 
 
 def test_sizing_uses_the_scenario_margin_when_given():

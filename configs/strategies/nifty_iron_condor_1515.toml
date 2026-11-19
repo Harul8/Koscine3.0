@@ -8,7 +8,7 @@ decision_time = "1430"
 entry_time = "1515"
 
 [expiry]
-kind = "monthly"                # IX-7: weekly and monthly expiries are tested as different instruments
+kind = "nearest"                # the nearest expiry, weekly or monthly; reports split results by kind (IX-7)
 min_dte = 7
 
 [strikes]

@@ -68,11 +68,12 @@ python -m koscine4.models.direction --group NIFTY --horizon 1      # also BANKNI
   from the 5-minute option chain, over the months those files cover; nothing is chosen there.
   `--compare` puts the two side by side on the same months (IX-5) and writes
   `records/results/search_<grid>_compare.md`. It runs no backtest.
-- Every index strategy states `expiry.kind = "weekly"` or `"monthly"`, and the grids try both.
-  A setting is chosen for each kind on its own, and every run report has a "By expiry kind"
-  table (IX-7). The six index strategy files were set to `"monthly"`, which is a change from
-  before: they previously took the nearest expiry, usually a weekly one. Bank Nifty weeklies
-  stopped in November 2024.
+- Every index strategy states `expiry.kind`: `"nearest"`, `"weekly"` or `"monthly"`. The six
+  index strategies take the nearest expiry (owner's decision, 2026-11-19), so Nifty trades are
+  mostly weeklies and Bank Nifty trades are weeklies until November 2024, when its weeklies
+  stopped, and monthlies after. Every run report has a "By expiry kind" table, so the two are
+  never pooled silently (IX-7). A grid can still try `"expiry.kind" = ["weekly", "monthly"]`;
+  a setting is then chosen for each kind on its own.
 - An iron condor or long strangle may have a `[tilt]` section (DR-7): a direction model and
   the strike settings for an "up" and a "down" variant. The trade is decided without the
   forecast; a confident forecast only moves the strikes. The daily run uses the forecast only
@@ -106,10 +107,18 @@ setting and a gate 3 record for the strategy.
   gate 2 pass, then its closed ledger trades). Candidates from all strategies are ranked by it;
   one with fewer than `[expected_result].min_trades` known trades has none yet and ranks last.
   The harness ranks the same way, so backtests and the daily list agree.
-- **Margin (R-6).** The margin shown and used for sizing is a scenario estimate: the worst loss
-  over price and volatility moves worked out from the legs' own implied volatility, plus
-  exposure margin. The `[margin]` numbers are not the exchange's; check a few trades against a
-  broker's margin calculator and adjust them. Maximum loss x `margin_factor` is the fallback.
+- **Margin (R-6).** The margin shown and used for sizing is a scenario estimate in the manner
+  of SPAN: what the position would owe at the worst of a set of price and volatility moves
+  (the premium received is not netted off), plus exposure margin on each sold leg. The
+  `[margin]` numbers were fitted on 2026-11-19 to Zerodha's F&O calculator: about an 8.75% price
+  scan for the indices and 13.5% for RELIANCE, exposure 1.9% (index) and 3.5% (stock). Five
+  spreads came out 1% to 7% above Zerodha's total. The old maximum loss x 1.25 was 43% to 82%
+  below it. Exposure margin is about as large as SPAN on a spread, and an iron condor pays it
+  on both sold legs. Refit if the exchange changes its method. The fallback, when a leg's
+  volatility cannot be worked out, is the spread's width x `margin_factor` plus exposure.
+- **Costs at expiry.** A trade held to expiry pays no exchange charge or premium tax on the way
+  out, but each leg pays the broker's flat brokerage (Zerodha charges it on expired, exercised
+  and assigned contracts), and a bought option in the money pays 0.15% of its intrinsic value.
 - **Fills (O-6, O-7).** The web app's **Trade List** tab shows the saved lists, the open and
   closed trades, and a form to record each leg's entry and exit fill, mark a recommendation not
   taken, and close a trade from its fills. The same actions are web routes under `/v1`

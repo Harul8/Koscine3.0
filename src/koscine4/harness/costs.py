@@ -48,11 +48,19 @@ def order_cost(price: float, quantity: float, is_buy: bool, rates: Mapping) -> f
 
 
 def exercise_cost(intrinsic: float, quantity: float, rates: Mapping) -> float:
-    """Tax in rupees on a bought option exercised at expiry: securities transaction tax on its intrinsic
-    value. There is no order, so no brokerage, exchange charge or stamp duty."""
+    """Tax in rupees on a bought option exercised at expiry: securities transaction tax on its intrinsic value."""
     if "stt_exercise_pct" not in rates:
         raise KeyError("Cost setting 'stt_exercise_pct' is missing; it is needed for a trade held to expiry.")
     return max(intrinsic, 0.0) * quantity * float(rates["stt_exercise_pct"]) / 100.0
+
+
+def settlement_cost(intrinsic: float, quantity: float, is_buy: bool, rates: Mapping) -> float:
+    """Cost in rupees of one leg settled by the exchange at expiry. There is no order, so no exchange charge,
+    stamp duty or tax on the premium, but the broker charges its flat brokerage (plus GST) on expired,
+    exercised and assigned contracts (Zerodha's charges page, 2026-11-19), and a bought option that finishes
+    in the money pays the exercise tax on its intrinsic value."""
+    brokerage = float(rates["brokerage_per_order"]) * (1.0 + float(rates["gst_pct"]) / 100.0)
+    return brokerage + (exercise_cost(intrinsic, quantity, rates) if is_buy else 0.0)
 
 
 def with_slippage(price: float, is_buy: bool, slippage_pct: float) -> float:

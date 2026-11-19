@@ -20,7 +20,7 @@ DIRECTIONAL = ("debit_spread",)                   # a structure that only pays i
 BOOKS = ("index", "stock")
 DECISION_TO_ENTRY = {"evening": "next_open", "1430": "1515"}     # the two supported timings (decision A5)
 INDEX_BOOK = ("NIFTY", "BANKNIFTY")
-EXPIRY_KINDS = ("weekly", "monthly", "any")      # IX-7: "any" only for the stock book, whose options are all monthly
+EXPIRY_KINDS = ("nearest", "weekly", "monthly")  # IX-7: "nearest" takes either kind; reports still split results by kind
 # DR-7: the neutral structures direction may tilt, and the strike settings a tilt may change
 TILT_STRIKE_KEYS = {
     "iron_condor": {"put_short_otm_pct", "call_short_otm_pct", "put_wing_pct", "call_wing_pct"},
@@ -98,11 +98,11 @@ def validate(spec: StrategySpec) -> StrategySpec:
         raise SpecError("Score must state its source and a threshold fixed before testing (S-5, S-6).")
     if "min_dte" not in spec.expiry:
         raise SpecError("Expiry rule must state min_dte.")
-    kind = spec.expiry.get("kind", "any")
+    kind = spec.expiry.get("kind", "nearest")
     if kind not in EXPIRY_KINDS:
         raise SpecError(f"expiry.kind must be one of {EXPIRY_KINDS}.")
-    if spec.book == "index" and kind == "any":
-        raise SpecError("An index strategy must state expiry.kind = 'weekly' or 'monthly'; the two are tested as different instruments (IX-7).")
+    if spec.book == "index" and "kind" not in spec.expiry:
+        raise SpecError("An index strategy must state expiry.kind: 'nearest', 'weekly' or 'monthly' (IX-7).")
     if spec.tilt:
         _validate_tilt(spec)
     return spec
