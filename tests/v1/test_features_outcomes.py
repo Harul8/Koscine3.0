@@ -11,7 +11,8 @@ import synthetic as S
 from koscine4.features import build as fb
 from koscine4.features import builders as B
 from koscine4.features.leak import register_checked, truncation_test
-from koscine4.features.registry import FAMILIES, MAX_MODEL_FEATURES, REGISTRY, Feature, Registry, RegistryError, UnknownFeature
+from koscine4.features.registry import (FAMILIES, MAX_MODEL_FEATURES, PERCENTILE_EXEMPT, PERCENTILE_EXTRA, PERCENTILE_FAMILIES, REGISTRY,
+                                        Feature, Registry, RegistryError, UnknownFeature)
 from koscine4.harness.leak import too_good_columns
 from koscine4.models.core import ModelConfig, ModelError
 from koscine4.outcomes import build as outcomes
@@ -48,6 +49,19 @@ def test_every_feature_states_its_source_formula_and_lookback(big):
     assert set(FAMILIES) >= {REGISTRY.get(n).family for n in REGISTRY.names()}
     pct = [f for f in REGISTRY.describe() if f["percentile_of"]]                                    # F-7
     assert {"rv_20_pctile", "iv_pctile", "fii_net_5d_pctile"} <= {f["name"] for f in pct}
+
+
+def test_every_volatility_and_flow_feature_has_a_percentile(big):
+    covered = {REGISTRY.get(n).percentile_of for n in REGISTRY.names()} - {None}
+    wanted = [n for fam in PERCENTILE_FAMILIES for n in REGISTRY.names(family=fam)] + list(PERCENTILE_EXTRA)
+    missing = [n for n in wanted if REGISTRY.get(n).percentile_of is None and n not in covered and n not in PERCENTILE_EXEMPT]
+    assert not missing, f"F-7: no trailing percentile for {missing}"
+    names = [n for n in REGISTRY.names(decision_time="evening") if REGISTRY.get(n).percentile_of]
+    table = fb.read(names, settings=big)
+    late = table[table["date"] >= S.DAYS[300]]
+    for n in names:                                                                                  # built, and a share of 1
+        v = late[n].dropna()
+        assert len(v) and v.between(0.0, 1.0).all(), n
 
 
 def test_a_raw_price_level_cannot_be_registered():

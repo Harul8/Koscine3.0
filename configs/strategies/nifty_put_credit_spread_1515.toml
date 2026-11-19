@@ -10,6 +10,7 @@ entry_time = "1515"
 notes = "Ported from analysis/index_credit_spread_1515.py: 2% out-of-the-money short, 5-session hold, safety exit before expiry."
 
 [expiry]
+kind = "monthly"                # IX-7: weekly and monthly expiries are tested as different instruments
 min_dte = 7
 
 [strikes]

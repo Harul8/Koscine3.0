@@ -9,6 +9,7 @@ decision_time = "evening"
 entry_time = "next_open"
 
 [expiry]
+kind = "monthly"                # IX-7: weekly and monthly expiries are tested as different instruments
 min_dte = 5
 
 [strikes]

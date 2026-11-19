@@ -79,8 +79,16 @@ def price_features(inp: Inputs) -> pd.DataFrame:
     out["range_pct"] = (p["high"] - p["low"]) / p["close"]
     vol_mean = _roll(g, "volume", 20, "mean")
     out["volume_ratio_20"] = (p["volume"] / vol_mean).where(vol_mean > 0)
-    out["rv_20_pctile"] = _pctile(out.groupby("instrument", sort=False), "rv_20")
+    go = out.groupby("instrument", sort=False)
+    for col in PRICE_PCTILES:                                         # F-7: each against its own trailing 252 sessions
+        out[f"{col}_pctile"] = _pctile(go, col)
     return out
+
+
+# F-7: volatility and flow features that also get a trailing-252-session percentile, by builder.
+PRICE_PCTILES = ("rv_5", "rv_20", "rv_60", "rv_ratio_5_20", "parkinson_10", "atr_pct_14", "range_pct", "volume_ratio_20")
+OPTION_PCTILES = ("iv_rv_ratio", "iv_minus_rv", "iv_chg_5d", "term_slope")
+POSITION_PCTILES = ("fii_idx_fut_ratio", "fii_idx_fut_ratio_chg_5d", "fii_idx_opt_tilt")
 
 
 def option_features(inp: Inputs, price: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -117,6 +125,9 @@ def option_features(inp: Inputs, price: pd.DataFrame | None = None) -> pd.DataFr
     m["optvol"] = m["opt_call_vol"].fillna(0) + m["opt_put_vol"].fillna(0)
     vmean = _roll(m.groupby("instrument", sort=False), "optvol", 20, "mean")
     out["opt_volume_ratio_20"] = (m["optvol"] / vmean).where(vmean > 0)
+    go = out.groupby("instrument", sort=False)
+    for col in OPTION_PCTILES:                                        # F-7
+        out[f"{col}_pctile"] = _pctile(go, col)
     return out
 
 
@@ -167,6 +178,7 @@ def regime_features(inp: Inputs, price: pd.DataFrame | None = None) -> pd.DataFr
     out = pd.DataFrame(index=pd.Index(sorted(inp.prices["date"].unique()), name="date"))
     out["nifty_ret_5d"] = nifty["ret_5d"]
     out["nifty_rv_20"] = nifty["rv_20"]
+    out["nifty_rv_20_pctile"] = nifty["rv_20_pctile"]               # F-7: the same percentile as Nifty's own rv_20_pctile
     out["nifty_dist_ma200"] = nifty["dist_ma200"]
     vix = inp.prices[inp.prices["instrument"] == VIX].sort_values("date").set_index("date")["close"]
     out["vix_pctile"] = vix.rolling(252, min_periods=60).rank(pct=True)
@@ -186,8 +198,7 @@ def flow_features(inp: Inputs) -> tuple[pd.DataFrame, pd.DataFrame]:
         s5 = f[f"{who}_net"].rolling(5, min_periods=5).sum()
         mean, std = s5.rolling(252, min_periods=60).mean(), s5.rolling(252, min_periods=60).std()
         cash[f"{who}_net_5d_z"] = ((s5 - mean) / std).where(std > 0)
-        if who == "fii":
-            cash["fii_net_5d_pctile"] = s5.rolling(252, min_periods=60).rank(pct=True)
+        cash[f"{who}_net_5d_pctile"] = s5.rolling(252, min_periods=60).rank(pct=True)
     p = inp.participant
     p = p[p["participant"].astype(str).str.upper() == "FII"].sort_values("date").set_index("date")
     pos = pd.DataFrame(index=p.index)
@@ -201,6 +212,8 @@ def flow_features(inp: Inputs) -> tuple[pd.DataFrame, pd.DataFrame]:
         pos["fii_idx_opt_tilt"] = (tilt / total).where(total > 0)
     else:
         pos["fii_idx_opt_tilt"] = np.nan
+    for col in POSITION_PCTILES:                                      # F-7
+        pos[f"{col}_pctile"] = pos[col].rolling(252, min_periods=60).rank(pct=True)
     return cash.reset_index(), pos.reset_index()
 
 

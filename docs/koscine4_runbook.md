@@ -14,7 +14,12 @@ Nothing here starts by itself: training runs and backtests start only when you r
 | Features | `python -m koscine4.features.build --time evening` then `--time 1430` | a few minutes each | **Not run** |
 | Outcomes | `python -m koscine4.outcomes.build` | about a minute | **Not run** |
 
-The last three must be run once, in that order, before any backtest.
+The last three must be run once, in that order, before any backtest. Features must be rebuilt
+after 18 November 2026: that change added 16 percentile columns (`*_pctile`, F-7).
+
+The 5-minute files under `data/intraday/` (Nifty and Bank Nifty bars and option chains) must be no
+more than `[store].max_staleness_days` old. A 14:30 daily run stops when a 15:15 strategy's index
+has stale files; an evening run lists them as data warnings (D-10).
 
 ## 2. Baselines and the three old ideas (gate 1)
 
@@ -40,16 +45,38 @@ python -m koscine4.harness.run --strategy straddle_model
 python -m koscine4.harness.run --strategy stock_mover_book
 ```
 
+A classifier's probabilities are corrected (M-6, `calibration = "platt"` in the model file; set
+`"none"` to keep them raw). Each correction is fitted only on earlier out-of-sample predictions
+whose outcomes had ended by that model's cutoff, and is saved beside the model as
+`calibration.json`. The model report has a calibration table and says whether every tenth is
+within `[models].calibration_tolerance`. Models trained before 18 November 2026 have no
+correction; retrain them.
+
 ## 4. Index search and direction research
 
 ```bash
-python -m koscine4.harness.search --grid nifty_credit_spread_grid
-python -m koscine4.harness.search --grid nifty_iron_condor_grid
-python -m koscine4.harness.search --grid banknifty_credit_spread_grid
-python -m koscine4.harness.search --grid banknifty_iron_condor_grid
+python -m koscine4.harness.search --grid nifty_credit_spread_grid --fills daily
+python -m koscine4.harness.search --grid nifty_credit_spread_grid --fills 5m
+python -m koscine4.harness.search --grid nifty_credit_spread_grid --compare
+# the same three for nifty_iron_condor_grid, banknifty_credit_spread_grid, banknifty_iron_condor_grid
 python -m koscine4.harness.run --strategy nifty_long_straddle
 python -m koscine4.models.direction --group NIFTY --horizon 1      # also BANKNIFTY and stocks; horizons 1, 3, 5
 ```
+
+- `--fills daily` runs every cell on the whole history with fills from the daily file, and
+  chooses the setting on the early part. `--fills 5m` runs every cell again with 15:15 fills
+  from the 5-minute option chain, over the months those files cover; nothing is chosen there.
+  `--compare` puts the two side by side on the same months (IX-5) and writes
+  `records/results/search_<grid>_compare.md`. It runs no backtest.
+- Every index strategy states `expiry.kind = "weekly"` or `"monthly"`, and the grids try both.
+  A setting is chosen for each kind on its own, and every run report has a "By expiry kind"
+  table (IX-7). The six index strategy files were set to `"monthly"`, which is a change from
+  before: they previously took the nearest expiry, usually a weekly one. Bank Nifty weeklies
+  stopped in November 2024.
+- An iron condor or long strangle may have a `[tilt]` section (DR-7): a direction model and
+  the strike settings for an "up" and a "down" variant. The trade is decided without the
+  forecast; a confident forecast only moves the strikes. The daily run uses the forecast only
+  when that direction model has a gate 2 pass.
 
 ## 5. Gate decisions (yours)
 
@@ -71,9 +98,22 @@ python -m koscine4.daily.run --date <today> --time 1430 --paper
 ```
 
 The list is written to `records/daily/`. Without `--paper` the run needs every `[risk]`
-setting and a gate 3 record for the strategy. Fills are recorded in the ledger
-(`koscine4.ledger.book.Ledger.record_fill`, or the `/v1/ledger/fills` web route once the
-router in `koscine4/api/routes.py` is added to `api/main.py`).
+setting and a gate 3 record for the strategy.
+
+- **Expected result (S-5).** Each candidate gets an expected result after costs, as a % of its
+  maximum loss: the model's own prediction when the model was trained on that result, otherwise
+  the mean result of the strategy's earlier trades with a similar score (the runs behind its
+  gate 2 pass, then its closed ledger trades). Candidates from all strategies are ranked by it;
+  one with fewer than `[expected_result].min_trades` known trades has none yet and ranks last.
+  The harness ranks the same way, so backtests and the daily list agree.
+- **Margin (R-6).** The margin shown and used for sizing is a scenario estimate: the worst loss
+  over price and volatility moves worked out from the legs' own implied volatility, plus
+  exposure margin. The `[margin]` numbers are not the exchange's; check a few trades against a
+  broker's margin calculator and adjust them. Maximum loss x `margin_factor` is the fallback.
+- **Fills (O-6, O-7).** The web app's **Trade List** tab shows the saved lists, the open and
+  closed trades, and a form to record each leg's entry and exit fill, mark a recommendation not
+  taken, and close a trade from its fills. The same actions are web routes under `/v1`
+  (`koscine4/api/routes.py`, included by `api/main.py`).
 
 ## Where things are
 
@@ -83,6 +123,7 @@ router in `koscine4/api/routes.py` is added to `api/main.py`).
 | Strategy rules | `configs/strategies/*.toml` |
 | Model definitions | `configs/models/*.toml` |
 | Search grids | `configs/searches/*.toml` |
+| Expected result, margin and calibration settings | `[expected_result]`, `[margin]`, `[models]` in `configs/settings.toml` |
 | Corporate actions to review | `records/store/adjustments_review.csv`; corrections go in `configs/adjustment_overrides.toml` |
 | Data check results | `records/store/check_issues.csv` |
 | Monthly lists | `records/universe/top_list.csv` |

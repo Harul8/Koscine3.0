@@ -27,7 +27,7 @@ from koscine4.strategies.structures import BUY, SELL, Leg, build_legs, choose_ex
 
 def spec_dict(name="t_nifty_straddle", **over) -> dict:
     d = dict(name=name, family=name, book="index", instruments=["NIFTY"], structure="long_straddle", decision_time="evening",
-             entry_time="next_open", expiry={"min_dte": 7}, strikes={"max_snap_pct": 1.0},
+             entry_time="next_open", expiry={"min_dte": 7, "kind": "monthly"}, strikes={"max_snap_pct": 1.0},
              exit={"max_hold_sessions": 5, "safety_days": 2}, liquidity={"min_volume": 100, "min_open_interest": 1, "min_premium": 5.0},
              score={"source": "take_all", "threshold": 0.0}, selection={"weekly_cap": True, "max_per_day": 1})
     d.update(over)
@@ -375,6 +375,7 @@ decision_time = "1430"
 entry_time = "1515"
 [expiry]
 min_dte = 7
+kind = "monthly"
 [strikes]
 short_otm_pct = 2.0
 wing_pct = 2.0

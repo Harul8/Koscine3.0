@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Activity, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, Coins, Cog, ExternalLink, Filter, Flame, History, LineChart, Lock, Play, RefreshCw, Waves, X } from "lucide-react";
 import "./styles.css";
+import { TradeListTab } from "./TradeList";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8003";
 const GROUP_LABEL: Record<string, string> = { A_mcap30: "A · mega-cap", B_turn35: "B · movers" };
@@ -57,7 +58,8 @@ const TABS = [
   { id: "desk", label: "Buy Signals", icon: <Flame size={16} /> },
   { id: "movers", label: "Universe", icon: <Filter size={16} /> },
   { id: "price", label: "Chart", icon: <LineChart size={16} /> },
-  { id: "ops", label: "Refresh / Retrain", icon: <Cog size={16} /> }
+  { id: "ops", label: "Refresh / Retrain", icon: <Cog size={16} /> },
+  { id: "k4", label: "Trade List", icon: <History size={16} /> }
 ];
 
 function urlParam(name: string): string | null {
@@ -105,6 +107,7 @@ export default function App() {
       {tab === "movers" && <DailyMovers {...props} />}
       {tab === "price" && <PriceHistory {...props} initialSymbol={initialSymbol} />}
       {tab === "ops" && <RunRetrain />}
+      {tab === "k4" && <TradeListTab />}
     </main>
   );
 }

@@ -31,6 +31,8 @@ def load_predictions(settings: Settings, spec: StrategySpec) -> dict[str, pd.Dat
         names.add(str(spec.score["model"]))
     if spec.direction_model:
         names.add(spec.direction_model)
+    if spec.tilt:
+        names.add(str(spec.tilt["model"]))                  # DR-7: the forecast that may tilt the strikes
     out = {}
     for name in sorted(names):
         path = settings.path("pit") / "predictions" / f"{name}.parquet"
@@ -58,7 +60,8 @@ def run(strategy: Strategy | StrategySpec | str, start=None, end=None, settings:
     end, sealed_note = records.clip_to_seal(settings, end, last, unlock_sealed, reason)
     limits = dict(settings.section("selection"))
     cap = bool(spec.selection.get("weekly_cap", True)) if apply_weekly_cap is None else apply_weekly_cap
-    result = run_engine(strategy, data, start, end, limits, groups=dict(settings.section("selection").get("groups", {})), apply_weekly_cap=cap)
+    result = run_engine(strategy, data, start, end, limits, groups=dict(settings.section("selection").get("groups", {})), apply_weekly_cap=cap,
+                        slippage_pct=slippage)
     report = summarise(result.trades, result.skips, dict(settings.section("costs")), slippage)
 
     snapshot = records.data_snapshot(settings)

@@ -1,4 +1,4 @@
-# Index strategy search (IX-1 to IX-4). Written before running. 3 x 2 x 2 x 2 = 24 cells.
+# Index strategy search (IX-1 to IX-4, IX-7). Written before running. 3 x 2 x 2 x 2 x 2 = 48 cells; a setting is chosen for each expiry kind.
 base = "banknifty_iron_condor_1515"
 select_until = "2020-12-31"
 min_trades = 40
@@ -8,3 +8,4 @@ min_trades = 40
 "strikes.wing_pct" = [1.0, 2.0]
 "expiry.min_dte" = [7, 14]
 "exit.max_hold_sessions" = [3, 5]
+"expiry.kind" = ["weekly", "monthly"]

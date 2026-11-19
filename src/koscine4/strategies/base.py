@@ -2,16 +2,27 @@
 
 The harness and the daily run both drive a strategy through `candidates` and `manage`, and
 through nothing else. That shared path is what makes a live trade comparable with its backtest.
+
+Every candidate carries one comparable number (S-5): its expected result after costs, as a
+percentage of its maximum loss. A model trained on a structure's after-cost result gives it
+directly. Any other strategy gets it from its own track record: the mean after-cost result of
+its closed trades known at the decision, taken from the trades whose score fell in the same
+band. The ranking inside one strategy still follows its specification (a baseline ranks by its
+feature, M-1); the expected result is what ranks candidates of different strategies against
+each other in the daily list.
+
+Direction may tilt the choice between two neutral variants of one structure (DR-7): the trade
+is decided first without it, and only then may a direction forecast move the strikes.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
 from koscine4.strategies.spec import StrategySpec
-from koscine4.strategies.structures import Leg, build_legs, max_loss_per_share, net_debit
+from koscine4.strategies.structures import Leg, build_legs, expiry_kind, max_loss_per_share, net_debit
 
 SELLS_PREMIUM = ("credit_spread", "iron_condor")
 
@@ -29,6 +40,7 @@ class Candidate:
     max_loss_per_share: float              # at those prices
     reasons: dict = field(default_factory=dict)
     uses_direction: bool = False
+    expected_result_pct: float = float("nan")    # S-5: expected result after costs, % of maximum loss
 
 
 @dataclass
@@ -96,9 +108,69 @@ class SpecStrategy(Strategy):
             return None
         return 1 if p >= 0.5 else -1
 
+    def expected_result(self, view, score: float) -> tuple[float, dict]:
+        """(expected result after costs as % of maximum loss, the inputs it came from) (S-5)."""
+        s = self.spec.score
+        if s.get("source") == "model" and view.model_predicts_result(str(s["model"])):
+            return float(score), {"source": "model", "model": str(s["model"]), "prediction_pct": float(score)}
+        return view.expected_from_track_record(self.spec.name, score)
+
+    def _priced_legs(self, spec: StrategySpec, chain: pd.DataFrame, spot: float, date, direction):
+        """((legs, prices, lot, max loss per share), "", {}) or (None, reason, details)."""
+        liq = spec.liquidity
+        legs = build_legs(spec, chain, spot, date, direction)
+        if not legs:
+            return None, "no_strikes_for_structure", {}
+        rows = [_row(chain, leg) for leg in legs]
+        if any(r is None for r in rows):
+            return None, "leg_not_listed", {}
+        lot0 = rows[0]["lot"] if rows[0]["lot"] == rows[0]["lot"] and rows[0]["lot"] > 0 else float("nan")
+        for leg, r in zip(legs, rows):                                        # S-4: every leg
+            problem = None
+            if not r["volume"] >= float(liq["min_volume"]):
+                problem = "liquidity:volume"
+            elif not r["open_int"] / lot0 >= float(liq["min_open_interest"]):          # open interest in lots
+                problem = "liquidity:open_interest"
+            elif not r["close"] >= float(liq["min_premium"]):
+                problem = "liquidity:premium"
+            if problem:
+                return None, problem, {"leg": leg.label()}
+        prices = [float(r["close"]) for r in rows]
+        lot = rows[0]["lot"]
+        if lot != lot or lot <= 0:
+            return None, "no_lot_size", {}
+        risk = max_loss_per_share(legs, prices)
+        if not risk > 0:
+            return None, "no_risk_defined", {}
+        return (legs, prices, float(lot), risk), "", {}
+
+    def _tilt(self, view, instrument: str, chain: pd.DataFrame, spot: float, base: tuple) -> tuple[tuple, dict]:
+        """DR-7: move the strikes of an already-decided neutral trade toward a direction forecast.
+
+        Returns the legs to trade and a note. Any problem keeps the untilted trade: the forecast can
+        change where the strikes sit, never whether there is a trade.
+        """
+        t = self.spec.tilt
+        note = {"model": str(t["model"]), "variant": "neutral"}
+        try:
+            p = view.prediction(str(t["model"]), instrument)
+        except Exception:                                   # no predictions loaded for the model
+            return base, dict(note, reason="no_forecast_available")
+        if p != p:
+            return base, dict(note, reason="no_forecast_for_this_day")
+        note["forecast_up"] = float(p)
+        conf = float(t.get("min_confidence", 0.55))
+        variant = "up" if p >= conf else "down" if p <= 1.0 - conf else None
+        if variant is None:
+            return base, dict(note, reason="forecast_not_confident")
+        tilted = replace(self.spec, strikes={**self.spec.strikes, **dict(t[variant])})
+        got, reason, _ = self._priced_legs(tilted, chain, spot, view.date, None)
+        if got is None:
+            return base, dict(note, reason=f"{variant}_variant_refused:{reason}")
+        return got, dict(note, variant=variant)
+
     def candidates(self, view):
         spec, out, refused = self.spec, [], []
-        liq = spec.liquidity
 
         def refuse(instrument, reason, **more):
             refused.append({"instrument": instrument, "strategy": spec.name, "reason": reason, **more})
@@ -123,36 +195,9 @@ class SpecStrategy(Strategy):
                     and view.results_within(instrument, hold + 1):
                 refuse(instrument, "results_in_window")                      # R-8
                 continue
-            legs = build_legs(spec, chain, spot, view.date, self.direction(view, instrument))
-            if not legs:
-                refuse(instrument, "no_strikes_for_structure")
-                continue
-            rows = [_row(chain, leg) for leg in legs]
-            if any(r is None for r in rows):
-                refuse(instrument, "leg_not_listed")
-                continue
-            problem = None
-            lot0 = rows[0]["lot"] if rows[0]["lot"] == rows[0]["lot"] and rows[0]["lot"] > 0 else float("nan")
-            for leg, r in zip(legs, rows):                                    # S-4: every leg
-                if not r["volume"] >= float(liq["min_volume"]):
-                    problem = "liquidity:volume"
-                elif not r["open_int"] / lot0 >= float(liq["min_open_interest"]):      # open interest in lots
-                    problem = "liquidity:open_interest"
-                elif not r["close"] >= float(liq["min_premium"]):
-                    problem = "liquidity:premium"
-                if problem:
-                    break
-            if problem:
-                refuse(instrument, problem, leg=leg.label())
-                continue
-            prices = [float(r["close"]) for r in rows]
-            lot = rows[0]["lot"]
-            if lot != lot or lot <= 0:
-                refuse(instrument, "no_lot_size")
-                continue
-            risk = max_loss_per_share(legs, prices)
-            if not risk > 0:
-                refuse(instrument, "no_risk_defined")
+            built, reason, more = self._priced_legs(spec, chain, spot, view.date, self.direction(view, instrument))
+            if built is None:
+                refuse(instrument, reason, **more)
                 continue
             score = self.score(view, instrument)
             if score != score:
@@ -161,9 +206,15 @@ class SpecStrategy(Strategy):
             if score < float(spec.score["threshold"]):                        # S-6
                 refuse(instrument, "below_threshold", score=score)
                 continue
-            out.append(Candidate(spec.name, spec.book, instrument, view.date, legs, float(score), float(lot), prices, risk,
-                                 reasons={"score_source": spec.score["source"], "net_debit": net_debit(legs, prices), "spot": spot},
-                                 uses_direction=spec.uses_direction))
+            reasons = {"score_source": spec.score["source"], "spot": spot}
+            if spec.tilt:                                                     # DR-7: only after the trade is decided
+                built, reasons["tilt"] = self._tilt(view, instrument, chain, spot, built)
+            legs, prices, lot, risk = built
+            expected, inputs = self.expected_result(view, float(score))
+            reasons.update({"net_debit": net_debit(legs, prices), "expiry_kind": expiry_kind(chain, legs[0].expiry),
+                            "expected_result": inputs})
+            out.append(Candidate(spec.name, spec.book, instrument, view.date, legs, float(score), lot, prices, risk,
+                                 reasons=reasons, uses_direction=spec.uses_direction, expected_result_pct=expected))
         return out, refused
 
     def manage(self, state: PositionState, view=None) -> Action:

@@ -34,11 +34,17 @@ def choose_expiry(chain: pd.DataFrame, date, min_dte: int, max_dte: int | None =
     is_opt = chain["opt_type"].isin(["CE", "PE"])
     exp = pd.DatetimeIndex(sorted(chain.loc[is_opt, "expiry"].unique()))
     if kind != "any":
-        monthly = set(chain.loc[~is_opt, "expiry"].unique())
+        monthly = set(pd.DatetimeIndex(chain.loc[~is_opt, "expiry"].unique()))
         exp = pd.DatetimeIndex([e for e in exp if (e in monthly) == (kind == "monthly")])
     dte = (exp - date).days
     ok = exp[(dte >= min_dte) & ((dte <= max_dte) if max_dte is not None else True)]
     return ok[0] if len(ok) else None
+
+
+def expiry_kind(chain: pd.DataFrame, expiry) -> str:
+    """'monthly' if the expiry also has a futures contract, else 'weekly' (IX-7)."""
+    fut = chain.loc[~chain["opt_type"].isin(["CE", "PE"]), "expiry"]
+    return "monthly" if pd.Timestamp(expiry) in set(pd.to_datetime(fut)) else "weekly"
 
 
 def nearest_strike(strikes, target: float, max_snap_pct: float) -> float | None:
@@ -47,6 +53,11 @@ def nearest_strike(strikes, target: float, max_snap_pct: float) -> float | None:
         return None
     best = min(strikes, key=lambda k: abs(k - target))
     return best if abs(best / target - 1.0) * 100.0 <= max_snap_pct else None
+
+
+def per_side(strikes, side: str, key: str):
+    """A strike setting for one side ("put" or "call"): `put_<key>` if given, else the shared `<key>`."""
+    return strikes.get(f"{side}_{key}", strikes.get(key))
 
 
 def build_legs(spec: StrategySpec, chain: pd.DataFrame, spot: float, date, direction: int | None = None) -> list[Leg] | None:
@@ -78,8 +89,8 @@ def build_legs(spec: StrategySpec, chain: pd.DataFrame, spot: float, date, direc
         atm = nearest_strike(set(calls) & set(puts), spot, snap)
         return None if atm is None else [Leg(expiry, atm, "CE", BUY), Leg(expiry, atm, "PE", BUY)]
     if s == "long_strangle":
-        otm = float(k["otm_pct"]) / 100.0
-        c, p = strike(calls, otm), strike(puts, -otm)
+        c_otm, p_otm = (float(per_side(k, side, "otm_pct")) / 100.0 for side in ("call", "put"))
+        c, p = strike(calls, c_otm), strike(puts, -p_otm)
         return None if c is None or p is None else [Leg(expiry, c, "CE", BUY), Leg(expiry, p, "PE", BUY)]
     if s == "debit_spread":
         near, width = float(k.get("otm_pct", 0.0)) / 100.0, float(k["wing_pct"]) / 100.0
@@ -89,14 +100,15 @@ def build_legs(spec: StrategySpec, chain: pd.DataFrame, spot: float, date, direc
         a, b = strike(puts, -near), strike(puts, -near - width)
         return None if a is None or b is None or b >= a else [Leg(expiry, a, "PE", BUY), Leg(expiry, b, "PE", SELL)]
     if s in ("credit_spread", "iron_condor"):
-        short, wing = float(k["short_otm_pct"]) / 100.0, float(k["wing_pct"]) / 100.0
         legs: list[Leg] = []
         if s == "iron_condor" or side == "put":
+            short, wing = float(per_side(k, "put", "short_otm_pct")) / 100.0, float(per_side(k, "put", "wing_pct")) / 100.0
             a, b = strike(puts, -short), strike(puts, -short - wing)
             if a is None or b is None or b >= a:
                 return None
             legs += [Leg(expiry, a, "PE", SELL), Leg(expiry, b, "PE", BUY)]
         if s == "iron_condor" or side == "call":
+            short, wing = float(per_side(k, "call", "short_otm_pct")) / 100.0, float(per_side(k, "call", "wing_pct")) / 100.0
             a, b = strike(calls, short), strike(calls, short + wing)
             if a is None or b is None or b <= a:
                 return None

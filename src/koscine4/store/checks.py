@@ -101,17 +101,55 @@ def check_jumps(prices: pd.DataFrame, adjustments: pd.DataFrame, jump_pct: float
             for r in big.itertuples(index=False)]
 
 
-def check_freshness(folder: Path, today, max_days: int) -> list[Issue]:
-    """D-10: the newest file in an intraday folder must be recent."""
-    folder = Path(folder)
-    files = [f for f in folder.glob("*.parquet")] if folder.exists() else []
-    if not files:
-        return [Issue("intraday_missing", "error", folder.name, _d(today), "no intraday files found")]
-    newest = max(pd.Timestamp(f.stem) for f in files if _is_date(f.stem))
+def check_freshness(path: Path, today, max_days: int) -> list[Issue]:
+    """D-10: the newest intraday data in a folder (or one file) must be recent.
+
+    The option-chain folders name each file by its EXPIRY, so a file name says nothing about how
+    recent the data is: a far expiry downloaded months ago still has a future name. The check reads
+    the timestamps inside the newest files instead, and uses a file's name only when it has none.
+    """
+    newest = newest_intraday_day(path)
+    name = Path(path).name
+    if newest is None:
+        return [Issue("intraday_missing", "error", name, _d(today), "no intraday files found")]
     age = (pd.Timestamp(today).normalize() - newest).days
     if age > max_days:
-        return [Issue("intraday_stale", "error", folder.name, _d(today), f"newest file is {age} days old ({_d(newest)})")]
+        return [Issue("intraday_stale", "error", name, _d(today), f"newest data is {age} days old ({_d(newest)})")]
     return []
+
+
+def newest_intraday_day(path: Path, files_to_read: int = 3) -> pd.Timestamp | None:
+    """The last day with intraday data in `path` (a folder of parquet files, or one file)."""
+    path = Path(path)
+    if path.is_file():
+        files = [path]
+    elif path.exists():
+        dated = sorted((f for f in path.glob("*.parquet") if _is_date(f.stem)), key=lambda f: pd.Timestamp(f.stem))
+        undated = [f for f in path.glob("*.parquet") if not _is_date(f.stem)]
+        files = dated[-files_to_read:] + undated
+    else:
+        files = []
+    days = []
+    for f in files:
+        day = _last_timestamp(f)
+        if day is None and _is_date(f.stem):
+            day = pd.Timestamp(f.stem).normalize()
+        if day is not None:
+            days.append(day)
+    return max(days) if days else None
+
+
+def _last_timestamp(file: Path) -> pd.Timestamp | None:
+    try:
+        ts = pd.read_parquet(file, columns=["timestamp"])["timestamp"]
+    except Exception:
+        return None
+    if ts.empty:
+        return None
+    ts = pd.to_datetime(ts)
+    if ts.dt.tz is not None:
+        ts = ts.dt.tz_localize(None)
+    return ts.max().normalize()
 
 
 def _is_date(text: str) -> bool:

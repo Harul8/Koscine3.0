@@ -16,6 +16,11 @@ from koscine4.store.symbols import canonicalize, load_changes
 from koscine4.store.market_value import MARKET_VALUE
 from koscine4.store.tables import ADJUSTMENTS, PRICES_RAW, read_table
 
+# Intraday files under [paths].intraday (D-10): 5-minute index bars for the 14:30 features, and the
+# 5-minute option chains (one file per expiry) that price 15:15 fills.
+INTRADAY_BAR_FILES = {"NIFTY": "nifty_5m.parquet", "BANKNIFTY": "banknifty_5m.parquet"}
+INTRADAY_CHAIN_FOLDERS = {"NIFTY": "nifty_option_chain_5m", "BANKNIFTY": "banknifty_option_chain_5m"}
+
 
 class Store:
     def __init__(self, settings: Settings | None = None):
@@ -140,7 +145,7 @@ class Store:
     def intraday_bars(self, *, asof: Decision) -> pd.DataFrame:
         """5-minute index bars that had finished by `asof`: at 14:30, today's bars stamped before 14:30."""
         frames = []
-        for instrument, file in (("NIFTY", "nifty_5m.parquet"), ("BANKNIFTY", "banknifty_5m.parquet")):
+        for instrument, file in INTRADAY_BAR_FILES.items():
             path = self.settings.path("intraday") / file
             if path.exists():
                 b = pd.read_parquet(path, columns=["timestamp", "open", "high", "low", "close"])

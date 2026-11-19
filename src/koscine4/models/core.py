@@ -17,6 +17,7 @@ from koscine4.store.calendar import TradingCalendar
 
 ALGORITHMS = ("ridge", "logistic", "gbt")
 KINDS = ("regression", "classification")
+CALIBRATIONS = ("platt", "none")                 # M-6: how a classifier's probabilities are corrected
 
 
 class ModelError(ValueError):
@@ -38,12 +39,16 @@ class ModelConfig:
     seed: int = 7
     params: dict = field(default_factory=dict)
     start: str = ""
+    calibration: str = "platt"                       # M-6: classification only; "none" keeps the raw probabilities
+    min_calibration_rows: int = 300                  # fewer known out-of-sample rows than this: no correction yet
 
     def validate(self) -> "ModelConfig":
         from koscine4.features.registry import MAX_MODEL_FEATURES, REGISTRY
 
         if self.algorithm not in ALGORITHMS or self.kind not in KINDS:
             raise ModelError(f"Version 1 models are {ALGORITHMS} of kind {KINDS} (M-3).")
+        if self.calibration not in CALIBRATIONS:
+            raise ModelError(f"calibration must be one of {CALIBRATIONS} (M-6).")
         if self.algorithm == "ridge" and self.kind != "regression" or self.algorithm == "logistic" and self.kind != "classification":
             raise ModelError("ridge is for regression and logistic is for classification.")
         REGISTRY.require(self.features)
@@ -144,6 +149,83 @@ def walk_forward(cfg: ModelConfig, features: pd.DataFrame, outcomes: pd.DataFram
     return out, records
 
 
+@dataclass(frozen=True)
+class Platt:
+    """A probability correction (M-6): p -> 1 / (1 + exp(-(a * logit(p) + b)))."""
+
+    a: float
+    b: float
+    rows: int
+
+    def apply(self, p) -> np.ndarray:
+        p = np.clip(np.asarray(p, dtype=float), 1e-6, 1.0 - 1e-6)
+        return 1.0 / (1.0 + np.exp(-(self.a * np.log(p / (1.0 - p)) + self.b)))
+
+    def to_dict(self) -> dict:
+        return {"method": "platt", "a": self.a, "b": self.b, "rows": self.rows}
+
+
+def fit_platt(p, y, min_rows: int) -> Platt | None:
+    """Fit the correction on predictions whose outcomes are known. None with too few rows or one class."""
+    from sklearn.linear_model import LogisticRegression
+
+    df = pd.DataFrame({"p": np.asarray(p, dtype=float), "y": np.asarray(y, dtype=float)}).dropna()
+    if len(df) < int(min_rows) or df["y"].nunique() < 2:
+        return None
+    x = np.clip(df["p"].to_numpy(), 1e-6, 1.0 - 1e-6)
+    x = np.log(x / (1.0 - x)).reshape(-1, 1)
+    lr = LogisticRegression(C=1e6, max_iter=1000).fit(x, df["y"].astype(int).to_numpy())
+    return Platt(float(lr.coef_[0, 0]), float(lr.intercept_[0]), int(len(df)))
+
+
+def calibrate(cfg: ModelConfig, preds: pd.DataFrame, outcomes: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Platt | None]]:
+    """M-6: correct a classifier's walk-forward probabilities, one correction per fitted model.
+
+    The correction for the model fitted at cutoff C is fitted on the earlier out-of-sample predictions
+    whose outcomes had ended by C, so it never uses an outcome the model could not have seen. Until
+    enough such rows exist the raw probability is kept. Returns the predictions with `raw_prediction`
+    added and `prediction` corrected, and the correction for each cutoff (None where there was none).
+    """
+    out = preds.copy()
+    out["raw_prediction"] = out["prediction"]
+    fitted: dict[str, Platt | None] = {}
+    if cfg.kind != "classification" or cfg.calibration == "none" or out.empty:
+        return out, fitted
+    known = out.merge(outcomes[["date", "instrument", "y", "window_end"]], on=["date", "instrument"], how="inner")
+    cutoffs = pd.to_datetime(out["cutoff"])
+    for cutoff in sorted(cutoffs.dropna().unique()):
+        cutoff = pd.Timestamp(cutoff)
+        prior = known[(known["window_end"] <= cutoff) & (known["date"] <= cutoff)]
+        cal = fit_platt(prior["raw_prediction"], prior["y"], cfg.min_calibration_rows)
+        fitted[str(cutoff.date())] = cal
+        if cal is not None:
+            rows = cutoffs == cutoff
+            out.loc[rows, "prediction"] = cal.apply(out.loc[rows, "raw_prediction"])
+    return out, fitted
+
+
+def save_calibration(folder: Path, cal: Platt | None) -> None:
+    if folder.exists():
+        body = cal.to_dict() if cal is not None else {"method": "none", "note": "too few known out-of-sample rows at this cutoff"}
+        (folder / "calibration.json").write_text(json.dumps(body, indent=2), encoding="utf-8")
+
+
+def load_calibration(folder: Path) -> Platt | None:
+    path = folder / "calibration.json"
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text(encoding="utf-8"))
+    return Platt(float(d["a"]), float(d["b"]), int(d["rows"])) if d.get("method") == "platt" else None
+
+
+def calibration_check(table: list[dict], tolerance: float) -> dict:
+    """M-6: every tenth of the predictions within `tolerance` of its realised rate."""
+    if not table:
+        return {"tolerance": tolerance, "largest_gap": None, "ok": None, "note": "too few rows to check"}
+    gap = max(abs(r["mean_prediction"] - r["realised_rate"]) for r in table)
+    return {"tolerance": tolerance, "largest_gap": round(float(gap), 4), "ok": bool(gap <= tolerance)}
+
+
 def save_model(folder: Path, model: _Wrapped, record: dict) -> None:
     import joblib
 
@@ -160,6 +242,7 @@ def load_latest_model(model_root: Path, name: str, on_or_before) -> tuple[_Wrapp
     if not folders:
         raise ModelError(f"No saved model '{name}' with a cutoff on or before {pd.Timestamp(on_or_before).date()}.")
     record = json.loads((folders[-1] / "record.json").read_text(encoding="utf-8"))
+    record["_folder"] = str(folders[-1])                    # where the probability correction (M-6) sits
     return joblib.load(folders[-1] / "model.joblib"), record
 
 

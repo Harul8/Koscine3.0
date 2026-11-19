@@ -92,6 +92,10 @@ class Ledger:
         return fid
 
     def mark_not_taken(self, rec_id: int, note: str = "") -> None:
+        """The owner did not take a recommendation. Only one with no fills yet can be marked so."""
+        status = self.get(rec_id)["status"]
+        if status != "recommended":
+            raise LedgerError(f"Recommendation {rec_id} is '{status}'; only a recommendation with no fills can be marked not taken.")
         self._exec("UPDATE recommendations SET status = 'not_taken', exit_reason = ? WHERE id = ?", (note, rec_id))
 
     def fills(self, rec_id: int) -> pd.DataFrame:

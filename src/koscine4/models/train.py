@@ -23,7 +23,8 @@ from koscine4.features import build as feature_build
 from koscine4.harness import records
 from koscine4.harness.leak import rank_correlation, too_good_columns
 from koscine4.harness.walkforward import monthly_folds
-from koscine4.models.core import ModelConfig, calibration_table, walk_forward
+from koscine4.models.core import (ModelConfig, calibrate, calibration_check, calibration_table, load_calibration, save_calibration,
+                                  walk_forward)
 from koscine4.outcomes import build as outcomes
 from koscine4.settings import Settings, load_settings
 from koscine4.store.api import Store
@@ -78,6 +79,9 @@ def train(name: str, settings: Settings | None = None, start=None, end=None, unl
         raise RuntimeError(f"Columns that track the outcome too closely to be features (V-13): {leaks}")
     preds, model_records = walk_forward(cfg, feats, target, folds, cal, gap, weight=outcomes.overlap_weight(horizon),
                                         model_dir=settings.path("model_store") / cfg.name, score_instruments=tradeable)
+    preds, calibrators = calibrate(cfg, preds, target)                                   # M-6
+    for cutoff, c in calibrators.items():
+        save_calibration(settings.path("model_store") / cfg.name / cutoff, c)
     out_path = settings.path("pit") / "predictions" / f"{cfg.name}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     preds.to_parquet(out_path, index=False)
@@ -85,10 +89,17 @@ def train(name: str, settings: Settings | None = None, start=None, end=None, unl
     scored = preds.merge(target, on=["date", "instrument"], how="inner")
     by_year = {int(y): {"rows": int(len(g)), "rank_correlation": rank_correlation(g["prediction"], g["y"])}
                for y, g in scored.groupby(scored["date"].dt.year)}
+    classifier = cfg.kind == "classification"
+    tolerance = float(dict(settings.section("models")).get("calibration_tolerance", 0.05))
     report = {"model": cfg.name, "rows": int(len(preds)), "scored_rows": int(len(scored)), "fits": len(model_records),
               "rank_correlation": rank_correlation(scored["prediction"], scored["y"]), "by_year": by_year,
-              "calibration": calibration_table(scored["prediction"], scored["y"]) if cfg.kind == "classification" else [],
+              "calibration": calibration_table(scored["prediction"], scored["y"]) if classifier else [],
+              "calibration_raw": calibration_table(scored["raw_prediction"], scored["y"]) if classifier else [],
+              "calibration_method": cfg.calibration if classifier else "not a classifier",
+              "corrected_fits": sum(c is not None for c in calibrators.values()),
               "start": str(start.date()), "end": str(end.date()), "sealed_note": sealed_note}
+    if classifier:
+        report["calibration_check"] = calibration_check(report["calibration"], tolerance)
     records.append_log(settings, {"kind": "train", "model": cfg.name, "features": list(cfg.features), "feature_count": len(cfg.features),
                                   "data_snapshot": records.data_snapshot(settings), "code_version": records.code_version(settings),
                                   "summary": {k: report[k] for k in ("rows", "fits", "rank_correlation")}})
@@ -99,6 +110,15 @@ def train(name: str, settings: Settings | None = None, start=None, end=None, unl
              f"Rank correlation of prediction with outcome: {report['rank_correlation']:.4f}", "",
              "| Year | Rows | Rank correlation |", "|---|---|---|"]
     lines += [f"| {y} | {v['rows']} | {v['rank_correlation']:.4f} |" for y, v in by_year.items()]
+    if classifier:
+        chk = report["calibration_check"]
+        verdict = "not checked: too few rows" if chk["ok"] is None else ("within" if chk["ok"] else "OUTSIDE") + f" tolerance {chk['tolerance']}"
+        lines += ["", f"## Calibration (M-6, {cfg.calibration}; {report['corrected_fits']} of {len(calibrators)} fits corrected)", "",
+                  f"Largest gap between predicted and realised rate: {chk['largest_gap']} ({verdict}).", "",
+                  "| Tenth | Rows | Raw prediction | Corrected prediction | Realised rate |", "|---|---|---|---|---|"]
+        raw = {r["bin"]: r for r in report["calibration_raw"]}
+        lines += [f"| {r['bin'] + 1} | {r['rows']} | {raw.get(r['bin'], {}).get('mean_prediction', float('nan')):.3f} | "
+                  f"{r['mean_prediction']:.3f} | {r['realised_rate']:.3f} |" for r in report["calibration"]]
     (res / f"model_{cfg.name}.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (res / f"model_{cfg.name}.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     return report
@@ -108,10 +128,13 @@ def predict_latest(settings: Settings, name: str, feature_rows: pd.DataFrame, da
     """Score today's feature rows with the saved model stamped with the latest cutoff (daily run)."""
     from koscine4.models.core import load_latest_model
 
+    from pathlib import Path
+
     model, record = load_latest_model(settings.path("model_store"), name, date)
-    p = model.predict(feature_rows[record["features"]])
+    raw = np.asarray(model.predict(feature_rows[record["features"]]), dtype=float)
+    cal = load_calibration(Path(record["_folder"]))                                       # M-6: the same correction as the backtest
     return pd.DataFrame({"date": feature_rows["date"].to_numpy(), "instrument": feature_rows["instrument"].to_numpy(),
-                         "prediction": np.asarray(p, dtype=float), "cutoff": record["cutoff"]})
+                         "prediction": cal.apply(raw) if cal is not None else raw, "raw_prediction": raw, "cutoff": record["cutoff"]})
 
 
 def main() -> None:

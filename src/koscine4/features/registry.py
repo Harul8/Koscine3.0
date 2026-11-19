@@ -14,6 +14,14 @@ FAMILIES = (
 )
 MAX_MODEL_FEATURES = 40          # F-10
 
+# F-7: every volatility and flow feature also has a percentile of its own trailing 252 sessions,
+# except the ones listed here with the reason.
+PERCENTILE_FAMILIES = ("volatility_state", "implied_vs_realised", "flows")
+PERCENTILE_EXTRA = ("nifty_rv_20",)                     # a volatility feature filed under regime
+PERCENTILE_EXEMPT = {
+    "implied_move_5d": "a fixed multiple of atm_iv, so its percentile is iv_pctile",
+}
+
 
 class UnknownFeature(KeyError):
     """Raised when code asks for a column that is not a registered feature."""
@@ -109,7 +117,14 @@ def default_registry() -> Registry:
         _f("atr_pct_14", "volatility_state", "price", P, "14-session mean true range / close", 14),
         _f("range_pct", "volatility_state", "price", P, "(high - low) / close", 0),
         _f("volume_ratio_20", "volatility_state", "price", P, "volume / 20-session mean volume", 20),
+        _f("rv_5_pctile", "volatility_state", "price", P, "percentile of rv_5 in its own trailing 252 sessions", 257, percentile_of="rv_5"),
         _f("rv_20_pctile", "volatility_state", "price", P, "percentile of rv_20 in its own trailing 252 sessions", 272, percentile_of="rv_20"),
+        _f("rv_60_pctile", "volatility_state", "price", P, "percentile of rv_60 in its own trailing 252 sessions", 312, percentile_of="rv_60"),
+        _f("rv_ratio_5_20_pctile", "volatility_state", "price", P, "percentile of rv_ratio_5_20 in its own trailing 252 sessions", 272, percentile_of="rv_ratio_5_20"),
+        _f("parkinson_10_pctile", "volatility_state", "price", P, "percentile of parkinson_10 in its own trailing 252 sessions", 262, percentile_of="parkinson_10"),
+        _f("atr_pct_14_pctile", "volatility_state", "price", P, "percentile of atr_pct_14 in its own trailing 252 sessions", 266, percentile_of="atr_pct_14"),
+        _f("range_pct_pctile", "volatility_state", "price", P, "percentile of range_pct in its own trailing 252 sessions", 252, percentile_of="range_pct"),
+        _f("volume_ratio_20_pctile", "volatility_state", "price", P, "percentile of volume_ratio_20 in its own trailing 252 sessions", 272, percentile_of="volume_ratio_20"),
         # ---- implied against realised
         _f("atm_iv", "implied_vs_realised", "option", O, "at-the-money implied volatility of the near expiry", 0),
         _f("iv_rv_ratio", "implied_vs_realised", "option", O, "atm_iv / rv_20", 20),
@@ -118,6 +133,10 @@ def default_registry() -> Registry:
         _f("iv_chg_5d", "implied_vs_realised", "option", O, "atm_iv - atm_iv 5 sessions ago", 5),
         _f("iv_pctile", "implied_vs_realised", "option", O, "percentile of atm_iv in its own trailing 252 sessions", 252, percentile_of="atm_iv"),
         _f("term_slope", "implied_vs_realised", "option", O, "next-expiry atm_iv / near-expiry atm_iv - 1", 0),
+        _f("iv_rv_ratio_pctile", "implied_vs_realised", "option", O, "percentile of iv_rv_ratio in its own trailing 252 sessions", 272, percentile_of="iv_rv_ratio"),
+        _f("iv_minus_rv_pctile", "implied_vs_realised", "option", O, "percentile of iv_minus_rv in its own trailing 252 sessions", 272, percentile_of="iv_minus_rv"),
+        _f("iv_chg_5d_pctile", "implied_vs_realised", "option", O, "percentile of iv_chg_5d in its own trailing 252 sessions", 257, percentile_of="iv_chg_5d"),
+        _f("term_slope_pctile", "implied_vs_realised", "option", O, "percentile of term_slope in its own trailing 252 sessions", 252, percentile_of="term_slope"),
         # ---- option positioning
         _f("skew", "positioning", "option", O, "IV of the put one s.d. below the forward minus IV of the call one s.d. above", 0),
         _f("pcr_oi", "positioning", "option", D, "put open interest / call open interest", 0),
@@ -136,6 +155,7 @@ def default_registry() -> Registry:
         # ---- market regime (same value for every instrument on a day)
         _f("nifty_ret_5d", "regime", "regime", P, "Nifty close / close 5 sessions ago - 1", 5),
         _f("nifty_rv_20", "regime", "regime", P, "Nifty rv_20", 20),
+        _f("nifty_rv_20_pctile", "regime", "regime", P, "percentile of Nifty rv_20 in its own trailing 252 sessions", 272, percentile_of="nifty_rv_20"),
         _f("nifty_dist_ma200", "regime", "regime", P, "Nifty close / 200-session mean - 1", 200),
         _f("vix_pctile", "regime", "regime", P, "percentile of India VIX in its trailing 252 sessions", 252),
         _f("vix_chg_5d", "regime", "regime", P, "India VIX / its value 5 sessions ago - 1", 5),
@@ -147,6 +167,10 @@ def default_registry() -> Registry:
         _f("fii_idx_fut_ratio_chg_5d", "flows", "flow", PO, "fii_idx_fut_ratio - its value 5 sessions ago", 5),
         _f("fii_idx_opt_tilt", "flows", "flow", PO, "FII index options (call long + put short - put long - call short) / total", 0),
         _f("fii_net_5d_pctile", "flows", "flow", FL, "percentile of the 5-session FII net cash sum in its trailing 252 sessions", 257, percentile_of="fii_net_5d_z"),
+        _f("dii_net_5d_pctile", "flows", "flow", FL, "percentile of the 5-session DII net cash sum in its trailing 252 sessions", 257, percentile_of="dii_net_5d_z"),
+        _f("fii_idx_fut_ratio_pctile", "flows", "flow", PO, "percentile of fii_idx_fut_ratio in its trailing 252 sessions", 252, percentile_of="fii_idx_fut_ratio"),
+        _f("fii_idx_fut_ratio_chg_5d_pctile", "flows", "flow", PO, "percentile of fii_idx_fut_ratio_chg_5d in its trailing 252 sessions", 257, percentile_of="fii_idx_fut_ratio_chg_5d"),
+        _f("fii_idx_opt_tilt_pctile", "flows", "flow", PO, "percentile of fii_idx_opt_tilt in its trailing 252 sessions", 252, percentile_of="fii_idx_opt_tilt"),
         # ---- intraday state at 14:30 (indices only; not valid for an evening decision)
         _f("intraday_ret_1430", "intraday", "intraday", "intraday", "price at 14:30 / today's open - 1", 0, decision_times=("1430",)),
         _f("intraday_range_1430", "intraday", "intraday", "intraday", "(high - low up to 14:30) / today's open", 0, decision_times=("1430",)),

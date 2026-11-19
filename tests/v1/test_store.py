@@ -310,6 +310,13 @@ def test_intraday_freshness(tmp_path):
     (folder / "2026-08-25.parquet").write_bytes(b"")
     assert check_freshness(folder, "2026-08-28", 7) == []
     assert check_freshness(folder, "2026-09-10", 7)[0].check == "intraday_stale"
+    chain = tmp_path / "chain"; chain.mkdir()                                  # option-chain files are named by expiry
+    pd.DataFrame({"timestamp": pd.to_datetime(["2026-07-01 15:15", "2026-07-02 15:25"])}).to_parquet(chain / "2026-12-31.parquet")
+    stale = check_freshness(chain, "2026-09-01", 7)
+    assert stale[0].check == "intraday_stale" and "2026-07-02" in stale[0].detail   # a far expiry's name is not its data's date
+    bars = tmp_path / "nifty_5m.parquet"
+    pd.DataFrame({"timestamp": pd.to_datetime(["2026-08-31 15:25"]).tz_localize("Asia/Kolkata")}).to_parquet(bars)
+    assert check_freshness(bars, "2026-09-01", 7) == [] and check_freshness(tmp_path / "none.parquet", "2026-09-01", 7)[0].check == "intraday_missing"
 
 
 # ---- option quotes and lot sizes (D-5) -----------------------------------------------------------------------

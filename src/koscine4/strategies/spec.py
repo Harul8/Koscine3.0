@@ -20,6 +20,12 @@ DIRECTIONAL = ("debit_spread",)                   # a structure that only pays i
 BOOKS = ("index", "stock")
 DECISION_TO_ENTRY = {"evening": "next_open", "1430": "1515"}     # the two supported timings (decision A5)
 INDEX_BOOK = ("NIFTY", "BANKNIFTY")
+EXPIRY_KINDS = ("weekly", "monthly", "any")      # IX-7: "any" only for the stock book, whose options are all monthly
+# DR-7: the neutral structures direction may tilt, and the strike settings a tilt may change
+TILT_STRIKE_KEYS = {
+    "iron_condor": {"put_short_otm_pct", "call_short_otm_pct", "put_wing_pct", "call_wing_pct"},
+    "long_strangle": {"put_otm_pct", "call_otm_pct"},
+}
 
 
 class SpecError(ValueError):
@@ -36,7 +42,7 @@ class StrategySpec:
     instruments: tuple[str, ...] = ()           # empty for the stock book = the month's list
     side: str = ""                              # spreads: "put", "call" or "model" (from a direction model)
     family: str = ""                            # runs of one idea share a family; variants are counted per family
-    expiry: Mapping[str, Any] = field(default_factory=dict)      # min_dte, max_dte (calendar days)
+    expiry: Mapping[str, Any] = field(default_factory=dict)      # min_dte, max_dte (calendar days), kind (IX-7)
     strikes: Mapping[str, Any] = field(default_factory=dict)     # otm_pct, short_otm_pct, wing_pct, max_snap_pct
     exit: Mapping[str, Any] = field(default_factory=dict)        # max_hold_sessions, target_pct, stop_pct, safety_days
     liquidity: Mapping[str, Any] = field(default_factory=dict)   # min_volume, min_open_interest, min_premium
@@ -45,6 +51,7 @@ class StrategySpec:
     selection: Mapping[str, Any] = field(default_factory=dict)   # weekly_cap, max_per_day
     allow_across_results: bool = False          # R-8
     direction_model: str = ""                   # S-12: the direction model this strategy depends on, if any
+    tilt: Mapping[str, Any] = field(default_factory=dict)        # DR-7: model, min_confidence, up {strikes}, down {strikes}
     notes: str = ""
 
     @property
@@ -57,6 +64,7 @@ class StrategySpec:
         d["filters"] = [dict(f) for f in self.filters]
         for k in ("expiry", "strikes", "exit", "liquidity", "score", "selection"):
             d[k] = dict(d[k])
+        d["tilt"] = {k: dict(v) if isinstance(v, Mapping) else v for k, v in dict(self.tilt).items()}
         return d
 
     def fingerprint(self) -> str:
@@ -90,7 +98,37 @@ def validate(spec: StrategySpec) -> StrategySpec:
         raise SpecError("Score must state its source and a threshold fixed before testing (S-5, S-6).")
     if "min_dte" not in spec.expiry:
         raise SpecError("Expiry rule must state min_dte.")
+    kind = spec.expiry.get("kind", "any")
+    if kind not in EXPIRY_KINDS:
+        raise SpecError(f"expiry.kind must be one of {EXPIRY_KINDS}.")
+    if spec.book == "index" and kind == "any":
+        raise SpecError("An index strategy must state expiry.kind = 'weekly' or 'monthly'; the two are tested as different instruments (IX-7).")
+    if spec.tilt:
+        _validate_tilt(spec)
     return spec
+
+
+def _validate_tilt(spec: StrategySpec) -> None:
+    """DR-7: a direction forecast may only choose between two neutral variants of the same structure."""
+    t = dict(spec.tilt)
+    allowed = TILT_STRIKE_KEYS.get(spec.structure)
+    if allowed is None:
+        raise SpecError(f"Direction may only tilt a neutral structure ({', '.join(TILT_STRIKE_KEYS)}); "
+                        f"'{spec.structure}' is not one (DR-7).")
+    extra = set(t) - {"model", "min_confidence", "up", "down"}
+    if extra:
+        raise SpecError(f"Unknown fields in [tilt]: {sorted(extra)}")
+    if not t.get("model"):
+        raise SpecError("[tilt] must name the direction model whose forecast it uses.")
+    if not 0.5 < float(t.get("min_confidence", 0.55)) < 1.0:
+        raise SpecError("[tilt] min_confidence must be above 0.5 and below 1.")
+    for variant in ("up", "down"):
+        moves = t.get(variant)
+        if not isinstance(moves, Mapping) or not moves:
+            raise SpecError(f"[tilt.{variant}] must give the strikes of that variant.")
+        bad = set(moves) - allowed
+        if bad:
+            raise SpecError(f"[tilt.{variant}] may only move strikes ({', '.join(sorted(allowed))}); it also sets {sorted(bad)} (DR-7).")
 
 
 def from_dict(d: Mapping[str, Any]) -> StrategySpec:

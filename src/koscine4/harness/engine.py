@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from koscine4.harness.costs import order_cost, rates_on, with_slippage
-from koscine4.harness.market import MarketData
+from koscine4.harness.costs import exercise_cost, order_cost, rates_on, with_slippage
+from koscine4.harness.market import MarketData, TrackRecord
 from koscine4.selection.select import BookState, select
 from koscine4.strategies.base import Candidate, PositionState, Strategy, _row
 from koscine4.strategies.structures import BUY, max_loss_per_share
@@ -29,6 +29,7 @@ from koscine4.strategies.structures import BUY, max_loss_per_share
 TRADE_COLUMNS = [
     "strategy", "book", "instrument", "decision_date", "entry_date", "exit_date", "sessions_held", "exit_reason",
     "legs", "lot", "entry_prices", "exit_prices", "score", "entry_trust", "exit_trust", "max_loss_per_share", "expiry",
+    "expiry_kind", "expected_result_pct",
 ]
 
 
@@ -85,13 +86,18 @@ def _mark(data: MarketData, instrument: str, leg, date, when: str):
 
 
 def run_engine(strategy: Strategy, data: MarketData, start, end, limits: dict, groups: dict | None = None,
-               apply_weekly_cap: bool = True) -> RunResult:
+               apply_weekly_cap: bool = True, slippage_pct: float | None = None) -> RunResult:
+    """`slippage_pct` prices each closed trade for the strategy's running track record (S-5); the trades
+    themselves are stored without slippage, as before."""
     spec = strategy.spec
     evening = spec.decision_time == "evening"
     entry_when, mark_when = ("open", "close") if evening else ("1515", "1515")
     min_volume = float(spec.liquidity["min_volume"])
     max_per_day = spec.selection.get("max_per_day")
     days = data.calendar.between(start, end)
+    costs = dict(data.settings.section("costs"))
+    slippage = float(data.settings.section("harness")["default_slippage_pct"]) if slippage_pct is None else float(slippage_pct)
+    track = data.track_records[spec.name] = TrackRecord()          # this run's own record, known to its later decisions
     state = BookState()
     # Outcome-building runs set allow_overlap: every signal is taken, even while an earlier trade on the
     # same instrument is open, so each decision day gets a result. Trading runs never set it (S-8).
@@ -145,14 +151,19 @@ def run_engine(strategy: Strategy, data: MarketData, start, end, limits: dict, g
                     continue
                 reason = action.reason
             trusts = sorted({m[1] for m in marks})
+            legs = [(str(l.expiry.date()), l.strike, l.opt_type, l.side) for l in pos.cand.legs]
+            exit_prices = [float(m[0]) for m in marks]
             trades.append({
                 "strategy": spec.name, "book": spec.book, "instrument": instrument, "decision_date": pos.cand.decision_date,
                 "entry_date": pos.entry_date, "exit_date": date, "sessions_held": pos.sessions_held, "exit_reason": reason,
-                "legs": [(str(l.expiry.date()), l.strike, l.opt_type, l.side) for l in pos.cand.legs], "lot": pos.cand.lot,
-                "entry_prices": list(pos.entry_prices), "exit_prices": [float(m[0]) for m in marks], "score": pos.cand.score,
+                "legs": legs, "lot": pos.cand.lot,
+                "entry_prices": list(pos.entry_prices), "exit_prices": exit_prices, "score": pos.cand.score,
                 "entry_trust": pos.entry_trust, "exit_trust": trusts[0] if len(trusts) == 1 else "mixed",
                 "max_loss_per_share": pos.risk, "expiry": min(l.expiry for l in pos.cand.legs),
+                "expiry_kind": pos.cand.reasons.get("expiry_kind", ""), "expected_result_pct": pos.cand.expected_result_pct,
             })
+            priced = price_one(legs, pos.entry_prices, exit_prices, pos.cand.lot, pos.entry_date, date, reason, costs, slippage)
+            track.add(date, pos.cand.score, priced["result_pct"])
             del positions[key]
             state.open_instruments.discard(instrument)
 
@@ -186,28 +197,42 @@ def run_engine(strategy: Strategy, data: MarketData, start, end, limits: dict, g
     return RunResult(pd.DataFrame(trades, columns=TRADE_COLUMNS), skips, list(positions.values()))
 
 
+def price_one(legs, entry_prices, exit_prices, lot: float, entry_date, exit_date, exit_reason: str, costs: dict,
+              slippage_pct: float) -> dict:
+    """Money for one trade at one slippage level. `legs` are (expiry, strike, type, side) tuples.
+
+    A trade that reached expiry ("expired") is settled by the exchange at intrinsic value: there is
+    no closing order, so no slippage and no order costs on the way out, but a bought option that
+    finishes in the money pays securities transaction tax on exercise.
+    """
+    sides = [l[3] for l in legs]
+    settled = exit_reason == "expired"
+    entry = [with_slippage(p, s == BUY, slippage_pct) for p, s in zip(entry_prices, sides)]
+    exit_ = list(exit_prices) if settled else [with_slippage(p, s != BUY, slippage_pct) for p, s in zip(exit_prices, sides)]
+    gross = sum(s * (x - e) for s, e, x in zip(sides, entry, exit_)) * lot
+    r_in, r_out = rates_on(costs, entry_date), rates_on(costs, exit_date)
+    cost = sum(order_cost(e, lot, s == BUY, r_in) for e, s in zip(entry, sides))
+    if settled:
+        cost += sum(exercise_cost(x, lot, r_out) for x, s in zip(exit_, sides) if s == BUY and x > 0)
+    else:
+        cost += sum(order_cost(x, lot, s != BUY, r_out) for x, s in zip(exit_, sides) if x > 0)
+    as_legs = [type("L", (), {"expiry": l[0], "strike": l[1], "opt_type": l[2], "side": l[3]})() for l in legs]
+    risk = max_loss_per_share(as_legs, entry) * lot
+    pnl = gross - cost
+    return {"pnl": pnl, "cost": cost, "risk": risk, "turnover": sum(e + x for e, x in zip(entry_prices, exit_prices)) * lot,
+            "result_pct": 100.0 * pnl / risk if risk > 0 else float("nan")}
+
+
 def price_trades(trades: pd.DataFrame, costs: dict, slippage_pct: float) -> pd.DataFrame:
     """Add the money columns for one slippage level: per-lot profit after costs, and as a share of maximum loss."""
     out = trades.copy()
-    pnl, cost_col, risk_col, turn = [], [], [], []
-    for t in trades.itertuples(index=False):
-        sides = [l[3] for l in t.legs]
-        entry = [with_slippage(p, s == BUY, slippage_pct) for p, s in zip(t.entry_prices, sides)]
-        exit_ = [with_slippage(p, s != BUY, slippage_pct) for p, s in zip(t.exit_prices, sides)]
-        gross = sum(s * (x - e) for s, e, x in zip(sides, entry, exit_)) * t.lot
-        r_in, r_out = rates_on(costs, t.entry_date), rates_on(costs, t.exit_date)
-        cost = sum(order_cost(e, t.lot, s == BUY, r_in) for e, s in zip(entry, sides))
-        cost += sum(order_cost(x, t.lot, s != BUY, r_out) for x, s in zip(exit_, sides) if x > 0)
-        legs = [type("L", (), {"expiry": l[0], "strike": l[1], "opt_type": l[2], "side": l[3]})() for l in t.legs]
-        risk = max_loss_per_share(legs, entry) * t.lot
-        pnl.append(gross - cost)
-        cost_col.append(cost)
-        risk_col.append(risk)
-        turn.append(sum(e + x for e, x in zip(t.entry_prices, t.exit_prices)) * t.lot)
-    out["pnl_per_lot"] = pnl
-    out["costs_per_lot"] = cost_col
-    out["max_loss_per_lot"] = risk_col
-    out["turnover_per_lot"] = turn
-    out["result_pct"] = [100.0 * p / r if r > 0 else float("nan") for p, r in zip(pnl, risk_col)]
+    reasons = trades["exit_reason"] if "exit_reason" in trades.columns else pd.Series([""] * len(trades), index=trades.index)
+    priced = [price_one(t.legs, t.entry_prices, t.exit_prices, t.lot, t.entry_date, t.exit_date, r, costs, slippage_pct)
+              for t, r in zip(trades.itertuples(index=False), reasons)]
+    out["pnl_per_lot"] = [p["pnl"] for p in priced]
+    out["costs_per_lot"] = [p["cost"] for p in priced]
+    out["max_loss_per_lot"] = [p["risk"] for p in priced]
+    out["turnover_per_lot"] = [p["turnover"] for p in priced]
+    out["result_pct"] = [p["result_pct"] for p in priced]
     out["slippage_pct"] = slippage_pct
     return out

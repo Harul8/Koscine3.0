@@ -83,12 +83,15 @@ def summarise(trades: pd.DataFrame, skips: list[dict], costs: dict, slippage_pct
     p = price_trades(trades, costs, slippage_pct)
     report = {"slippage_pct": slippage_pct, **_block(p)}
     if p.empty:
-        report.update({"by_year": {}, "by_trust": {}, "by_period": {}, "by_exit_reason": {}, "worst_run": worst_run(pd.Series(dtype=float)),
-                       "break_even_slippage_pct": float("nan"), "at_twice_slippage": {}, "skipped": _skips(skips)})
+        report.update({"by_year": {}, "by_trust": {}, "by_expiry_kind": {}, "by_period": {}, "by_exit_reason": {},
+                       "worst_run": worst_run(pd.Series(dtype=float)), "break_even_slippage_pct": float("nan"),
+                       "at_twice_slippage": {}, "skipped": _skips(skips)})
         return report
     p = p.sort_values("exit_date")
     report["by_year"] = {int(y): _block(g) for y, g in p.groupby(p["entry_date"].dt.year)}
     report["by_trust"] = {str(k): _block(g) for k, g in p.groupby("entry_trust")}                 # V-6: shown separately
+    kinds = p["expiry_kind"] if "expiry_kind" in p.columns else pd.Series("", index=p.index)
+    report["by_expiry_kind"] = {str(k): _block(g) for k, g in p.groupby(kinds.replace("", "unknown"))}   # IX-7: never pooled silently
     edges = np.array_split(np.sort(p["entry_date"].dt.year.unique()), min(periods, p["entry_date"].dt.year.nunique()))
     report["by_period"] = {f"{int(e[0])}-{int(e[-1])}": _block(p[p["entry_date"].dt.year.isin(e)]) for e in edges if len(e)}
     report["by_exit_reason"] = {str(k): int(v) for k, v in p["exit_reason"].value_counts().items()}
@@ -123,7 +126,7 @@ def to_markdown(name: str, report: dict, meta: dict) -> str:
               f"| Break-even slippage, % per leg | {f(report.get('break_even_slippage_pct'))} |",
               f"| Mean result at twice the slippage | {f(report.get('at_twice_slippage', {}).get('mean_result_pct'))} |",
               f"| Skipped at entry | {report['skipped']['at_entry']} |", ""]
-    for title, key in (("By year", "by_year"), ("By period", "by_period"), ("By fill quality", "by_trust")):
+    for title, key in (("By year", "by_year"), ("By period", "by_period"), ("By fill quality", "by_trust"), ("By expiry kind", "by_expiry_kind")):
         rows = report.get(key) or {}
         if rows:
             lines += [f"## {title}", "", "| | Trades | Independent | Mean result % | Win rate % |", "|---|---|---|---|---|"]

@@ -12,6 +12,8 @@ import synthetic as S
 from koscine4.api.routes import trade_list
 from koscine4.daily.run import DailyRunError, run as daily_run, to_markdown
 from koscine4.harness import records
+from koscine4.harness.engine import price_trades
+from koscine4.harness.gate import load_trades
 from koscine4.harness.run import run as harness_run
 from koscine4.ledger.book import Ledger, LedgerError, feature_drift
 from koscine4.settings import load_settings, project_root
@@ -26,6 +28,7 @@ structure = "long_straddle"
 decision_time = "evening"
 entry_time = "next_open"
 [expiry]
+kind = "monthly"
 min_dte = 7
 [strikes]
 max_snap_pct = 1.0
@@ -110,6 +113,12 @@ def test_the_trade_list_has_every_field_and_is_stored(fresh):
     assert trade_list(out["date"], "evening", settings) == __import__("json").loads(__import__("json").dumps(out, default=str))        # O-7: the same list
     rec = Ledger(settings).get(t["ledger_id"])
     assert rec["status"] == "recommended" and rec["mode"] == "paper" and rec["lots"] == t["lots"]                             # L-1
+    run_id = records.read_gates(settings, "t_nifty_straddle")[-1]["runs"][0]
+    gate_trades = price_trades(load_trades(settings, run_id), dict(settings.section("costs")), 1.0)
+    assert t["expected_result_inputs"]["source"] == "track_record" and t["expected_result_inputs"]["past_trades"] == len(gate_trades)
+    assert t["expected_result_pct_of_max_loss"] == pytest.approx(gate_trades["result_pct"].mean(), abs=0.01)                # S-5
+    assert t["margin_estimate_rupees"] == 0 and t["margin_inputs"]["method"].startswith("bought options only")              # R-6
+    assert "Expected result after costs" in md and "past trades" in md
 
 
 def test_a_planted_data_error_stops_the_run_before_scoring(fresh):
@@ -123,6 +132,27 @@ def test_a_planted_data_error_stops_the_run_before_scoring(fresh):
     assert not (settings.path("records") / "daily").exists()
     with pytest.raises(DailyRunError, match="Refresh the data first"):
         daily_run(S.DAYS[-1] + pd.Timedelta(days=30), "evening", settings=_with_strategy(fresh, gate=None, risk=False), paper=True, rebuild_store=False)
+
+
+def test_stale_intraday_files_stop_a_1430_list_and_are_listed_on_an_evening_one(fresh):
+    settings = _with_strategy(fresh, gate=None)
+    evening = daily_run(S.DAYS[-1], "evening", settings=settings, paper=True, write=False)
+    assert {w["check"] for w in evening["data_warnings"]} == {"intraday_missing"} and len(evening["data_warnings"]) == 4       # D-10
+    assert "Data warnings" in to_markdown(evening)
+    spec = SPEC.replace('"t_nifty_straddle"', '"t_nifty_pcs"').replace('decision_time = "evening"', 'decision_time = "1430"') \
+               .replace('entry_time = "next_open"', 'entry_time = "1515"').replace('structure = "long_straddle"', 'structure = "credit_spread"\nside = "put"') \
+               .replace("max_snap_pct = 1.0", "short_otm_pct = 2.0\nwing_pct = 2.0\nmax_snap_pct = 1.0")
+    (settings.root / "configs" / "strategies" / "t_nifty_pcs.toml").write_text(spec, encoding="utf-8")
+    records.record_gate(settings, "t_nifty_pcs", 2, "pass", [harness_run("t_nifty_pcs", S.DAYS[100], S.DAYS[200], settings=settings)["run_id"]])
+    with pytest.raises(DailyRunError, match="Intraday data for NIFTY is not current"):
+        daily_run(S.DAYS[-1], "1430", settings=settings, paper=True, write=False, rebuild_store=False)
+    folder = settings.path("intraday")
+    (folder / "nifty_option_chain_5m").mkdir(parents=True)
+    stamp = pd.to_datetime([f"{S.DAYS[-2].date()} 15:15"])
+    pd.DataFrame({"timestamp": stamp}).to_parquet(folder / "nifty_option_chain_5m" / f"{(S.DAYS[-1] + pd.Timedelta(days=30)).date()}.parquet")
+    pd.DataFrame({"timestamp": stamp, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0}).to_parquet(folder / "nifty_5m.parquet")
+    out = daily_run(S.DAYS[-1], "1430", settings=settings, paper=True, write=False, rebuild_store=False)
+    assert out["strategies_live"] == ["t_nifty_pcs"] and {w["instrument"] for w in out["data_warnings"]} == {"BANKNIFTY"}
 
 
 def test_open_trades_get_todays_exit_instruction_and_block_a_second_trade(fresh):

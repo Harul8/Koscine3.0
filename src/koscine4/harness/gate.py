@@ -15,6 +15,7 @@ import pandas as pd
 
 from koscine4.harness import records
 from koscine4.harness.engine import price_trades
+from koscine4.harness.market import TrackRecord
 from koscine4.risk import rules as risk_rules
 from koscine4.settings import Settings, load_settings
 
@@ -31,6 +32,24 @@ def load_trades(settings: Settings, run_id: str) -> pd.DataFrame:
     for col in ("legs", "entry_prices", "exit_prices"):
         t[col] = t[col].map(json.loads)
     return t
+
+
+def track_record(settings: Settings, strategy: str) -> TrackRecord | None:
+    """S-5: the closed trades of the runs behind the strategy's latest gate 2 pass, priced at each run's own
+    slippage. A trade that appears in more than one of those runs counts once. None without a pass on record."""
+    passes = [r for r in records.read_gates(settings, strategy) if r["gate"] == 2 and r["decision"] == "pass"]
+    if not passes:
+        return None
+    frames = []
+    for rid in passes[-1]["runs"]:
+        if not (settings.path("runs") / rid / "trades.parquet").exists():
+            continue
+        slippage = float(load_report(settings, rid)["report"]["slippage_pct"])
+        frames.append(price_trades(load_trades(settings, rid), dict(settings.section("costs")), slippage))
+    if not frames:
+        return None
+    t = pd.concat(frames, ignore_index=True).drop_duplicates(["instrument", "entry_date", "exit_date"])
+    return TrackRecord.from_frame(t)
 
 
 def check(settings: Settings, run_id: str, sealed_run: str | None = None, baseline_run: str | None = None) -> dict:

@@ -6,6 +6,8 @@ if asked for anything later. The harness itself reads later bars to fill and mar
 """
 from __future__ import annotations
 
+import bisect
+import tomllib
 from dataclasses import dataclass
 
 import numpy as np
@@ -13,7 +15,7 @@ import pandas as pd
 
 from koscine4.features.registry import REGISTRY
 from koscine4.settings import Settings
-from koscine4.store.api import Store
+from koscine4.store.api import INTRADAY_CHAIN_FOLDERS, Store
 from koscine4.store.availability import Decision
 from koscine4.store.tables import PRICES_RAW, StoreError, read_table
 
@@ -25,7 +27,7 @@ class LookAheadError(RuntimeError):
 class IntradayMarks:
     """Option prices at one clock time from the 5-minute index chain files, where they exist."""
 
-    FOLDERS = {"NIFTY": "nifty_option_chain_5m", "BANKNIFTY": "banknifty_option_chain_5m"}
+    FOLDERS = INTRADAY_CHAIN_FOLDERS
 
     def __init__(self, settings: Settings, instrument: str, hhmm: str = "15:15"):
         self.table: dict[tuple, tuple[float, float]] = {}
@@ -56,6 +58,68 @@ class IntradayMarks:
         return self.table.get((pd.Timestamp(date), pd.Timestamp(expiry), float(strike), opt_type))
 
 
+class TrackRecord:
+    """A strategy's closed trades in the order they closed: exit date, score, after-cost result (S-5).
+
+    `estimate` answers with the trades known at a decision only, so the expected result of a
+    backtest candidate never uses a trade that had not closed yet.
+    """
+
+    def __init__(self):
+        self.exit_dates: list[pd.Timestamp] = []
+        self.scores: list[float] = []
+        self.results: list[float] = []
+        self._cache: dict = {}
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def add(self, exit_date, score: float, result_pct: float) -> None:
+        if result_pct != result_pct:
+            return
+        exit_date = pd.Timestamp(exit_date)
+        i = bisect.bisect_right(self.exit_dates, exit_date)
+        self.exit_dates.insert(i, exit_date)
+        self.scores.insert(i, float(score))
+        self.results.insert(i, float(result_pct))
+        self._cache.clear()
+
+    @classmethod
+    def from_frame(cls, trades: pd.DataFrame) -> "TrackRecord":
+        """From priced trades (exit_date, score, result_pct)."""
+        tr = cls()
+        for d, s, r in sorted(zip(trades["exit_date"], trades["score"], trades["result_pct"]), key=lambda x: pd.Timestamp(x[0])):
+            tr.add(d, s, r)
+        return tr
+
+    def estimate(self, visible, score: float, cfg) -> tuple[float, dict]:
+        """(expected result %, inputs) from trades that closed on or before `visible`."""
+        n_known = bisect.bisect_right(self.exit_dates, pd.Timestamp(visible)) if visible is not None else 0
+        window, min_trades = int(cfg["window_trades"]), int(cfg["min_trades"])
+        buckets, min_bucket = int(cfg["score_bands"]), int(cfg["min_band_trades"])
+        lo = max(0, n_known - window)
+        n = n_known - lo
+        if n < min_trades:
+            return float("nan"), {"source": "track_record", "past_trades": n, "note": f"fewer than {min_trades} closed trades known"}
+        key = (lo, n_known)
+        if key not in self._cache:
+            sc, rs = np.array(self.scores[lo:n_known]), np.array(self.results[lo:n_known])
+            edges = np.quantile(sc, np.linspace(0.0, 1.0, buckets + 1)[1:-1]) if np.unique(sc).size >= buckets else None
+            bands = {}
+            if edges is not None:
+                where = np.searchsorted(edges, sc, side="right")
+                bands = {int(b): (int((where == b).sum()), float(rs[where == b].mean())) for b in np.unique(where)}
+            self._cache[key] = (edges, bands, float(rs.mean()))
+        edges, bands, overall = self._cache[key]
+        inputs = {"source": "track_record", "past_trades": n, "mean_of_all_pct": round(overall, 3)}
+        if edges is not None:
+            b = int(np.searchsorted(edges, score, side="right"))
+            count, mean = bands.get(b, (0, float("nan")))
+            if count >= min_bucket:
+                return mean, dict(inputs, score_band=f"{b + 1} of {buckets}", band_trades=count, band_mean_pct=round(mean, 3))
+        return overall, inputs
+
+
 class MarketData:
     """History for one run, loaded once."""
 
@@ -79,6 +143,19 @@ class MarketData:
         self.features = None if features is None else features.set_index(["date", "instrument"]).sort_index()
         ev = self.store.all_events()
         self._events = {k: v for k, v in ev.assign(known=ev["announced_on"].fillna(ev["event_date"])).groupby("instrument", sort=False)} if len(ev) else {}
+        self.track_records: dict[str, TrackRecord] = {}      # S-5: filled by the engine as trades close, or from past runs
+        self._model_targets: dict[str, bool] = {}
+
+    def model_predicts_result(self, model: str) -> bool:
+        """True if the model was trained on a structure's after-cost result as % of maximum loss (S-5)."""
+        if model not in self._model_targets:
+            path = self.settings.root / "configs" / "models" / f"{model}.toml"
+            target = {}
+            if path.exists():
+                with path.open("rb") as fh:
+                    target = tomllib.load(fh).get("target", {})
+            self._model_targets[model] = target.get("table") == "structure" and target.get("column", "result_pct") == "result_pct"
+        return self._model_targets[model]
 
     # ---- raw access for the harness (fills and marks). Not given to strategies.
     def chain(self, instrument: str, date) -> pd.DataFrame:
@@ -163,6 +240,16 @@ class MarketView:
             return float(p.at[(self.decision.date, instrument)])
         except KeyError:
             return float("nan")
+
+    def model_predicts_result(self, model: str) -> bool:
+        return self.data.model_predicts_result(model)
+
+    def expected_from_track_record(self, strategy: str, score: float) -> tuple[float, dict]:
+        """S-5: the strategy's own after-cost results known at this decision, from trades with a similar score."""
+        tr = self.data.track_records.get(strategy)
+        if tr is None:
+            return float("nan"), {"source": "track_record", "past_trades": 0, "note": "no track record loaded"}
+        return tr.estimate(self.visible, score, self.data.settings.section("expected_result"))
 
     def results_within(self, instrument: str, sessions: int) -> bool:
         """True if an announced result date falls in the next `sessions` sessions (today included at 14:30)."""

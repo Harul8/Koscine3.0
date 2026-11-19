@@ -56,6 +56,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from koscine4.api.routes import router as koscine4_router  # noqa: E402  (O-7: trade list and ledger under /v1)
+
+if koscine4_router is not None:
+    app.include_router(koscine4_router)
+
 
 _NIFTY_POLLER_PID_FILE = PROJECT_ROOT / "locks" / "prod_nifty_intraday" / "live_poller.pid"
 

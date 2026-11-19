@@ -95,33 +95,69 @@ gst_pct = 18.0                    # percent, on brokerage, exchange charge and S
 # Each row applies from its date until the next row.
 # Checked on 2026-11-17 against broker and press notices: the 1 Oct 2024 and 1 Apr 2026 rows.
 # The earlier rows are from memory of the Finance Acts and are NOT confirmed; they matter only for old test years.
+# stt_exercise_pct: tax on a bought option exercised in the money at expiry, % of its intrinsic value.
+# Every stt_exercise_pct value is NOT confirmed. Before June 2016 the tax was charged on the settlement
+# price rather than the intrinsic value, so the early rows understate it. The harness exits before
+# expiry, so this applies only to a trade that could not be priced on its last sessions.
 [[costs.schedule]]
 from = "2010-01-01"
 stt_sell_pct = 0.017              # percent of premium, sell side (not confirmed)
 exchange_txn_pct = 0.05           # percent of premium (not confirmed)
+stt_exercise_pct = 0.125          # not confirmed
 
 [[costs.schedule]]
 from = "2016-06-01"
 stt_sell_pct = 0.05               # not confirmed
 exchange_txn_pct = 0.05
+stt_exercise_pct = 0.125          # not confirmed
 
 [[costs.schedule]]
 from = "2023-04-01"
 stt_sell_pct = 0.0625
 exchange_txn_pct = 0.05
+stt_exercise_pct = 0.125          # not confirmed
 
 [[costs.schedule]]
 from = "2024-10-01"
 stt_sell_pct = 0.1                # confirmed
 exchange_txn_pct = 0.03503        # confirmed
+stt_exercise_pct = 0.125          # not confirmed
 
 [[costs.schedule]]
 from = "2026-04-01"
 stt_sell_pct = 0.15               # confirmed (Union Budget 2026)
 exchange_txn_pct = 0.03503
+stt_exercise_pct = 0.15           # not confirmed
+
+[expected_result]
+# S-5: a candidate whose score is not a model's after-cost result gets one from its strategy's own
+# closed trades known at the decision.
+window_trades = 500               # the most recent closed trades used
+min_trades = 30                   # with fewer known trades there is no expected result yet
+score_bands = 5                   # past trades are split into this many bands of score...
+min_band_trades = 10              # ...and a band holding fewer than this uses the mean of all
+
+[models]
+calibration_tolerance = 0.05      # M-6: each tenth of the predictions must be within this of its realised rate
+
+[margin]
+# R-6: estimated margin for a trade with a sold leg: the worst loss over a set of price and
+# volatility scenarios, in the manner of the exchange's SPAN method, plus exposure margin on the
+# sold legs. These are NOT the exchange's published parameters. Compare a few trades with a
+# broker's margin calculator and adjust. [risk_model].margin_factor is the fallback when the
+# legs' implied volatility cannot be worked out.
+price_scan_sigmas = 3.5           # price moves tested: up to this many daily standard deviations...
+margin_period_days = 2            # ...over this many days, from the legs' own implied volatility,
+min_price_scan_pct_index = 4.0    # and never less than this % of the index...
+min_price_scan_pct_stock = 7.5    # ...or of the stock
+vol_scan_fraction = 0.25          # implied volatility is also moved up and down by this fraction of itself
+extreme_move_multiple = 2.0       # an extreme move of this many price scans...
+extreme_move_cover = 0.35         # ...counts at this share of its loss
+exposure_pct_index = 2.0          # exposure margin, % of the sold legs' notional value: index options
+exposure_pct_stock = 3.5          # stock options
 
 [risk_model]
-margin_factor = 1.25              # R-6: estimated margin for a spread = its maximum loss x this. An estimate, not the exchange figure.
+margin_factor = 1.25              # R-6 fallback: margin = maximum loss x this, when the [margin] scenario estimate cannot be made
 min_sessions_to_expiry_at_entry = 2
 
 [ledger]

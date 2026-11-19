@@ -4,6 +4,9 @@ Per order: brokerage. On premium turnover: exchange transaction charge and SEBI 
 securities transaction tax on the sell side; stamp duty on the buy side. GST applies to
 brokerage, the exchange charge and the SEBI fee. Rates that changed over time come from the
 dated schedule in the settings file, so a 2015 trade is charged 2015 rates.
+
+A bought option held to expiry and exercised in the money pays securities transaction tax on
+its intrinsic value instead of a closing order's costs (`exercise_cost`).
 """
 from __future__ import annotations
 
@@ -42,6 +45,14 @@ def order_cost(price: float, quantity: float, is_buy: bool, rates: Mapping) -> f
     stamp = turnover * float(rates["stamp_buy_pct"]) / 100.0 if is_buy else 0.0
     gst = (brokerage + exchange + sebi) * float(rates["gst_pct"]) / 100.0
     return brokerage + exchange + sebi + stt + stamp + gst
+
+
+def exercise_cost(intrinsic: float, quantity: float, rates: Mapping) -> float:
+    """Tax in rupees on a bought option exercised at expiry: securities transaction tax on its intrinsic
+    value. There is no order, so no brokerage, exchange charge or stamp duty."""
+    if "stt_exercise_pct" not in rates:
+        raise KeyError("Cost setting 'stt_exercise_pct' is missing; it is needed for a trade held to expiry.")
+    return max(intrinsic, 0.0) * quantity * float(rates["stt_exercise_pct"]) / 100.0
 
 
 def with_slippage(price: float, is_buy: bool, slippage_pct: float) -> float:
