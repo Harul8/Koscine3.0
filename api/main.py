@@ -1046,14 +1046,16 @@ def prod2_broken_wing_signal_history(symbol: str | None = None, tier: str | None
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
-        n_completed = int((df["outcome"] != "pending").sum())
+        # win_rate's denominator is win+loss ONLY -- "pending" (forward window not complete) and
+        # "no_fill" (2026-09: window fully played out but never found a priceable day, e.g. a
+        # leg's volume never cleared MIN_VOL -- resolved, but has no ror_pct) both have no outcome
+        # to dilute it with (see gen_sell_signal_history.py and siblings).
+        n_pending = int((df["outcome"] == "pending").sum())
+        n_resolved = int(df["outcome"].isin(["win", "loss"]).sum())
         summary = {
             "n": int(len(df)),
-            "n_pending": int(len(df)) - n_completed,
-            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
-            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
-            # and siblings for why some rows can now be pending: forward window not complete).
-            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
+            "n_pending": n_pending,
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_resolved)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
@@ -1116,14 +1118,16 @@ def prod2_skew_signal_history(symbol: str | None = None, tier: str | None = None
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
-        n_completed = int((df["outcome"] != "pending").sum())
+        # win_rate's denominator is win+loss ONLY -- "pending" (forward window not complete) and
+        # "no_fill" (2026-09: window fully played out but never found a priceable day, e.g. a
+        # leg's volume never cleared MIN_VOL -- resolved, but has no ror_pct) both have no outcome
+        # to dilute it with (see gen_sell_signal_history.py and siblings).
+        n_pending = int((df["outcome"] == "pending").sum())
+        n_resolved = int(df["outcome"].isin(["win", "loss"]).sum())
         summary = {
             "n": int(len(df)),
-            "n_pending": int(len(df)) - n_completed,
-            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
-            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
-            # and siblings for why some rows can now be pending: forward window not complete).
-            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
+            "n_pending": n_pending,
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_resolved)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),
@@ -1147,14 +1151,16 @@ def prod2_sell_signal_history(symbol: str | None = None) -> dict[str, object]:
     df = df.sort_values("entry_date", ascending=False)
     summary = None
     if not df.empty:
-        n_completed = int((df["outcome"] != "pending").sum())
+        # win_rate's denominator is win+loss ONLY -- "pending" (forward window not complete) and
+        # "no_fill" (2026-09: window fully played out but never found a priceable day, e.g. a
+        # leg's volume never cleared MIN_VOL -- resolved, but has no ror_pct) both have no outcome
+        # to dilute it with (see gen_sell_signal_history.py and siblings).
+        n_pending = int((df["outcome"] == "pending").sum())
+        n_resolved = int(df["outcome"].isin(["win", "loss"]).sum())
         summary = {
             "n": int(len(df)),
-            "n_pending": int(len(df)) - n_completed,
-            # win_rate is over COMPLETED trades only -- a still-open ("pending") trade has no
-            # outcome yet and shouldn't dilute the denominator (see gen_sell_signal_history.py
-            # and siblings for why some rows can now be pending: forward window not complete).
-            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_completed)), 3),
+            "n_pending": n_pending,
+            "win_rate": round(float((df["outcome"].eq("win")).sum() / max(1, n_resolved)), 3),
             "ev_ror_pct": round(float(df["ror_pct"].mean()), 1),
             "median_ror_pct": round(float(df["ror_pct"].median()), 1),
             "worst_ror_pct": round(float(df["ror_pct"].min()), 1),

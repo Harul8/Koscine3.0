@@ -410,6 +410,17 @@ table.freeze-cols td.fz1, table.freeze-cols td.fz2, table.freeze-cols td.fz3 { b
 table.freeze-cols tr.sell-live td.fz1, table.freeze-cols tr.sell-live td.fz2, table.freeze-cols tr.sell-live td.fz3 { background: #f2f8f6; }
 table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right: 1px solid #d8dfdb; }
 
+/* Sell Signals history table only: Tier joins the frozen zone, right after Symbol -- so Symbol
+   gets a fixed width (.sh-symbol, freeze math needs it, and it's no longer the last frozen
+   column so its border-right is turned back off) and Tier gets pinned one column further right
+   (.sh-tier4, carries the border-right that used to end on Symbol). When a symbol filter hides
+   the Symbol column entirely, Tier just reuses the plain .fz3 slot instead (see allSyms in
+   App.tsx) -- it's genuinely the 3rd and last frozen column in that case. */
+table.freeze-cols th.sh-symbol, table.freeze-cols td.sh-symbol { min-width: 120px; max-width: 120px; border-right: none; }
+table.freeze-cols th.sh-tier4, table.freeze-cols td.sh-tier4 { position: sticky; left: 360px; z-index: 2; white-space: nowrap; border-right: 1px solid #d8dfdb; }
+table.freeze-cols th.sh-tier4 { z-index: 3; background: #fafbfa; }
+table.freeze-cols td.sh-tier4 { background: #ffffff; }
+
 .strategy-tag {
   display: inline-block;
   padding: 2px 8px;
@@ -729,6 +740,8 @@ tr.sell-secondary td {
   table.freeze-cols td.fz1, table.freeze-cols td.fz2, table.freeze-cols td.fz3 { background: #101815; }
   table.freeze-cols tr.sell-live td.fz1, table.freeze-cols tr.sell-live td.fz2, table.freeze-cols tr.sell-live td.fz3 { background: #17281f; }
   table.freeze-cols td.fz3, table.freeze-cols th.fz3 { border-right-color: #2c3a34; }
+  table.freeze-cols th.sh-tier4 { background: #172420; border-right-color: #2c3a34; }
+  table.freeze-cols td.sh-tier4 { background: #101815; border-right-color: #2c3a34; }
   .cash-signal-tag.breakout { background: #17281f; color: #4fd18a; }
   .cash-signal-tag.breakdown { background: #2c1717; color: #ef8080; }
   .cash-signal-tag.consolidation { background: #1f2a26; color: #9fb0aa; }

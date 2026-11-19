@@ -136,10 +136,12 @@ def implied_vol(price, S, K, T, r, is_call):
 
 
 # Optional partial-range regen: `python gen_skew_signal_history.py bw_panel.parquet 2026-07-01
-# 2026-08-31` only recomputes entries in [ENTRY_DATE_MIN, ENTRY_DATE_MAX] and merges the result
-# into the existing CSV (rows outside that range are preserved untouched).
-ENTRY_DATE_MIN = sys.argv[2] if len(sys.argv) > 2 else None
-ENTRY_DATE_MAX = sys.argv[3] if len(sys.argv) > 3 else None
+# 2026-08-31` only recomputes SIGNALS whose signal_date falls in [SIGNAL_DATE_MIN,
+# SIGNAL_DATE_MAX] and merges the result into the existing CSV (rows outside that range are
+# preserved untouched). 2026-09, explicit user decision (no-look-ahead fix) -- see
+# gen_broken_wing_signal_history.py's identical constant for the full rationale.
+SIGNAL_DATE_MIN = sys.argv[2] if len(sys.argv) > 2 else None
+SIGNAL_DATE_MAX = sys.argv[3] if len(sys.argv) > 3 else None
 panel = pd.read_parquet(sys.argv[1])
 panel["date"] = pd.to_datetime(panel["date"]); panel["expiry"] = pd.to_datetime(panel["expiry"])
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
@@ -148,13 +150,18 @@ g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_tex
 # signals -- 4.6x below the next-weakest name (TMPV, Rs.2,820) -- not a fluke of a small sample.
 EXCLUDE_SYMBOLS = {"ANGELONE"}
 
-mk = load_market_data(columns=["date", "symbol", "atm_iv", "close"])
+mk = load_market_data(columns=["date", "symbol", "atm_iv", "close", "open"])
 mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str); mk = mk.sort_values(["symbol", "date"])
 mk["iv_ratio"] = mk.groupby("symbol")["atm_iv"].transform(lambda s: s / s.rolling(252, min_periods=60).median())
 IV = mk.set_index(["symbol", "date"])["iv_ratio"].to_dict()
-# 2026-09, explicit user decision -- see gen_broken_wing_signal_history.py's identical constant
-# for rationale: `underlying` is the ENTRY date's close, LTP needs the SIGNAL date's close.
+# 2026-09 -- see gen_broken_wing_signal_history.py's identical constant: `underlying` and
+# `signal_underlying` are now both signal_date `t`'s close (numerically the same), since the
+# whole candidate is anchored on `t` now, not entry_date. Kept as two fields for continuity.
 CLOSE = mk.set_index(["symbol", "date"])["close"].to_dict()
+# 2026-09, explicit user decision -- see gen_broken_wing_signal_history.py's identical constant:
+# once fired, the trade is entered next day at OPEN and carried/marked at OPEN every day of the
+# walk (never close). Used for exit_underlying (Exit LTP) here.
+OPEN = mk.set_index(["symbol", "date"])["open"].to_dict()
 tdays = np.array(sorted(mk["date"].unique())); tpos = {d: k for k, d in enumerate(tdays)}
 
 lot_df = pd.read_parquet(SILVER_DATA_ROOT / "lot_size.parquet", columns=["symbol", "expiry_month", "lot"])
@@ -167,45 +174,50 @@ cbar = {k: dict(zip(pd.to_datetime(g["date"]).values, zip(g["open"].values, g["c
         for k, g in panel.groupby(["symbol", "opt_type", "expiry", "strike"], sort=False)}
 
 
-def legseq(sym, ot, exp, strike, win):
+def bars_for(sym, ot, exp, strike, win):
+    """Per-day (open, close, vol) bars across the forward mark-to-market window -- used ONLY for
+    the day-walk now, never for entry pricing (entry reads the picked chain row's own `close`
+    directly, see run_tier()). See gen_broken_wing_signal_history.py's identical helper."""
     b = cbar.get((sym, ot, exp, strike))
-    if not b:
-        return None
-    e = b.get(win[0])
-    if not e or e[0] <= 0:
-        return None
-    bars = [b.get(d) for d in win]     # (open, close, vol) or None per day
-    return e[0], bars
+    return [b.get(d) for d in win] if b else None
+
+
+def _entry_date_for(t: pd.Timestamp, p: int) -> pd.Timestamp:
+    """entry_date is now a derived LABEL -- see gen_broken_wing_signal_history.py's identical
+    helper for the full rationale."""
+    if p + 1 < len(tdays):
+        return pd.Timestamp(tdays[p + 1])
+    return pd.bdate_range(start=t + pd.Timedelta(days=1), periods=1)[0]
 
 
 def run_tier(tier_id: str, wing: float) -> list[dict]:
     min_ror = TIER_MIN_ROR[tier_id]
     out = []
-    for (sym, e_date), day in panel.groupby(["symbol", "date"], sort=True):
-        e_date_str = pd.Timestamp(e_date).date().isoformat()
-        if (ENTRY_DATE_MIN and e_date_str < ENTRY_DATE_MIN) or (ENTRY_DATE_MAX and e_date_str > ENTRY_DATE_MAX):
+    for (sym, t), day in panel.groupby(["symbol", "date"], sort=True):
+        t = pd.Timestamp(t)
+        t_str = t.date().isoformat()
+        if (SIGNAL_DATE_MIN and t_str < SIGNAL_DATE_MIN) or (SIGNAL_DATE_MAX and t_str > SIGNAL_DATE_MAX):
             continue
         if sym in EXCLUDE_SYMBOLS:
             continue
-        if sym not in _universe_for(e_date):
+        if sym not in _universe_for(t):
             continue                  # same universe rule the live panel uses for this date
-        p = tpos.get(pd.Timestamp(e_date))
-        if p is None or p == 0:
+        p = tpos.get(t)
+        if p is None:
             continue
-        t = pd.Timestamp(tdays[p - 1])
         ivr = IV.get((sym, t))
-        u = day["underlying"].iloc[0]
+        u = day["underlying"].iloc[0]   # t's own close now -- see the CLOSE-dict comment above
         candidate_exps = sorted(day["expiry"].unique())
-        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - pd.Timestamp(e_date)).days >= DTE_MIN), None)
+        exp = next((e for e in candidate_exps if (pd.Timestamp(e) - t).days >= DTE_MIN), None)
         if exp is None:
             continue
         chain = day[day["expiry"] == exp]
-        dte = int((exp - pd.Timestamp(e_date)).days)
-        # win may be shorter than FWD near the end of available history -- the trade is still
-        # shown, marked "pending" below, rather than withheld until the full window exists.
-        win = [pd.Timestamp(x) for x in tdays[p: p + FWD]]
-        if not win:
-            continue   # entry is the very last day in history -- no forward data at all yet
+        dte = int((exp - t).days)
+        entry_date = _entry_date_for(t, p)
+        # win may be empty (signal just fired off the latest close, nothing beyond it exists yet)
+        # or shorter than FWD near the end of available history -- the trade is still shown,
+        # marked "pending" below, rather than withheld until the full window exists.
+        win = [pd.Timestamp(x) for x in tdays[p + 1: p + 1 + FWD]]
         lot = lot_size(sym, exp)   # needed up-front now: the OI-lots liquidity filter below
                                     # divides raw share-OI by lot size before comparing to MIN_OI_LOTS
 
@@ -225,23 +237,29 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         spe, lpe = pick("PE", u * (1 - SHORT_OTM), MIN_OI_LOTS_SELL), pick("PE", u * (1 - SHORT_OTM - wing), MIN_OI_LOTS)
         if any(x is None for x in (sce, lce, spe, lpe)):
             continue
-        if sce["open"] < 3 or spe["open"] < 3 or sce["vol"] < MIN_VOL or spe["vol"] < MIN_VOL:
+        if sce["close"] < 3 or spe["close"] < 3 or sce["vol"] < MIN_VOL or spe["vol"] < MIN_VOL:
             continue
 
+        # IV back-out and entry premium both read t's own chain close now -- no more open price,
+        # no more day-walk lookup for entry (see the no-look-ahead fix note on SIGNAL_DATE_MIN/MAX
+        # above).
         T = dte / 365.0
-        ce_iv = implied_vol(float(sce["open"]), u, float(sce["strike"]), T, R, True)
-        pe_iv = implied_vol(float(spe["open"]), u, float(spe["strike"]), T, R, False)
+        ce_iv = implied_vol(float(sce["close"]), u, float(sce["strike"]), T, R, True)
+        pe_iv = implied_vol(float(spe["close"]), u, float(spe["strike"]), T, R, False)
         if ce_iv is None or pe_iv is None:
             continue
         skew = ce_iv - pe_iv
         side = "CE" if skew > 0 else "PE"
         short_row, long_row, ot = (sce, lce, "CE") if side == "CE" else (spe, lpe, "PE")
 
-        seq_s = legseq(sym, ot, exp, float(short_row["strike"]), win)
-        seq_l = legseq(sym, ot, exp, float(long_row["strike"]), win)
-        if seq_s is None or seq_l is None:
+        if pd.isna(short_row["close"]) or short_row["close"] <= 0 or pd.isna(long_row["close"]) or long_row["close"] <= 0:
             continue
-        credit = seq_s[0] - seq_l[0]
+        short_bars = bars_for(sym, ot, exp, float(short_row["strike"]), win)
+        long_bars = bars_for(sym, ot, exp, float(long_row["strike"]), win)
+        if short_bars is None or long_bars is None:
+            continue
+        short_close, long_close = float(short_row["close"]), float(long_row["close"])
+        credit = short_close - long_close
         width = abs(float(long_row["strike"]) - float(short_row["strike"]))
         risk = width - credit
         if credit <= 0 or risk <= 0:
@@ -253,51 +271,69 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         # carried through to the cross-tier fallback pass below (FALLBACK_MIN_ROR).
 
         vals, dd, exited_early = [], 0.0, False
-        leg_closes = []   # (short_close, long_close) per kept day, parallel to `vals` -- lets
-                          # the exit row show the ACTUAL per-leg closing premiums exit_value was
-                          # computed from, not just the aggregate.
+        leg_opens = []    # (short_open, long_open) per kept day, parallel to `vals` -- lets the
+                          # exit row show the ACTUAL per-leg OPEN premiums exit_value was computed
+                          # from, not just the aggregate. 2026-09, explicit user decision: once
+                          # entered (next day's open), the position is carried/marked at OPEN
+                          # prices every day of the walk, never close.
         exit_days = []    # win[i] per kept day, parallel to `vals` -- for the exit-day underlying (LTP) lookup below.
         for i in range(len(win)):
-            sb, lb = seq_s[1][i], seq_l[1][i]
+            sb, lb = short_bars[i], long_bars[i]
             if not (sb is None or lb is None or sb[2] < MIN_VOL or lb[2] < MIN_VOL):
-                value = sb[1] - lb[1]
+                value = sb[0] - lb[0]
                 value = max(0.0, min(width, value))
                 upnl = credit - value
                 vals.append(value)
-                leg_closes.append((sb[1], lb[1]))
+                leg_opens.append((sb[0], lb[0]))
                 exit_days.append(win[i])
                 dd = min(dd, upnl)
             if (exp - win[i]).days <= SAFE_DTE:
                 exited_early = True
                 break
-        if not vals:
-            continue
         # complete = outcome is actually FINAL; otherwise the trade is still genuinely open (win
-        # just hasn't reached FWD days yet) -- but its PnL is still shown, mark-to-market as of
-        # the latest available day, same as a real broker P&L screen for an open position.
-        # `complete` gates ONLY the `outcome` label (win/loss vs pending), never pnl/ror_pct.
+        # just hasn't reached FWD days yet, or hasn't even started -- a signal fired off the
+        # latest available close has an EMPTY win/vals until the next day's data lands) -- but its
+        # PnL is shown, mark-to-market as of the latest available day, same as a real broker P&L
+        # screen for an open position. `complete` gates ONLY the `outcome` label, never pnl/ror_pct.
         complete = exited_early or (len(win) == FWD)
-        exit_value = vals[-1]
-        pnl = round(credit - exit_value, 2)
-        # raw (unclamped) per-leg exit premiums -- can differ slightly from the [0,width]-clamped
-        # exit_value above on a rare stale/illiquid print, same as entry's sell/buy_premium vs
-        # credit already can.
-        exit_sell_premium, exit_buy_premium = round(leg_closes[-1][0], 2), round(leg_closes[-1][1], 2)
-        exit_underlying_raw = CLOSE.get((sym, exit_days[-1]))
-        exit_underlying = round(float(exit_underlying_raw), 1) if exit_underlying_raw is not None and pd.notna(exit_underlying_raw) else None
+        if not vals:
+            # win was empty (brand-new signal, no forward day exists yet -- genuinely still
+            # pending) OR the window fully played out (or force-exited) without ever finding a
+            # single valid day (e.g. a leg's volume never cleared MIN_VOL) -- that second case is
+            # RESOLVED, just unpriceable, so it gets its own terminal state instead of sitting as
+            # "pending" forever (2026-09, discovered while verifying the no-look-ahead fix).
+            exit_value = exit_sell_premium = exit_buy_premium = exit_underlying = None
+            pnl = pnl_per_lot = ror_pct = max_dd_pct = None
+            outcome = "no_fill" if complete else "pending"
+        else:
+            exit_value = vals[-1]
+            pnl = round(credit - exit_value, 2)
+            # raw (unclamped) per-leg exit premiums -- can differ slightly from the [0,width]-clamped
+            # exit_value above on a rare stale/illiquid print, same as entry's sell/buy_premium vs
+            # credit already can.
+            exit_sell_premium, exit_buy_premium = round(leg_opens[-1][0], 2), round(leg_opens[-1][1], 2)
+            exit_underlying_raw = OPEN.get((sym, exit_days[-1]))
+            exit_underlying = round(float(exit_underlying_raw), 1) if exit_underlying_raw is not None and pd.notna(exit_underlying_raw) else None
+            pnl_per_lot = round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None
+            ror_pct = round(pnl / risk * 100, 1)
+            max_dd_pct = round(dd / risk * 100, 1)
+            outcome = ("win" if pnl > 0 else "loss") if complete else "pending"
         max_profit_per_lot = credit * lot if lot is not None and pd.notna(lot) else None
 
         # "Buy PnL" hedge analysis -- see gen_broken_wing_signal_history.py's identical block for
         # the full rationale. Skew only sells one side already (`side`/`short_row`), so the hedge
-        # is simply the opposite type at that SAME short strike.
+        # is simply the opposite type at that SAME short strike, entered at ENTRY DATE's own open
+        # (2026-09, explicit user decision) and peak-searched across OPENS for the walk. Empty
+        # `win` leaves this None, same as the rest of the outcome columns.
         buy_ot = "PE" if side == "CE" else "CE"
         buy_strike = float(short_row["strike"])
-        buy_seq = legseq(sym, buy_ot, exp, buy_strike, win)
+        buy_bars = bars_for(sym, buy_ot, exp, buy_strike, win) if win else None
         buy_pnl_per_lot = None
-        if buy_seq is not None and buy_seq[0] > 0:
-            buy_valid_closes = [b[1] for b in buy_seq[1] if b is not None and b[2] >= MIN_VOL]
-            if buy_valid_closes and lot is not None and pd.notna(lot):
-                buy_pnl_per_lot = round((max(buy_valid_closes) - buy_seq[0]) * lot, 1)
+        if buy_bars and buy_bars[0] is not None and buy_bars[0][0] > 0:
+            buy_entry_open = buy_bars[0][0]
+            buy_valid_opens = [b[0] for b in buy_bars if b is not None and b[2] >= MIN_VOL]
+            if buy_valid_opens and lot is not None and pd.notna(lot):
+                buy_pnl_per_lot = round((max(buy_valid_opens) - buy_entry_open) * lot, 1)
 
         def oi_lots(row):
             v = row.get("oi")
@@ -308,14 +344,14 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
         signal_underlying = CLOSE.get((sym, t))
         out.append({
             "tier": tier_id, "symbol": sym, "group": g2.get(sym, "C_top50oi"), "signal_date": t.date().isoformat(),
-            "entry_date": pd.Timestamp(e_date).date().isoformat(),
+            "entry_date": entry_date.date().isoformat(),
             "expiry": exp.date().isoformat(), "dte": dte, "underlying": round(u, 1),
             "signal_underlying": round(float(signal_underlying), 1) if signal_underlying is not None and pd.notna(signal_underlying) else None,
             "iv_ratio": round(float(ivr), 2) if ivr is not None and pd.notna(ivr) else None,
             "side": side, "ce_iv": round(ce_iv, 3), "pe_iv": round(pe_iv, 3), "skew": round(skew, 3),
             "short_strike": float(short_row["strike"]), "long_strike": float(long_row["strike"]),
             "oi_short": oi_lots(short_row), "oi_long": oi_lots(long_row),
-            "sell_premium": round(seq_s[0], 2), "buy_premium": round(seq_l[0], 2),
+            "sell_premium": round(short_close, 2), "buy_premium": round(long_close, 2),
             "credit": round(credit, 2), "max_risk": round(risk, 2), "max_profit": round(credit, 2),
             "entry_ror_pct": round(entry_ror, 1),
             "clears_primary_bar": entry_ror > min_ror and max_profit_per_lot is not None and max_profit_per_lot >= MIN_PROFIT_PER_LOT,
@@ -323,12 +359,12 @@ def run_tier(tier_id: str, wing: float) -> list[dict]:
             "max_risk_per_lot": round(risk * lot, 1) if lot is not None and pd.notna(lot) else None,
             "max_profit_per_lot": round(credit * lot, 1) if lot is not None and pd.notna(lot) else None,
             "exit_underlying": exit_underlying,
-            "exit_value": round(exit_value, 2),
+            "exit_value": (round(exit_value, 2) if exit_value is not None else None),
             "exit_sell_premium": exit_sell_premium, "exit_buy_premium": exit_buy_premium,
-            "pnl": pnl, "pnl_per_lot": (round(pnl * lot, 1) if lot is not None and pd.notna(lot) else None),
+            "pnl": pnl, "pnl_per_lot": pnl_per_lot,
             "buy_pnl_per_lot": buy_pnl_per_lot,
-            "ror_pct": round(pnl / risk * 100, 1), "max_dd_pct": round(dd / risk * 100, 1),
-            "outcome": ("win" if pnl > 0 else "loss") if complete else "pending",
+            "ror_pct": ror_pct, "max_dd_pct": max_dd_pct,
+            "outcome": outcome,
         })
     return out
 
@@ -350,13 +386,15 @@ outdir = ROOT / "locks" / "prod_sell_strategies"; outdir.mkdir(parents=True, exi
 
 def _merge_partial(new_rows: list[dict], out_path, sort_cols):
     """Partial-range run: merge into the existing file instead of overwriting it -- keep every
-    existing row OUTSIDE [ENTRY_DATE_MIN, ENTRY_DATE_MAX] untouched, replace only rows inside it.
-    Shared by both the real-signal CSV and the raw-candidates cache below."""
+    existing row whose signal_date is OUTSIDE [SIGNAL_DATE_MIN, SIGNAL_DATE_MAX] untouched,
+    replace only rows inside it. Shared by both the real-signal CSV and the raw-candidates cache
+    below. 2026-09, explicit user decision (no-look-ahead fix) -- see
+    gen_broken_wing_signal_history.py's identical function for the full rationale."""
     new_df = pd.DataFrame(new_rows).sort_values(sort_cols) if new_rows else pd.DataFrame(new_rows)
-    if not (ENTRY_DATE_MIN or ENTRY_DATE_MAX) or not out_path.exists():
+    if not (SIGNAL_DATE_MIN or SIGNAL_DATE_MAX) or not out_path.exists():
         return new_df
     old = pd.read_parquet(out_path) if out_path.suffix == ".parquet" else pd.read_csv(out_path)
-    keep_old = old[(old["entry_date"] < (ENTRY_DATE_MIN or "0000-00-00")) | (old["entry_date"] > (ENTRY_DATE_MAX or "9999-99-99"))]
+    keep_old = old[(old["signal_date"] < (SIGNAL_DATE_MIN or "0000-00-00")) | (old["signal_date"] > (SIGNAL_DATE_MAX or "9999-99-99"))]
     return pd.concat([keep_old, new_df], ignore_index=True).sort_values(sort_cols)
 
 
@@ -388,7 +426,7 @@ df.to_csv(out_path, index=False)
 n_pending = int((df["outcome"] == "pending").sum())
 print(f"wrote {len(df)} signals (all tiers, de-duped, {n_pending} pending -- pnl/ror_pct still "
       f"shown, mark-to-market as of the latest available day) -> {outdir / 'skew_signal_history.csv'}")
-completed = df[df["outcome"] != "pending"]
+completed = df[df["outcome"].isin(["win", "loss"])]  # exclude no_fill too, not just pending
 print(completed.groupby("tier").agg(n=("pnl", "size"),
                              win=("outcome", lambda s: (s == "win").mean()),
                              ev_ror=("ror_pct", "mean"), median_ror=("ror_pct", "median"),

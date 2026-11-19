@@ -7,21 +7,28 @@ Signals and History" change (explicit user decision) for why this split exists.
 Two separate concerns, kept separate on purpose:
 
 1. FIRE today (single day only): invokes the 3 unified gen_*_signal_history.py generators with
-   ENTRY_DATE_MIN=ENTRY_DATE_MAX=today, then gen_signal_dedup_and_fallback.py scoped to the same
-   single day. Since the window is exactly one day, this can only ever ADD today's pick, never
-   touch or re-derive any past day's selection (see those scripts' _merge_partial: rows outside
-   the window are always preserved as-is). Reuses the SAME selection logic the live
-   /prod2/*_strategy endpoints use (same universe, same ROR gate, same entry-time-only tie-break)
-   -- no separate/duplicated selection logic to drift out of sync with the live panel.
+   SIGNAL_DATE_MIN=SIGNAL_DATE_MAX=today (2026-09, explicit user decision -- no-look-ahead fix:
+   this used to be ENTRY_DATE_MIN/MAX; a signal now fires the moment ITS OWN signal-day close
+   lands, priced entirely off that close -- no more waiting on the next day's data to exist), then
+   gen_signal_dedup_and_fallback.py scoped to the DERIVED entry_date (today's next business day --
+   that script's own range args are still entry_date-scoped). Since the window is exactly one day,
+   this can only ever ADD today's pick, never touch or re-derive any past day's selection (see
+   those scripts' _merge_partial: rows outside the window are always preserved as-is). Reuses the
+   SAME selection logic the live /prod2/*_strategy endpoints use (same universe, same ROR gate,
+   same signal-time-only tie-break) -- no separate/duplicated selection logic to drift out of sync
+   with the live panel.
 
 2. MARK still-open trades to market (trailing 5 trading days): for every row across all 3
    history CSVs whose entry_date falls in the trailing 5 trading days and whose outcome is still
    "pending", recompute ONLY its price walk for the ALREADY-LOGGED symbol/strike/credit (never
    re-picked, never re-scanned against other candidates) using now-available forward bars, and
-   update exit_value/pnl/pnl_per_lot/ror_pct/outcome/max_dd_pct in place. This is what keeps a
-   recent pick's actual PnL current without ever letting its identity change -- a trade fired 6+
-   trading days ago is left untouched here (it has already resolved: either it hit its 5-day
-   window or the SAFE_DTE forced-exit backstop).
+   update exit_value/pnl/pnl_per_lot/ror_pct/outcome/max_dd_pct in place. Once fired, a trade is
+   entered at entry_date's own OPEN and carried/marked at OPEN prices every day of the walk (never
+   close, 2026-09 explicit user decision) -- a row with an empty walk (entry_date's data hasn't
+   landed yet) is simply left untouched here until it does. This is what keeps a recent pick's
+   actual PnL current without ever letting its identity change -- a trade fired 6+ trading days
+   ago is left untouched here (it has already resolved: either it hit its 5-day window or the
+   SAFE_DTE forced-exit backstop).
 
 Usage:
     python analysis/append_daily_sell_signals.py bw_panel.parquet               # fires for today
@@ -64,13 +71,25 @@ def _run(args: list[str]) -> None:
         raise SystemExit(f"!! stage failed: {args}")
 
 
+def _next_bday(d: str) -> str:
+    """Next trading-day LABEL for the coordinator's entry_date-scoped range args -- naive
+    Sat/Sun-only skip (no NSE holiday calendar here), same limitation as the generators' own
+    _entry_date_for() and this file's own `cutoff` calc below. Self-corrects on the next
+    gen_signal_dedup_and_fallback.py run once the real entry_date's data exists."""
+    return pd.bdate_range(start=pd.Timestamp(d) + pd.Timedelta(days=1), periods=1)[0].strftime("%Y-%m-%d")
+
+
 def _fire_today(panel_path: str, today: str) -> None:
     """Single-day-window run of the 3 unified generators + the coordinator, scoped to `today`
-    only -- structurally cannot touch any other day (see module docstring)."""
+    only -- structurally cannot touch any other day (see module docstring). The 3 generators are
+    scoped by SIGNAL_DATE (today IS the signal date whose close just got ingested); the
+    coordinator's own range args are entry_date-scoped, so it gets the derived next-business-day
+    label instead."""
     _run(["analysis/gen_sell_signal_history.py", panel_path, today, today])
     _run(["analysis/gen_broken_wing_signal_history.py", panel_path, today, today])
     _run(["analysis/gen_skew_signal_history.py", panel_path, today, today])
-    _run(["analysis/gen_signal_dedup_and_fallback.py", today, today])
+    entry_label = _next_bday(today)
+    _run(["analysis/gen_signal_dedup_and_fallback.py", entry_label, entry_label])
 
 
 def _mark_pending(panel_path: str, today: str) -> None:
@@ -88,9 +107,11 @@ def _mark_pending(panel_path: str, today: str) -> None:
         return b.get(pd.Timestamp(d)) if b else None
 
     def legseq(sym, ot, exp, strike, win):
-        # same entry-open + per-day-close sequence lookup the gen_*_signal_history.py generators
-        # use for the "Buy PnL" hedge comparison -- kept in sync here so a re-marked pending
-        # trade's buy_pnl_per_lot doesn't go stale relative to its own exit_value.
+        # entry-open (win[0] == entry_date, since `win` here already starts at entry_date -- see
+        # below) + per-day bars -- used for the "Buy PnL" hedge comparison, kept in sync with the
+        # gen_*_signal_history.py generators' identical entry-at-entry_date's-own-open convention
+        # (2026-09, explicit user decision) so a re-marked pending trade's buy_pnl_per_lot doesn't
+        # go stale relative to its own exit_value.
         b = cbar.get((sym, ot, exp, strike))
         if not b:
             return None
@@ -99,11 +120,13 @@ def _mark_pending(panel_path: str, today: str) -> None:
             return None
         return e[0], [b.get(d) for d in win]
 
-    # underlying close, for exit_underlying (Exit LTP) -- the SIGNAL date's underlying close is
-    # already logged at fire time, but the EXIT day's close isn't known until now.
-    mk = load_market_data(columns=["date", "symbol", "close"])
+    # underlying OPEN, for exit_underlying (Exit LTP) -- 2026-09, explicit user decision: once
+    # entered, a trade is carried/marked at OPEN prices every day of the walk (never close). The
+    # SIGNAL date's underlying close is already logged at fire time; the EXIT day's open isn't
+    # known until now.
+    mk = load_market_data(columns=["date", "symbol", "open"])
     mk["date"] = pd.to_datetime(mk["date"]); mk["symbol"] = mk["symbol"].astype(str)
-    CLOSE = mk.set_index(["symbol", "date"])["close"].to_dict()
+    OPEN = mk.set_index(["symbol", "date"])["open"].to_dict()
 
     cutoff = pd.bdate_range(end=today, periods=FWD + 1)[0].strftime("%Y-%m-%d")
 
@@ -127,10 +150,11 @@ def _mark_pending(panel_path: str, today: str) -> None:
             credit = float(row["credit"])
             width = credit + float(row["max_risk"])   # width == credit + max_risk, always (max_risk = width - credit)
             vals, dd, exited_early = [], 0.0, False
-            leg_closes = []   # (sell_close, buy_close) per kept day, parallel to `vals` -- same
+            leg_opens = []    # (sell_open, buy_open) per kept day, parallel to `vals` -- same
                               # exit_sell_premium/exit_buy_premium breakdown the generators track,
                               # kept in sync here so a re-marked pending trade's Exit-value
-                              # breakdown doesn't go stale relative to its own exit_value.
+                              # breakdown doesn't go stale relative to its own exit_value. 2026-09,
+                              # explicit user decision: carried/marked at OPEN every day, never close.
             exit_days = []    # win[i] per kept day, parallel to `vals` -- for exit_underlying.
             for d in win:
                 if is_skew:
@@ -138,38 +162,49 @@ def _mark_pending(panel_path: str, today: str) -> None:
                     sb = bar(row["symbol"], side, exp, float(row["short_strike"]), d)
                     lb = bar(row["symbol"], side, exp, float(row["long_strike"]), d)
                     ok = sb is not None and lb is not None and sb[2] >= MIN_VOL and lb[2] >= MIN_VOL
-                    value = max(0.0, min(width, sb[1] - lb[1])) if ok else None
-                    leg_pair = (sb[1], lb[1]) if ok else None
+                    value = max(0.0, min(width, sb[0] - lb[0])) if ok else None
+                    leg_pair = (sb[0], lb[0]) if ok else None
                 else:
                     legbars = [bar(row["symbol"], "CE", exp, float(row["short_ce"]), d),
                                bar(row["symbol"], "CE", exp, float(row["long_ce"]), d),
                                bar(row["symbol"], "PE", exp, float(row["short_pe"]), d),
                                bar(row["symbol"], "PE", exp, float(row["long_pe"]), d)]
                     ok = all(b is not None and b[2] >= MIN_VOL for b in legbars)
-                    value = max(0.0, min(width, (legbars[0][1] - legbars[1][1]) + (legbars[2][1] - legbars[3][1]))) if ok else None
-                    leg_pair = (legbars[0][1] + legbars[2][1], legbars[1][1] + legbars[3][1]) if ok else None
+                    value = max(0.0, min(width, (legbars[0][0] - legbars[1][0]) + (legbars[2][0] - legbars[3][0]))) if ok else None
+                    leg_pair = (legbars[0][0] + legbars[2][0], legbars[1][0] + legbars[3][0]) if ok else None
                 if value is not None:
                     vals.append(value)
-                    leg_closes.append(leg_pair)
+                    leg_opens.append(leg_pair)
                     exit_days.append(d)
                     dd = min(dd, credit - value)
                 if (exp - d).days <= SAFE_DTE:
                     exited_early = True
                     break
-            if not vals:
-                continue
             complete = exited_early or (len(win) == FWD)
+            if not vals:
+                # win still growing (genuinely still pending, more days may land later) -- nothing
+                # to write, leave the row exactly as-is. But if the window is already fully played
+                # out (or force-exited) and STILL never found a single valid day (e.g. a leg's
+                # volume never cleared MIN_VOL), that's RESOLVED, just unpriceable -- flip it to a
+                # terminal "no_fill" instead of leaving it stuck showing "pending" forever once it
+                # ages out of this function's trailing-5-day reprocessing window (2026-09,
+                # discovered while verifying the no-look-ahead fix).
+                if complete:
+                    df.at[idx, "outcome"] = "no_fill"
+                    n_marked += 1
+                continue
             exit_value = vals[-1]
-            exit_sell_premium, exit_buy_premium = leg_closes[-1]
-            exit_underlying_raw = CLOSE.get((row["symbol"], exit_days[-1]))
+            exit_sell_premium, exit_buy_premium = leg_opens[-1]
+            exit_underlying_raw = OPEN.get((row["symbol"], exit_days[-1]))
             exit_underlying = round(float(exit_underlying_raw), 1) if exit_underlying_raw is not None and pd.notna(exit_underlying_raw) else None
             pnl = round(credit - exit_value, 2)
             risk = float(row["max_risk"])
             lot = row.get("lot_size")
 
             # "Buy PnL" hedge comparison -- same OPPOSITE-type, SAME-strike-as-sold logic the
-            # generators use (see gen_broken_wing_signal_history.py for the full rationale),
-            # over the full FWD-day window regardless of this trade's own early-exit timing.
+            # generators use (see gen_broken_wing_signal_history.py for the full rationale): entered
+            # at entry_date's own open (win[0]), peak-searched across opens, over the full FWD-day
+            # window regardless of this trade's own early-exit timing.
             if is_skew:
                 side = row["side"]
                 buy_ot = "PE" if side == "CE" else "CE"
@@ -181,9 +216,9 @@ def _mark_pending(panel_path: str, today: str) -> None:
             buy_seq = legseq(row["symbol"], buy_ot, exp, buy_strike, win)
             buy_pnl_per_lot = None
             if buy_seq is not None and buy_seq[0] > 0:
-                buy_valid_closes = [b[1] for b in buy_seq[1] if b is not None and b[2] >= MIN_VOL]
-                if buy_valid_closes and pd.notna(lot):
-                    buy_pnl_per_lot = round((max(buy_valid_closes) - buy_seq[0]) * lot, 1)
+                buy_valid_opens = [b[0] for b in buy_seq[1] if b is not None and b[2] >= MIN_VOL]
+                if buy_valid_opens and pd.notna(lot):
+                    buy_pnl_per_lot = round((max(buy_valid_opens) - buy_seq[0]) * lot, 1)
 
             df.at[idx, "exit_value"] = round(exit_value, 2)
             df.at[idx, "exit_sell_premium"] = round(exit_sell_premium, 2)

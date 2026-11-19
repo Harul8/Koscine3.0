@@ -28,7 +28,7 @@ Usage:
         /prod2/refresh). Falls back to a full 2024-08-01 rebuild if OUT doesn't exist yet.
 """
 from __future__ import annotations
-import json, sys
+import json, os, sys
 from pathlib import Path
 import pandas as pd
 
@@ -54,7 +54,19 @@ else:
     START, END, OUT = sys.argv[1], sys.argv[2], Path(sys.argv[3])
     existing = None
 
-CE_LO, CE_HI, PE_LO, PE_HI = 0.99, 1.10, 0.85, 1.01
+# Strike moneyness band (strike/underlying) kept per option type. DEFAULTS ARE THE PRODUCTION
+# OTM-ONLY BAND -- calls from 1% ITM out to 10% OTM, puts from 15% OTM in to 1% ITM -- so the
+# daily --append flow and bw_panel.parquet are completely unchanged.
+# 2026-09, explicit user request: overridable via env so a RESEARCH panel can carry ITM strikes
+# and wider wings (the production band clips both, which silently made every "ITM" backtest
+# collapse back to an ATM trade -- there were only 2 ITM strikes in the whole panel). e.g.
+#   PANEL_CE_LO=0.70 PANEL_CE_HI=1.30 PANEL_PE_LO=0.70 PANEL_PE_HI=1.30 \
+#       python analysis/build_broken_wing_panel.py 2024-08-01 2026-09-01 bw_itm_panel.parquet
+# Write research panels to a DIFFERENT output file -- never overwrite bw_panel.parquet.
+CE_LO = float(os.environ.get("PANEL_CE_LO", 0.99))
+CE_HI = float(os.environ.get("PANEL_CE_HI", 1.10))
+PE_LO = float(os.environ.get("PANEL_PE_LO", 0.85))
+PE_HI = float(os.environ.get("PANEL_PE_HI", 1.01))
 TOP_N = 50
 
 g2 = {s: g for g, syms in json.loads((LOCK_V2 / "universe_groups.json").read_text()).items() for s in syms}
